@@ -74,7 +74,7 @@ class SplitFedv2(FLAlgorithm):
         smashed_data = splitting_output.clone().detach().requires_grad_(True)
 
         # Comm cost for upload splitting output to server
-        self.comm_load += smashed_data.numel() * smashed_data.element_size() 
+        self.comm_load_cut += smashed_data.numel() * smashed_data.element_size() 
 
         t0_s = time.time()
         self.server.optimizer.zero_grad()
@@ -93,7 +93,7 @@ class SplitFedv2(FLAlgorithm):
         t_s = time.time() - t2_s + t1_s - t0_s
 
         # Comm cost for downloading grads of smashed data
-        self.comm_load += smashed_data.grad.numel() * smashed_data.grad.element_size()
+        self.comm_load_cut += smashed_data.grad.numel() * smashed_data.grad.element_size()
 
         # Backprop split output with smashed data grad
         t2_c = time.time()
@@ -144,7 +144,7 @@ class SplitFedv1(FLAlgorithm):
         smashed_data = splitting_output.clone().detach().requires_grad_(True)
 
         # Upload the smashed data to the server
-        self.comm_load += smashed_data.numel() * smashed_data.element_size() 
+        self.comm_load_cut += smashed_data.numel() * smashed_data.element_size() 
 
         t0_s = time.time()
         self.servers[i].optimizer.zero_grad()
@@ -163,7 +163,7 @@ class SplitFedv1(FLAlgorithm):
         t_s = time.time() - t2_s + t1_s - t0_s
 
         # Download gradients of the smashed data
-        self.comm_load += smashed_data.grad.numel() * smashed_data.grad.element_size() 
+        self.comm_load_cut += smashed_data.grad.numel() * smashed_data.grad.element_size() 
 
         # Backprop grads back to splitting_output
         t2_c = time.time()

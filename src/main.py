@@ -5,6 +5,12 @@
 # -----------------------------------------------------------------------------
 import os, logging, json
 import random
+import time
+import platform
+try:
+    import resource
+except ImportError:
+    resource = None
 import numpy as np
 import wandb
 from datetime import datetime
@@ -24,6 +30,16 @@ from omegaconf import OmegaConf
 
 # -----------------------------------------------------------------------------
 global_torch_device = None
+_APP_START_TIME = time.time()
+
+# -----------------------------------------------------------------------------
+def get_peak_memory_mb():
+    '''Peak resident set size (RSS) of this process, in MiB. RSS units differ
+    by platform (bytes on macOS, KB on Linux), hence the branch.'''
+    if resource is None:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / (1024 ** 2) if platform.system() == 'Darwin' else peak / 1024
 
 # config torch backends and device 
 torch.backends.cudnn.deterministic = True
@@ -188,6 +204,8 @@ def main(cfg: DictConfig):
 
         global global_torch_device
         global_torch_device = torch.device(cfg.device)
+        if global_torch_device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats(global_torch_device)
 
     # configure and run FL algorithm
     server, client_list, test_loader = setup_server_and_clients(cfg)
@@ -213,17 +231,33 @@ def main(cfg: DictConfig):
     for k, v in results.avg_compute_times.items():
         logging.info(f" > {k:>20s} - {v:.2f}s")
 
+    # wall-clock latency (application start to completion) and peak memory
+    total_latency_s = time.time() - _APP_START_TIME
+    peak_memory_mb = get_peak_memory_mb()
+    logging.info(f"Total latency: {total_latency_s:.2f}s")
+    logging.info(f"Peak process memory: {peak_memory_mb:.2f} MiB")
+    if global_torch_device.type == 'cuda':
+        peak_cuda_memory_mb = \
+            torch.cuda.max_memory_allocated(global_torch_device) / (1024 ** 2)
+        logging.info(f"Peak CUDA memory: {peak_cuda_memory_mb:.2f} MiB")
+
     # save all results
     train_metrics = {f'client_{i}': tr_met for i, tr_met in
                      enumerate(results.train_metrics)}
 
     save_res = {
-        'test_loss' : results.loss,
-        'test_acc'  : results.accuracy,
-        'comm_load' : results.comm_load,
+        'test_loss'         : results.loss,
+        'test_acc'          : results.accuracy,
+        'comm_load'         : results.comm_load,
+        'comm_load_cut'     : results.comm_load_cut,
+        'comm_load_weights' : results.comm_load_weights,
+        'latency_s'         : total_latency_s,
+        'peak_memory_mb'    : peak_memory_mb,
         **train_metrics,
         **results.avg_compute_times
     }
+    if global_torch_device.type == 'cuda':
+        save_res['peak_cuda_memory_mb'] = peak_cuda_memory_mb
 
     # save models and results
     if cfg.save:
@@ -234,7 +268,10 @@ def main(cfg: DictConfig):
         
         metrics_file = os.path.join(cfg.save_path, 'metrics.pt')
         torch.save(
-            [results.accuracy, results.loss, results.comm_load],
+            [
+                results.accuracy, results.loss, results.comm_load,
+                results.comm_load_cut, results.comm_load_weights
+            ],
             metrics_file
         )
 

@@ -66,7 +66,7 @@ class CSEFSL(FLAlgorithm):
         # server model update
         local_iter = j * self.iters_per_epoch[i] + k
         if local_iter % self.server_update_interval == 0:
-            self.comm_load += smashed_data.numel() * smashed_data.element_size()
+            self.comm_load_cut += smashed_data.numel() * smashed_data.element_size()
 
             t0 = time.time()
             self.server.optimizer.zero_grad()
@@ -100,7 +100,7 @@ class CSEFSL(FLAlgorithm):
 
         for c in self.clients:
             c.auxiliary_model.load_state_dict(agg_weights)
-            self.comm_load += 2 * calculate_load(c.auxiliary_model)
+            self.comm_load_weights += 2 * calculate_load(c.auxiliary_model)
 
         ret_dict['auxiliary_agg_compute_time'] = time.time() - t0
         return ret_dict

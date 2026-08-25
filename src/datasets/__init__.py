@@ -47,6 +47,24 @@ def get_dataset(cfg):
         testSet = datasets.CIFAR10(dataDir, train=False, download=True,
                                     transform=testRule)
 
+    elif cfg.name == 'mnist':
+        dataDir = '../datas/mnist'
+
+        # resize to 32x32 and repeat the single channel to 3 so the same
+        # ResNet backbone used for CIFAR can be reused unmodified
+        mnistRule = transforms.Compose([
+            transforms.Resize(32),
+            transforms.Grayscale(num_output_channels=3),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                  std=[0.229, 0.224, 0.225])
+            ])
+
+        trainSet = datasets.MNIST(dataDir, train=True, download=True,
+                                   transform=mnistRule)
+        testSet = datasets.MNIST(dataDir, train=False, download=True,
+                                  transform=mnistRule)
+
     elif cfg.name == 'femnist':
         dataDir = '../datas/femnist'
         trainSet = femnist.Femnist(dataDir, train=True)  #-----todo

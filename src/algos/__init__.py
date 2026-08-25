@@ -58,9 +58,14 @@ def aggregate_models(model_list, weights, device='cpu'):
 # ------------------------------------------------------------------------------
 class FLAlgorithm(ABC):
     aggregated_client   : nn.Module
-    comm_load           : float = 0.0
+    comm_load_cut       : float = 0.0
+    comm_load_weights   : float = 0.0
     loss                : float = np.inf
     acc                 : float = 0.0
+
+    @property
+    def comm_load(self) -> float:
+        return self.comm_load_cut + self.comm_load_weights
 
     def __init__(self,
         cfg: DictConfig, server: Server, clients: List[Client],
@@ -116,7 +121,7 @@ class FLAlgorithm(ABC):
 
         for c in self.clients:
             c.model.load_state_dict(agg_weights)
-            self.comm_load += 2 * calculate_load(self.aggregated_client)
+            self.comm_load_weights += 2 * calculate_load(self.aggregated_client)
 
         ret_dict['client_agg_compute_time'] = time.time() - t0
         return ret_dict
@@ -181,6 +186,8 @@ class FLResults():
     accuracy            : List[float]
     train_metrics       : List[Dict[str, List]]
     aggregation_metrics : Dict[str, List]
+    comm_load_cut       : List[float]
+    comm_load_weights   : List[float]
     comm_load           : List[float]
     avg_compute_times   : Dict[str, float]
 
@@ -303,6 +310,8 @@ def _run_fl_algorithm(
     train_metrics=None,
     aggregation_metrics=None,
     comm_load=None,
+    comm_load_cut=None,
+    comm_load_weights=None,
 ) -> FLResults:
 
     # get algorithm
@@ -317,6 +326,8 @@ def _run_fl_algorithm(
             cfg.comm_threshold_mb = np.inf
 
     if comm_load is None: comm_load = []
+    if comm_load_cut is None: comm_load_cut = []
+    if comm_load_weights is None: comm_load_weights = []
     if test_loss is None: test_loss = []
     if test_acc is None: test_acc = []
     if train_metrics is None:
@@ -389,6 +400,8 @@ def _run_fl_algorithm(
             # aggregate required models
             agg_metrics = alg.aggregate()
             comm_load.append(alg.comm_load)
+            comm_load_cut.append(alg.comm_load_cut)
+            comm_load_weights.append(alg.comm_load_weights)
             if t == 0:
                 for k, v in agg_metrics.items():
                     aggregation_metrics[k] = [v]
@@ -408,7 +421,9 @@ def _run_fl_algorithm(
             log_dict.update({
                 'Test/accuracy': acc_,
                 'Test/loss': loss_,
-                'Test/load': comm_load
+                'Test/load': comm_load,
+                'Test/load_cut': comm_load_cut,
+                'Test/load_weights': comm_load_weights
             })
 
             # adjust learning rates for server models in single server runs
@@ -421,7 +436,9 @@ def _run_fl_algorithm(
             logging.info(
                 f' > Round {t}, ' + tr_str +
                 f', ts. loss: {loss_:.2f}, ts. acc: {100. * acc_:.2f}%' +
-                f', comm: {(alg.comm_load / (1024**3)):.2f} GiB.',
+                f', comm cut: {(alg.comm_load_cut / (1024**3)):.3f} GiB' +
+                f', comm weights: {(alg.comm_load_weights / (1024**3)):.3f} GiB' +
+                f', comm total: {(alg.comm_load / (1024**3)):.3f} GiB.',
             )
             logger_fn(log_dict, step=t)
 
@@ -442,7 +459,8 @@ def _run_fl_algorithm(
 
     return FLResults(
         alg.server, alg.clients, test_loss, test_acc, train_metrics,
-        aggregation_metrics, comm_load, avg_compute_times
+        aggregation_metrics, comm_load_cut, comm_load_weights, comm_load,
+        avg_compute_times
     )
 
 # ------------------------------------------------------------------------------
@@ -477,17 +495,21 @@ def run_fl_algorithm(
         train_metrics = results.train_metrics
         aggregation_metrics = results.aggregation_metrics
         comm_load = results.comm_load
+        comm_load_cut = results.comm_load_cut
+        comm_load_weights = results.comm_load_weights
     else:
         test_loss = None
         test_acc = None
         train_metrics = None
         aggregation_metrics = None
         comm_load = None
+        comm_load_cut = None
+        comm_load_weights = None
 
     return _run_fl_algorithm(
         cfg, server, clients, test_loader, checkpointer, torch_device,
         logger_fn, test_loss, test_acc, train_metrics, aggregation_metrics,
-        comm_load
+        comm_load, comm_load_cut, comm_load_weights
     )
 
 # ------------------------------------------------------------------------------

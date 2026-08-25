@@ -42,7 +42,7 @@ class FSLSAGE(FLAlgorithm):
         ret_dict = dict()
         if local_iter % self.server_update_interval == 0:
             smashed_data = splitting_output.clone().detach().requires_grad_(True)
-            self.comm_load += smashed_data.numel() * smashed_data.element_size()
+            self.comm_load_cut += smashed_data.numel() * smashed_data.element_size()
 
             t0_ = time.time()
             self.server.optimizer.zero_grad()
@@ -76,7 +76,7 @@ class FSLSAGE(FLAlgorithm):
             ret_dict['auxiliary_model_compute_time'] = time.time() - t0_
 
             # the aligned auxiliary model is sent back to client i
-            self.comm_load += calculate_load(self.clients[i].auxiliary_model)
+            self.comm_load_weights += calculate_load(self.clients[i].auxiliary_model)
 
         # client backpropagation and update client-side model weights
         t2 = time.time()
