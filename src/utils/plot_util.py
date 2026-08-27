@@ -57,7 +57,11 @@ def figure_setup():
     """Set all the sizes to the correct values and use
     tex fonts for all textsk
     """
-    params = {'text.usetex': True,
+    import shutil
+    # falls back to matplotlib's built-in mathtext when no LaTeX toolchain is
+    # installed (e.g. a fresh Colab/dev machine), instead of hard-crashing on
+    # the first plot render.
+    params = {'text.usetex': shutil.which('latex') is not None,
               'figure.dpi': 200,
               'font.size': font_size(),
               'font.serif': [],

@@ -1,0 +1,11 @@
++--------------+-----------------+-------------+------+
+|    Method    | MNIST α=∞ (IID) | MNIST α=0.5 |  R   |
++--------------+-----------------+-------------+------+
+|  SplitFedv1  |       N/A       |     N/A     | N/A  |
+|  SplitFedv2  |      98.80      |     N/A     | 1.50 |
+|   CSE-FSL    |      98.41      |     N/A     | 1.50 |
+|   FSL-SAGE   |       N/A       |     N/A     | N/A  |
+|    HO-SFL    |       N/A       |     N/A     | N/A  |
+| MU-SplitFed* |       N/A       |     N/A     | N/A  |
++--------------+-----------------+-------------+------+
+* Third-party CV/ResNet18 reimplementation (HKU-WILL-Lab/HO-SFL repo), not the original MU-SplitFed authors' code.

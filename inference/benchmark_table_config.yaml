@@ -1,0 +1,11 @@
+prefix_dir: ../saves
+model: resnet18
+dataset: mnist
+alpha: 0.5
+methods:
+  SplitFedv1 : {key: sl_multi_server,  reimplementation: false}
+  SplitFedv2 : {key: sl_single_server, reimplementation: false}
+  CSE-FSL    : {key: cse_fsl,          reimplementation: false}
+  FSL-SAGE   : {key: fsl_sage,         reimplementation: false}
+  HO-SFL     : {key: ho_sfl,           reimplementation: false}
+  MU-SplitFed: {key: mu_splitfed,      reimplementation: true}

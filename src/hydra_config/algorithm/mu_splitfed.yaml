@@ -1,0 +1,8 @@
+defaults:
+  - base_algorithm
+name    : mu_splitfed
+tau     : 2
+zo_mu   : 0.005
+lr_c    : 0.005
+lr_s    : 0.01
+lr_g    : 0.3
