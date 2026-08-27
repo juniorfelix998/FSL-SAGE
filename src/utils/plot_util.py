@@ -61,12 +61,14 @@ def figure_setup():
     # falls back to matplotlib's built-in mathtext when no LaTeX toolchain is
     # installed (e.g. a fresh Colab/dev machine), instead of hard-crashing on
     # the first plot render.
-    params = {'text.usetex': shutil.which('latex') is not None,
+    has_latex = shutil.which('latex') is not None
+    params = {'text.usetex': has_latex,
               'figure.dpi': 200,
               'font.size': font_size(),
-              'font.serif': [],
-              'font.sans-serif': [],
-              'font.monospace': [],
+              # Leave font.serif/sans-serif/monospace at matplotlib's own
+              # defaults (which list bundled fonts like 'DejaVu Sans' first) --
+              # overriding them to [] leaves nothing to resolve, which floods
+              # stdout with findfont warnings on every draw.
               'axes.labelsize': label_size(),
               'axes.titlesize': font_size(),
               'axes.linewidth': axis_lw(),
@@ -74,7 +76,11 @@ def figure_setup():
               'legend.fontsize': font_size(),
               'xtick.labelsize': ticks_size(),
               'ytick.labelsize': ticks_size(),
-              'font.family': 'serif'}
+              # 'serif' only resolves cleanly when a real LaTeX/serif font
+              # toolchain is present; without it matplotlib can't find any
+              # serif font and floods stdout with findfont warnings before
+              # silently falling back to DejaVu Sans anyway.
+              'font.family': 'serif' if has_latex else 'sans-serif'}
     plt.rcParams.update(params)
 
 

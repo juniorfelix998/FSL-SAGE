@@ -89,21 +89,34 @@ def run_sweep(methods, rounds, seed, device, num_clients):
     return failures
 
 # ------------------------------------------------------------------------------
+DISTRIBUTION_MARKERS = {'iid': 'o', 'noniid_dirichlet': '^'}
+
+
 def make_plots(cfg):
     # Local import: plot_results.py appends '../' to sys.path and imports
     # `src.utils.plot_util`, which only resolves correctly when this
     # process's cwd is `inference/` -- same precondition plot_results.py has
     # always had.
     import plot_results as pr
+    import matplotlib.pyplot as plt
 
     columns = [('iid', None), ('noniid_dirichlet', cfg['alpha'])]
     plots_root = os.path.join(os.path.dirname(__file__), 'plots_mnist')
 
-    scatter_dict = {name: {} for name in cfg['methods']}
-
     pr.setup()
+    # Fix one color per method up front so it stays identical across every
+    # plot below, regardless of which subset of methods has data for a given
+    # distribution (relying on axes.prop_cycle position instead would let
+    # colors drift whenever a run is missing).
+    cycle_colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    method_colors = {
+        name: cycle_colors[i % len(cycle_colors)]
+        for i, name in enumerate(cfg['methods'])
+    }
+
+    runs_by_distribution = {}
     for distribution, alpha in columns:
-        save_dicts = {}
+        runs = {}
         for name, meta in cfg['methods'].items():
             path = find_latest_run(
                 cfg['prefix_dir'], meta['key'], cfg['model'], cfg['dataset'],
@@ -111,45 +124,86 @@ def make_plots(cfg):
             )
             if path is None:
                 continue
-            run = load_run(path)
-            # accuracy_plot indexes save_dicts values as v[0][...] -- wrap in
-            # a 1-element list to match its multi-seed convention rather than
-            # relying on its single-dict code path.
-            save_dicts[name] = [run]
-            # proxy alpha for the "iid" column so metrics_vs_comm_load_scatter's
-            # log-scaled point-size convention (which assumes alpha > 0) still
-            # applies; 100.0 stands in for "close to infinite" (iid).
-            scatter_dict[name][alpha if alpha is not None else 100.0] = run
+            runs[name] = load_run(path)
+        runs_by_distribution[distribution] = runs
 
-        if not save_dicts:
+        if not runs:
             print(f"[skip plots] no runs found yet for mnist-{distribution}")
             continue
 
+        dist_label = 'IID' if distribution == 'iid' else f'α={alpha}'
         plot_dir = os.path.join(plots_root, distribution)
         os.makedirs(plot_dir, exist_ok=True)
+        save_dicts = {name: [run] for name, run in runs.items()}
         test_ids = list(range(len(save_dicts)))
-        pr.accuracy_plot(
-            save_dicts, ['test_acc', 'test_loss'],
-            ['Test Accuracy', 'Test Loss'], test_ids=test_ids,
-            metric_minimize=[False, True], plots_dir=plot_dir
-        )
-        pr.accuracy_plot(
-            save_dicts, ['test_acc', 'test_loss'],
-            ['Test Accuracy', 'Test Loss'], test_ids=test_ids,
-            metric_minimize=[False, True], x_comm_load=True, plots_dir=plot_dir
-        )
+        for x_comm_load in (False, True):
+            pr.accuracy_plot(
+                save_dicts, ['test_acc', 'test_loss'],
+                ['Test Accuracy', 'Test Loss'], test_ids=test_ids,
+                metric_minimize=[False, True], x_comm_load=x_comm_load,
+                plots_dir=plot_dir, title=f'MNIST ({dist_label})'
+            )
         print(f"[plots] wrote accuracy/loss vs round + comm-load to {plot_dir}")
 
-    scatter_dict = {k: v for k, v in scatter_dict.items() if v}
-    if scatter_dict:
-        scatter_dir = os.path.join(plots_root, 'comm_load_scatter')
-        pr.metrics_vs_comm_load_scatter(
-            scatter_dict, ['test_acc', 'test_loss'],
-            ['Test Accuracy', 'Test Loss'],
-            test_ids=list(range(len(scatter_dict))),
-            metric_minimize=[False, True], plots_dir=scatter_dir
-        )
-        print(f"[plots] wrote accuracy/loss vs comm-load scatter to {scatter_dir}")
+    _comm_load_scatter(runs_by_distribution, method_colors, plots_root)
+
+
+def _comm_load_scatter(runs_by_distribution, method_colors, plots_root):
+    '''Final test_acc vs total comm_load, one point per (method, distribution).
+
+    Deliberately not `plot_results.metrics_vs_comm_load_scatter`: that
+    function's point-size legend is built for a continuous sweep over many
+    real Dirichlet alpha values, which doesn't fit having just two discrete
+    conditions here (IID vs alpha=0.5) -- it produces a confusing legend
+    entry and overlapping same-size dots instead of a clean comparison.
+    '''
+    import matplotlib.pyplot as plt
+
+    scatter_dir = os.path.join(plots_root, 'comm_load_scatter')
+    os.makedirs(scatter_dir, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    seen_methods = set()
+    for distribution, runs in runs_by_distribution.items():
+        marker = DISTRIBUTION_MARKERS[distribution]
+        for name, run in runs.items():
+            x = run['comm_load'][-1] / (1024 ** 3)
+            y = run['test_acc'][-1] * 100.0
+            ax.scatter(
+                x, y, marker=marker, s=80, color=method_colors[name],
+                edgecolors='black', linewidths=0.5, alpha=0.9
+            )
+            seen_methods.add(name)
+
+    method_handles = [
+        plt.Line2D([0], [0], marker='o', color='w', label=name,
+                    markerfacecolor=method_colors[name], markersize=8)
+        for name in method_colors if name in seen_methods
+    ]
+    method_legend = ax.legend(
+        handles=method_handles, loc='lower right', fontsize=8, title='Method'
+    )
+    ax.add_artist(method_legend)
+
+    dist_handles = [
+        plt.Line2D([0], [0], marker=DISTRIBUTION_MARKERS[d], color='black',
+                    linestyle='', label=('IID' if d == 'iid' else 'α=0.5'),
+                    markerfacecolor='white', markersize=8)
+        for d in runs_by_distribution if runs_by_distribution[d]
+    ]
+    ax.legend(handles=dist_handles, loc='lower left', fontsize=8, title='Distribution')
+
+    ax.set_xlabel('Communication Load (GB)')
+    ax.set_ylabel('Test Accuracy (%)')
+    ax.set_title('Final Accuracy vs Communication Load')
+    ax.grid(True, which='both', axis='both', linestyle='dotted', linewidth=0.5,
+            color='gray', alpha=0.5)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(os.path.join(scatter_dir, 'test_acc_vs_commload_scatter.png'))
+    fig.savefig(os.path.join(scatter_dir, 'test_acc_vs_commload_scatter.eps'))
+    plt.close(fig)
+    print(f"[plots] wrote accuracy vs comm-load scatter to {scatter_dir}")
 
 # ------------------------------------------------------------------------------
 def main():

@@ -57,6 +57,10 @@ def columns_spec(cfg):
     ]
 
 # ------------------------------------------------------------------------------
+def to_gib(comm_load_bytes):
+    return comm_load_bytes / (1024 ** 3)
+
+# ------------------------------------------------------------------------------
 def compute_ranks(methods, cells, num_columns):
     '''Per column: rank by accuracy (higher better) and by comm_load (lower
     better), average those two ranks. Final R per method = mean of its
@@ -93,7 +97,11 @@ def build_table(cfg=None, out_path=None):
     ranks = compute_ranks(methods, cells, len(columns))
 
     table = PrettyTable()
-    table.field_names = ['Method'] + [c[0] for c in columns] + ['R']
+    col_names = ['Method']
+    for name, _, _ in columns:
+        col_names += [f'{name} Acc (%)', f'{name} Comm (GB)']
+    col_names.append('R')
+    table.field_names = col_names
 
     footnote_needed = False
     for name in methods:
@@ -104,7 +112,10 @@ def build_table(cfg=None, out_path=None):
 
         row = [label]
         for cell in cells[name]:
-            row.append(f"{cell['acc']:.2f}" if cell is not None else 'N/A')
+            if cell is not None:
+                row += [f"{cell['acc']:.2f}", f"{to_gib(cell['comm_load']):.2f}"]
+            else:
+                row += ['N/A', 'N/A']
         r_vals = ranks[name]
         row.append(f"{np.mean(r_vals):.2f}" if r_vals else 'N/A')
         table.add_row(row)

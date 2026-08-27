@@ -78,7 +78,8 @@ def get_path(cfg, exp_cfg, key_name, path):
 def accuracy_plot(
     save_dicts, metrics, metric_names, test_ids, metric_minimize,
     x_comm_load=False, plots_dir='../plots', legend=True,
-    x_axis_rnds_lim=None, mark_at_metric=None, centralized_level=None
+    x_axis_rnds_lim=None, mark_at_metric=None, centralized_level=None,
+    title=None
 ):
 
     for n, (metric, metric_name) in enumerate(zip(metrics, metric_names)):
@@ -194,6 +195,9 @@ def accuracy_plot(
             ax.set_xlabel("Communication Load (GB)")
         else:
             ax.set_xlabel("Rounds ($t$)")
+
+        if title is not None:
+            ax.set_title(title)
 
         ax.set_axisbelow(True)
 
