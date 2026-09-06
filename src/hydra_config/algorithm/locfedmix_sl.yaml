@@ -1,0 +1,16 @@
+defaults:
+  - base_algorithm
+name: locfedmix_sl
+# Beta(alpha, alpha) mixing-ratio parameter for the cross-client smashed-data
+# Mixup, matching the standard Mixup convention (Zhang et al. 2018) and the
+# paper's own alpha=beta case; paper's Fig. 4 finds uniform (alpha=1) and
+# alpha=4 both perform well, so this is a reasonable, not fully paper-tuned,
+# starting point.
+mixup_alpha    : 1.0
+# number of partner clients each client's smashed data is mixed with per
+# round (n_s in the paper) -- 1 = pairwise mixup, matching the paper's own
+# worked two-client example; the paper's own ablation explores larger n_s
+# as a further accuracy/cost trade-off, not replicated here.
+mixup_partners : 1
+# learning rate for each client's local Infopro reconstruction decoder.
+decoder_lr     : 0.001

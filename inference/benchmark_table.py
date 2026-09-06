@@ -44,6 +44,29 @@ REIMPL_FOOTNOTES = {
         "(juniorfelix998/sl-fl-dgl); not validated against the paper's own "
         "reported numbers."
     ),
+    'han_locloss': (
+        '‡',
+        "‡ AI-assisted no-code reimplementation of Han et al., \"Accelerating "
+        "FL with SL on Locally Generated Losses\" (FL-ICML 2021); not "
+        "validated against the paper's own reported numbers."
+    ),
+    'fedsplitx': (
+        '§',
+        "§ AI-assisted no-code reimplementation of FedSplitX (arXiv:2310.14579), "
+        "run at a single shared cut (this benchmark's protocol) rather than "
+        "the paper's own multiple simultaneous depth-levels; not validated "
+        "against the paper's own reported numbers."
+    ),
+    'hosl': (
+        '¶',
+        "¶ AI-assisted no-code reimplementation of HOSL (arXiv:2601.10940); "
+        "not validated against the paper's own reported numbers."
+    ),
+    'locfedmix_sl': (
+        '‖',
+        "‖ AI-assisted no-code reimplementation of LocFedMix-SL (ACM WWW "
+        "2022); not validated against the paper's own reported numbers."
+    ),
 }
 DEFAULT_REIMPL_SYMBOL = '*'
 

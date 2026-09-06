@@ -26,8 +26,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(REPO_ROOT, 'src')
 
 DEFAULT_METHODS = [
-    'sl_multi_server', 'sl_single_server', 'cse_fsl', 'fsl_sage', 'ho_sfl',
-    'mu_splitfed', 'dsl_aux',
+    'sl_multi_server', 'sl_single_server', 'vanilla_sl', 'cse_fsl',
+    'fsl_sage', 'ho_sfl', 'mu_splitfed', 'dsl_aux', 'han_locloss',
+    'fedsplitx', 'hosl', 'locfedmix_sl',
 ]
 DISTRIBUTIONS = [('iid', None), ('noniid_dirichlet', 0.5)]
 ALL_CUTS = ['shallow', 'middle', 'deep']

@@ -10,3 +10,8 @@ methods:
   HO-SFL     : {key: ho_sfl,           reimplementation: false}
   MU-SplitFed: {key: mu_splitfed,      reimplementation: true}
   DSL-Aux    : {key: dsl_aux,          reimplementation: true}
+  Vanilla-SL : {key: vanilla_sl,       reimplementation: false}
+  Han-et-al  : {key: han_locloss,      reimplementation: true}
+  FedSplitX  : {key: fedsplitx,        reimplementation: true}
+  HOSL       : {key: hosl,             reimplementation: true}
+  LocFedMix-SL: {key: locfedmix_sl,    reimplementation: true}

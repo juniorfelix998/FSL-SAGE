@@ -1,0 +1,12 @@
+defaults:
+  - base_algorithm
+name    : hosl
+# ZO perturbation scale and number of perturbations averaged per update --
+# not given precise values in the accessible parts of the paper; starting
+# points in the same range as this harness's other ZO methods (mu_splitfed,
+# ho_sfl), not tuned values.
+zo_mu   : 0.005
+num_pert: 5
+
+# NOTE: this method is non-federated per the paper (single client/server
+# pair) -- num_clients=1 is the paper-faithful run configuration.
