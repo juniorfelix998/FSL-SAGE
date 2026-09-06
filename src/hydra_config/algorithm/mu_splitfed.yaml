@@ -6,3 +6,9 @@ zo_mu   : 0.005
 lr_c    : 0.005
 lr_s    : 0.01
 lr_g    : 0.3
+# number of independent random ZO directions averaged per gradient estimate
+# (both client and server steps) -- mirrors ho_sfl.yaml's zo_p, adapted here
+# to reduce single-direction finite-difference variance. Starting point for
+# a correctness fix, not a tuned value: multiplies per-round compute by
+# ~tau * zo_p on top of today's ~tau.
+zo_p    : 5

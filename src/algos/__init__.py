@@ -284,11 +284,11 @@ def log_and_step_lr_per_client(i, alg, alg_name):
 
     # for auxiliary models. For fsl_sage, the optimization happens within the
     # align() method.
-    if alg_name == 'cse_fsl' or alg_name == 'fsl_sage':
+    if alg_name in ('cse_fsl', 'fsl_sage', 'dsl_aux'):
         lr_dict['aux_lr'] = take_lr_step(alg.clients[i].auxiliary_model)
 
     # log auxiliary model learning rate for fsl algorithms
-    if alg_name == 'cse_fsl' or alg_name =='fsl_sage':
+    if alg_name in ('cse_fsl', 'fsl_sage', 'dsl_aux'):
         log_dict.update({
             f'Clients/client_{i}/aux_model/aux_model_lr': \
                 alg.clients[i].auxiliary_model.optimizer.param_groups[0]['lr']

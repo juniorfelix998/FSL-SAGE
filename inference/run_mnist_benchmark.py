@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 # ------------------------------------------------------------------------------
 # One-command orchestrator: sweeps every MNIST method across both
-# distributions, builds the ranked comparison table, and generates
+# distributions, builds the comparison table (comm cut/weights/total, cut vs.
+# weights share, accuracy, latency, peak memory), and generates
 # accuracy/comm-load plots -- the single entry point referenced by the Colab
 # notebook's "run everything" cell.
 #
@@ -26,7 +27,7 @@ SRC_DIR = os.path.join(REPO_ROOT, 'src')
 
 DEFAULT_METHODS = [
     'sl_multi_server', 'sl_single_server', 'cse_fsl', 'fsl_sage', 'ho_sfl',
-    'mu_splitfed',
+    'mu_splitfed', 'dsl_aux',
 ]
 DISTRIBUTIONS = [('iid', None), ('noniid_dirichlet', 0.5)]
 
@@ -34,7 +35,7 @@ DISTRIBUTIONS = [('iid', None), ('noniid_dirichlet', 0.5)]
 def parse_args():
     p = argparse.ArgumentParser(
         description=(
-            "Sweep all MNIST methods, build the ranked comparison table, and "
+            "Sweep all MNIST methods, build the comparison table, and "
             "generate accuracy/comm-load plots. Run with `inference/` as cwd."
         )
     )

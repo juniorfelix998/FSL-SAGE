@@ -9,3 +9,4 @@ methods:
   FSL-SAGE   : {key: fsl_sage,         reimplementation: false}
   HO-SFL     : {key: ho_sfl,           reimplementation: false}
   MU-SplitFed: {key: mu_splitfed,      reimplementation: true}
+  DSL-Aux    : {key: dsl_aux,          reimplementation: true}

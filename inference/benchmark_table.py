@@ -1,9 +1,10 @@
 # ------------------------------------------------------------------------------
-# Cross-method, ranked comparison table for the MNIST phase of the benchmark
-# (see CLAUDE.md's "What Crosses the Cut?" target table). Kept separate from
+# Cross-method measurement table for the MNIST phase of the benchmark (comm
+# cut/weights/total, cut vs. weights share, accuracy, latency, peak memory --
+# see CLAUDE.md's "What Crosses the Cut?" target table). Kept separate from
 # `exp_config.yaml`/`plot_results.py::make_table` -- that schema is purpose-built
 # for the per-experiment line-plot functions and hand-maintained timestamped
-# paths, not a ranking table spanning multiple methods automatically.
+# paths, not a comparison table spanning multiple methods automatically.
 #
 # Auto-discovers the most recent matching run per method/distribution via
 # `results_loader.find_latest_run` rather than requiring hand-edited paths, so
@@ -11,8 +12,6 @@
 # ------------------------------------------------------------------------------
 import os
 import yaml
-import numpy as np
-from scipy.stats import rankdata
 from prettytable import PrettyTable
 
 from results_loader import find_latest_run, load_run
@@ -23,10 +22,26 @@ DEFAULT_CONFIG_PATH = os.path.join(
 DEFAULT_OUT_PATH = os.path.join(
     os.path.dirname(__file__), 'benchmark_table_mnist.txt'
 )
-REIMPL_FOOTNOTE = (
-    "* Third-party CV/ResNet18 reimplementation (HKU-WILL-Lab/HO-SFL repo), "
-    "not the original MU-SplitFed authors' code."
-)
+# per-method provenance footnotes, keyed by the algorithm's config key
+# (`cfg['methods'][name]['key']`) -- each row that's flagged `reimplementation:
+# true` in benchmark_table_config.yaml gets labeled with its own symbol, and
+# only the distinct footnotes actually used by a row in the table get printed
+# (not concatenated/shared across methods with different provenance stories).
+REIMPL_FOOTNOTES = {
+    'mu_splitfed': (
+        '*',
+        "* Third-party CV/ResNet18 reimplementation (HKU-WILL-Lab/HO-SFL repo), "
+        "not the original MU-SplitFed authors' code."
+    ),
+    'dsl_aux': (
+        '†',
+        "† AI-assisted no-code reimplementation of DSL-Aux (arXiv:2601.19261), "
+        "adapted from a partial third-party reference implementation "
+        "(juniorfelix998/sl-fl-dgl); not validated against the paper's own "
+        "reported numbers."
+    ),
+}
+DEFAULT_REIMPL_SYMBOL = '*'
 
 # ------------------------------------------------------------------------------
 def load_config(config_path=None):
@@ -37,8 +52,13 @@ def load_config(config_path=None):
 # ------------------------------------------------------------------------------
 def collect_cell(cfg, algo_key, distribution, alpha=None):
     '''Find the latest run for (algo_key, distribution[, alpha]) and pull its
-    final-round test accuracy (%) and total comm_load (bytes). Returns None if
-    no matching run exists yet.'''
+    final-round test accuracy (%), cut/weights/total comm_load (bytes), and
+    the run's latency (s) and peak memory (MB). Returns None if no matching
+    run exists yet.
+
+    `latency_s`/`peak_memory_mb` are bare scalars in `results.json` (unlike
+    `test_acc`/`comm_load*`, which are per-round lists) -- not `[-1]`-indexed.
+    '''
     path = find_latest_run(
         cfg['prefix_dir'], algo_key, cfg['model'], cfg['dataset'], distribution,
         alpha=alpha
@@ -46,7 +66,18 @@ def collect_cell(cfg, algo_key, distribution, alpha=None):
     if path is None:
         return None
     run = load_run(path)
-    return {'acc': run['test_acc'][-1] * 100.0, 'comm_load': run['comm_load'][-1]}
+    comm_cut = run['comm_load_cut'][-1]
+    comm_weights = run['comm_load_weights'][-1]
+    comm_total = run['comm_load'][-1]
+    return {
+        'acc': run['test_acc'][-1] * 100.0,
+        'comm_load_cut': comm_cut,
+        'comm_load_weights': comm_weights,
+        'comm_load': comm_total,
+        'cut_share_pct': 100.0 * comm_cut / comm_total if comm_total > 0 else 0.0,
+        'latency_s': run['latency_s'],
+        'peak_memory_mb': run['peak_memory_mb'],
+    }
 
 # ------------------------------------------------------------------------------
 def columns_spec(cfg):
@@ -57,30 +88,8 @@ def columns_spec(cfg):
     ]
 
 # ------------------------------------------------------------------------------
-def to_gib(comm_load_bytes):
-    return comm_load_bytes / (1024 ** 3)
-
-# ------------------------------------------------------------------------------
-def compute_ranks(methods, cells, num_columns):
-    '''Per column: rank by accuracy (higher better) and by comm_load (lower
-    better), average those two ranks. Final R per method = mean of its
-    per-column combined ranks, over columns where it has data.'''
-    combined_ranks = {name: [] for name in methods}
-    for col_idx in range(num_columns):
-        present = [
-            (name, cells[name][col_idx]) for name in methods
-            if cells[name][col_idx] is not None
-        ]
-        if not present:
-            continue
-        names = [n for n, _ in present]
-        accs = np.array([c['acc'] for _, c in present])
-        comms = np.array([c['comm_load'] for _, c in present])
-        acc_ranks = rankdata(-accs, method='average')
-        comm_ranks = rankdata(comms, method='average')
-        for n, ar, cr in zip(names, acc_ranks, comm_ranks):
-            combined_ranks[n].append((ar + cr) / 2.0)
-    return combined_ranks
+def to_mb(comm_load_bytes):
+    return comm_load_bytes / (1024 ** 2)
 
 # ------------------------------------------------------------------------------
 def build_table(cfg=None, out_path=None):
@@ -94,41 +103,53 @@ def build_table(cfg=None, out_path=None):
             for _, dist, alpha in columns
         ] for name in methods
     }
-    ranks = compute_ranks(methods, cells, len(columns))
 
     table = PrettyTable()
     col_names = ['Method']
     for name, _, _ in columns:
-        col_names += [f'{name} Acc (%)', f'{name} Comm (GB)']
-    col_names.append('R')
+        col_names += [
+            f'{name} Comm-cut (MB)', f'{name} Comm-weights (MB)',
+            f'{name} Comm-total (MB)', f'{name} Cut vs. weights',
+            f'{name} Acc (%)', f'{name} Latency (s)', f'{name} Peak mem (MB)',
+        ]
     table.field_names = col_names
 
-    footnote_needed = False
+    footnotes_used = []
     for name in methods:
         meta = cfg['methods'][name]
         is_reimpl = meta.get('reimplementation', False)
-        footnote_needed = footnote_needed or is_reimpl
-        label = f"{name}*" if is_reimpl else name
+        symbol, footnote = REIMPL_FOOTNOTES.get(
+            meta['key'], (DEFAULT_REIMPL_SYMBOL, None)
+        )
+        if is_reimpl and footnote is not None and footnote not in footnotes_used:
+            footnotes_used.append(footnote)
+        label = f"{name}{symbol}" if is_reimpl else name
 
         row = [label]
         for cell in cells[name]:
             if cell is not None:
-                row += [f"{cell['acc']:.2f}", f"{to_gib(cell['comm_load']):.2f}"]
+                row += [
+                    f"{to_mb(cell['comm_load_cut']):.2f}",
+                    f"{to_mb(cell['comm_load_weights']):.2f}",
+                    f"{to_mb(cell['comm_load']):.2f}",
+                    f"{cell['cut_share_pct']:.0f}% cut",
+                    f"{cell['acc']:.2f}",
+                    f"{cell['latency_s']:.2f}",
+                    f"{cell['peak_memory_mb']:.2f}",
+                ]
             else:
-                row += ['N/A', 'N/A']
-        r_vals = ranks[name]
-        row.append(f"{np.mean(r_vals):.2f}" if r_vals else 'N/A')
+                row += ['N/A'] * 7
         table.add_row(row)
 
     print(table)
-    if footnote_needed:
-        print(REIMPL_FOOTNOTE)
+    for footnote in footnotes_used:
+        print(footnote)
 
     out_path = out_path or DEFAULT_OUT_PATH
     with open(out_path, 'w') as f:
         print(table, file=f)
-        if footnote_needed:
-            print(REIMPL_FOOTNOTE, file=f)
+        for footnote in footnotes_used:
+            print(footnote, file=f)
 
     return table
 

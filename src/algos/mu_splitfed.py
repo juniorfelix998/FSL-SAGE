@@ -70,6 +70,7 @@ class MU_SplitFed(FLAlgorithm):
         self.tau = self.cfg.tau
         self.mu = self.cfg.zo_mu
         self.eta_g = self.cfg.lr_g
+        self.P = self.cfg.zo_p
 
         self.servers = [copy.deepcopy(self.server) for _ in self.clients]
 
@@ -127,59 +128,72 @@ class MU_SplitFed(FLAlgorithm):
         self.comm_load_cut += h_fixed.numel() * h_fixed.element_size()
 
         # tau local server-only zeroth-order steps, reusing h_fixed -- no
-        # further client communication needed for these.
+        # further client communication needed for these. Each step's
+        # gradient estimate now averages P independent random directions
+        # (instead of a single one) to cut finite-difference variance,
+        # mirroring ho_sfl.py's zo_p multi-direction averaging.
         t0_s = time.time()
         for _ in range(self.tau):
             self.servers[i].optimizer.zero_grad()
-            s_seed = int(np.random.randint(0, 1_000_000))
 
-            _perturb(self.servers[i].model, s_seed, self.mu)
-            with torch.no_grad():
-                out_p = self.servers[i].model(h_fixed)
-                loss_p = self.criterion(out_p, y)
+            for _ in range(self.P):
+                s_seed = int(np.random.randint(0, 1_000_000))
 
-            _perturb(self.servers[i].model, s_seed, -2 * self.mu)
-            with torch.no_grad():
-                out_n = self.servers[i].model(h_fixed)
-                loss_n = self.criterion(out_n, y)
+                _perturb(self.servers[i].model, s_seed, self.mu)
+                with torch.no_grad():
+                    out_p = self.servers[i].model(h_fixed)
+                    loss_p = self.criterion(out_p, y)
 
-            _perturb(self.servers[i].model, s_seed, self.mu)  # restore
+                _perturb(self.servers[i].model, s_seed, -2 * self.mu)
+                with torch.no_grad():
+                    out_n = self.servers[i].model(h_fixed)
+                    loss_n = self.criterion(out_n, y)
 
-            scalar_s = (loss_p.item() - loss_n.item()) / (2 * self.mu)
-            _perturb_accumulate_grad(self.servers[i].model, s_seed, scalar_s)
+                _perturb(self.servers[i].model, s_seed, self.mu)  # restore
+
+                scalar_s = (loss_p.item() - loss_n.item()) / (2 * self.mu)
+                _perturb_accumulate_grad(
+                    self.servers[i].model, s_seed, scalar_s / self.P
+                )
             self.servers[i].optimizer.step()
         t_s = time.time() - t0_s
 
-        # client-side zeroth-order step: two more client forwards, each a
-        # fresh activation upload.
+        # client-side zeroth-order step: two more client forwards per
+        # direction, each a fresh activation upload. Averaged over P
+        # independent random directions, same variance-reduction rationale
+        # as the server loop above.
         t0_c = time.time()
-        c_seed = int(np.random.randint(0, 1_000_000))
+        for _ in range(self.P):
+            c_seed = int(np.random.randint(0, 1_000_000))
 
-        _perturb(self.clients[i].model, c_seed, self.mu)
-        with torch.no_grad():
-            h_pos = self.clients[i].model(x)
-        self.comm_load_cut += h_pos.numel() * h_pos.element_size()
+            _perturb(self.clients[i].model, c_seed, self.mu)
+            with torch.no_grad():
+                h_pos = self.clients[i].model(x)
+            self.comm_load_cut += h_pos.numel() * h_pos.element_size()
 
-        _perturb(self.clients[i].model, c_seed, -2 * self.mu)
-        with torch.no_grad():
-            h_neg = self.clients[i].model(x)
-        self.comm_load_cut += h_neg.numel() * h_neg.element_size()
+            _perturb(self.clients[i].model, c_seed, -2 * self.mu)
+            with torch.no_grad():
+                h_neg = self.clients[i].model(x)
+            self.comm_load_cut += h_neg.numel() * h_neg.element_size()
 
-        _perturb(self.clients[i].model, c_seed, self.mu)  # restore
+            _perturb(self.clients[i].model, c_seed, self.mu)  # restore
 
-        with torch.no_grad():
-            out_c_p = self.servers[i].model(h_pos)
-            loss_c_p = self.criterion(out_c_p, y)
-            out_c_n = self.servers[i].model(h_neg)
-            loss_c_n = self.criterion(out_c_n, y)
+            with torch.no_grad():
+                out_c_p = self.servers[i].model(h_pos)
+                loss_c_p = self.criterion(out_c_p, y)
+                out_c_n = self.servers[i].model(h_neg)
+                loss_c_n = self.criterion(out_c_n, y)
 
-        scalar_c = (loss_c_p.item() - loss_c_n.item()) / (2 * self.mu)
-        # one scalar sent back so the client can replay its own update --
-        # drives this client's own update this round, same role as HO-SFL's
-        # g_a_m, so it's classified as cut traffic, not an aggregation event.
-        self.comm_load_cut += torch.zeros(1).element_size()
+            scalar_c = (loss_c_p.item() - loss_c_n.item()) / (2 * self.mu)
+            # one scalar sent back per direction so the client can replay its
+            # own update -- drives this client's own update this round, same
+            # role as HO-SFL's g_a_m, so it's classified as cut traffic, not
+            # an aggregation event.
+            self.comm_load_cut += torch.zeros(1).element_size()
 
-        _perturb_accumulate_grad(self.clients[i].model, c_seed, scalar_c)
+            _perturb_accumulate_grad(
+                self.clients[i].model, c_seed, scalar_c / self.P
+            )
         self.clients[i].optimizer.step()
         t_c = time.time() - t0_c
 

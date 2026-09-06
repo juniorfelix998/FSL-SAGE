@@ -1,0 +1,15 @@
+defaults:
+  - base_algorithm
+
+name           : dsl_aux
+# weight on the client-side local auxiliary-classifier loss, combined with
+# the real server gradient injected across the cut -- starting point per the
+# paper's description, not a tuned value.
+aux_loss_weight: 1.0
+
+# NOTE: this method is non-federated per the paper (single client/server
+# split, no weight aggregation across clients) -- num_clients=1 is the
+# paper-faithful run configuration. num_clients>1 is structurally supported
+# by this harness (each client trains fully independently, nothing shared)
+# but is a degenerate extension beyond the paper's own setting, not the
+# intended comparison point.
