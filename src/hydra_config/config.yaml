@@ -2,6 +2,7 @@ defaults:
   - dataset   : cifar10
   - model     : simple_conv
   - algorithm : fsl_sage
+  - cut       : middle
   - optional dataset_model : ${dataset}_${model}
   - optional dataset_model_algorithm : ${dataset}_${model}_${algorithm}
 

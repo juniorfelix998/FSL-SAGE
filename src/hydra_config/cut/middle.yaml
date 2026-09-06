@@ -1,0 +1,15 @@
+# @package _global_
+# Middle cut (default, matches this harness's original behavior before cut
+# support was added): client keeps stem + layer1 + layer2 (2 of 4 stages).
+# `in_planes` for server/auxiliary is auto-derived from client_layers.
+cut_name: middle
+model:
+  client:
+    options:
+      client_layers: 2
+  server:
+    options:
+      client_layers: 2
+  auxiliary:
+    options:
+      client_layers: 2

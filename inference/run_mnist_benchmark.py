@@ -30,6 +30,7 @@ DEFAULT_METHODS = [
     'mu_splitfed', 'dsl_aux',
 ]
 DISTRIBUTIONS = [('iid', None), ('noniid_dirichlet', 0.5)]
+ALL_CUTS = ['shallow', 'middle', 'deep']
 
 # ------------------------------------------------------------------------------
 def parse_args():
@@ -45,43 +46,54 @@ def parse_args():
     p.add_argument('--seed', type=int, default=200)
     p.add_argument('--methods', nargs='+', default=DEFAULT_METHODS,
                     help="algorithm registry keys to sweep")
+    p.add_argument('--cuts', nargs='+', default=['middle'], choices=ALL_CUTS,
+                    help="which cut(s) to sweep (see hydra_config/cut/*.yaml) "
+                         "-- default is just 'middle' (this harness's original "
+                         "behavior); pass e.g. --cuts shallow middle deep to "
+                         "compare a method's sensitivity to cut depth "
+                         "(each cut produces its own table/plots)")
     p.add_argument('--device', default=None,
                     help="cuda or cpu; default auto-detects via "
                          "torch.cuda.is_available()")
-    p.add_argument('--num_clients', type=int, default=None,
-                    help="override cfg.num_clients; default leaves the "
-                         "harness's own default (10)")
+    p.add_argument('--num_clients_list', type=int, nargs='+', default=None,
+                    help="sweep multiple client counts (e.g. --num_clients_list "
+                         "2 10 100), each producing its own table/plots -- "
+                         "default runs once at the harness's own default (10), "
+                         "same as before this became a sweep dimension")
     p.add_argument('--skip_sweep', action='store_true',
                     help="skip training and just (re)build the table/plots "
                          "from whatever is already under saves/")
     return p.parse_args()
 
 # ------------------------------------------------------------------------------
-def run_sweep(methods, rounds, seed, device, num_clients):
+def run_sweep(methods, rounds, seed, device, num_clients_values, cuts):
     failures = []
-    for algo in methods:
-        for distribution, alpha in DISTRIBUTIONS:
-            cmd = [
-                sys.executable, 'main.py',
-                f'algorithm={algo}', 'model=resnet18', 'dataset=mnist',
-                f'dataset.distribution={distribution}',
-                f'rounds={rounds}', f'seed={seed}', 'save=True',
-                f'device={device}',
-            ]
-            if alpha is not None:
-                cmd.append(f'dataset.alpha={alpha}')
-            if num_clients is not None:
-                cmd.append(f'num_clients={num_clients}')
+    for cut in cuts:
+        for num_clients in num_clients_values:
+            for algo in methods:
+                for distribution, alpha in DISTRIBUTIONS:
+                    cmd = [
+                        sys.executable, 'main.py',
+                        f'algorithm={algo}', 'model=resnet18', 'dataset=mnist',
+                        f'cut={cut}',
+                        f'dataset.distribution={distribution}',
+                        f'rounds={rounds}', f'seed={seed}', 'save=True',
+                        f'device={device}',
+                    ]
+                    if alpha is not None:
+                        cmd.append(f'dataset.alpha={alpha}')
+                    if num_clients is not None:
+                        cmd.append(f'num_clients={num_clients}')
 
-            tag = f'{algo} / mnist-{distribution}'
-            tag += f' (alpha={alpha})' if alpha is not None else ''
-            print(f"\n=== {tag} ===")
+                    tag = f'{algo} / mnist-{distribution} / cut={cut} / num_clients={num_clients}'
+                    tag += f' (alpha={alpha})' if alpha is not None else ''
+                    print(f"\n=== {tag} ===")
 
-            env = dict(os.environ, WANDB_MODE='offline')
-            result = subprocess.run(cmd, cwd=SRC_DIR, env=env)
-            if result.returncode != 0:
-                print(f"[FAILED] {tag} (exit {result.returncode})")
-                failures.append((algo, distribution))
+                    env = dict(os.environ, WANDB_MODE='offline')
+                    result = subprocess.run(cmd, cwd=SRC_DIR, env=env)
+                    if result.returncode != 0:
+                        print(f"[FAILED] {tag} (exit {result.returncode})")
+                        failures.append((algo, distribution, cut, num_clients))
 
     if failures:
         print(f"\nSweep finished with failures: {failures}")
@@ -93,7 +105,7 @@ def run_sweep(methods, rounds, seed, device, num_clients):
 DISTRIBUTION_MARKERS = {'iid': 'o', 'noniid_dirichlet': '^'}
 
 
-def make_plots(cfg):
+def make_plots(cfg, cut='middle', num_clients=None):
     # Local import: plot_results.py appends '../' to sys.path and imports
     # `src.utils.plot_util`, which only resolves correctly when this
     # process's cwd is `inference/` -- same precondition plot_results.py has
@@ -102,7 +114,10 @@ def make_plots(cfg):
     import matplotlib.pyplot as plt
 
     columns = [('iid', None), ('noniid_dirichlet', cfg['alpha'])]
-    plots_root = os.path.join(os.path.dirname(__file__), 'plots_mnist')
+    plots_dir_name = 'plots_mnist' if cut == 'middle' else f'plots_mnist_{cut}'
+    if num_clients is not None:
+        plots_dir_name += f'_nc{num_clients}'
+    plots_root = os.path.join(os.path.dirname(__file__), plots_dir_name)
 
     pr.setup()
     # Fix one color per method up front so it stays identical across every
@@ -121,7 +136,7 @@ def make_plots(cfg):
         for name, meta in cfg['methods'].items():
             path = find_latest_run(
                 cfg['prefix_dir'], meta['key'], cfg['model'], cfg['dataset'],
-                distribution, alpha=alpha
+                distribution, alpha=alpha, cut=cut, num_clients=num_clients
             )
             if path is None:
                 continue
@@ -217,12 +232,19 @@ def main():
             "as the working directory."
         )
 
+    num_clients_values = args.num_clients_list or [None]
+
     if not args.skip_sweep:
-        run_sweep(args.methods, args.rounds, args.seed, device, args.num_clients)
+        run_sweep(
+            args.methods, args.rounds, args.seed, device, num_clients_values,
+            args.cuts
+        )
 
     cfg = load_table_config()
-    build_table(cfg)
-    make_plots(cfg)
+    for cut in args.cuts:
+        for num_clients in num_clients_values:
+            build_table(cfg, cut=cut, num_clients=num_clients)
+            make_plots(cfg, cut=cut, num_clients=num_clients)
 
 # ------------------------------------------------------------------------------
 if __name__ == '__main__':

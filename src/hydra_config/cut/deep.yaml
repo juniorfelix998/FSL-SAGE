@@ -1,0 +1,15 @@
+# @package _global_
+# Deep cut: client keeps stem + layer1 + layer2 + layer3 (3 of 4 stages) --
+# only layer4+avgpool+fc are left on the server.
+# `in_planes` for server/auxiliary is auto-derived from client_layers.
+cut_name: deep
+model:
+  client:
+    options:
+      client_layers: 3
+  server:
+    options:
+      client_layers: 3
+  auxiliary:
+    options:
+      client_layers: 3

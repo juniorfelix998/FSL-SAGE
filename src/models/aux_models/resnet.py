@@ -7,8 +7,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from models.resnet import BasicBlock, Bottleneck, conv1x1, conv3x3
+from models.resnet import BasicBlock, Bottleneck, conv1x1, conv3x3, _STAGE_OUT_PLANES
 from models.aux_models import register_auxiliary_model
+
+# ------------------------------------------------------------------------------
+# The auxiliary model is a single local "next stage" mirror of whatever the
+# client's cut leaves for the server to do -- keyed by `client_layers` (1, 2,
+# or 3, matching ResNetClient/ResNetServer's cut boundary): (attribute name,
+# planes, dilate-list index). Stride is always 2 for these stages. Keeping
+# the attribute name 'layer3' for the default client_layers=2 case preserves
+# state_dict key compatibility with checkpoints saved before cut support was
+# added.
+_AUX_STAGE_SPECS = {
+    1: ('layer2', 128, 0),
+    2: ('layer3', 256, 1),
+    3: ('layer4', 512, 2),
+}
 
 # ------------------------------------------------------------------------------
 class ResNetAuxiliary(aux_models.GradScalarAuxiliaryModel):
@@ -18,6 +32,7 @@ class ResNetAuxiliary(aux_models.GradScalarAuxiliaryModel):
         block: Type[Union[BasicBlock, Bottleneck]],
         layers: List[int],
         in_planes: int = 128,
+        client_layers: int = 2,
         num_classes: int = 1000,
         zero_init_residual: bool = False,
         groups: int = 1,
@@ -35,6 +50,10 @@ class ResNetAuxiliary(aux_models.GradScalarAuxiliaryModel):
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
 
+        if client_layers not in _AUX_STAGE_SPECS:
+            raise ValueError(f"client_layers must be 1, 2, or 3, got {client_layers}")
+        self.client_layers = client_layers
+
         self.inplanes = in_planes   # TODO: changed
         self.dilation = 1
         if replace_stride_with_dilation is None:
@@ -48,14 +67,14 @@ class ResNetAuxiliary(aux_models.GradScalarAuxiliaryModel):
             )
         self.groups = groups
         self.base_width = width_per_group
-        #self.layer2 = self._make_layer(
-        #    block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0]
-        #)
-        self.layer3 = self._make_layer(
-            block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1]
-        )
+        stage_name, planes, dilate_idx = _AUX_STAGE_SPECS[client_layers]
+        self._stage_name = stage_name
+        setattr(self, stage_name, self._make_layer(
+            block, planes, layers[client_layers],
+            stride=2, dilate=replace_stride_with_dilation[dilate_idx]
+        ))
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(256 * block.expansion, num_classes)
+        self.fc = nn.Linear(planes * block.expansion, num_classes)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -121,9 +140,7 @@ class ResNetAuxiliary(aux_models.GradScalarAuxiliaryModel):
         return nn.Sequential(*layers)
 
     def _forward_impl(self, x: Tensor) -> Tensor:
-        # See note [TorchScript super()]
-        #x = self.layer2(x)
-        x = self.layer3(x)
+        x = getattr(self, self._stage_name)(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         x = self.fc(x)
@@ -161,7 +178,8 @@ def _resnet_sl_auxiliary(
 
 # ------------------------------------------------------------------------------
 @register_auxiliary_model("resnet18", disable_check=True)
-def resnet18_sl_aux(server, layers=None, in_planes: int = 128,
+def resnet18_sl_aux(server, layers=None, client_layers: int = 2,
+    in_planes: Optional[int] = None,
     weights: Optional[Any] = None, progress: bool = True, num_classes: int = 10,
     device='cpu', **kwargs: Any
 ):
@@ -185,9 +203,12 @@ def resnet18_sl_aux(server, layers=None, in_planes: int = 128,
         :members:
     """
     if layers is None: layers = [2, 2, 2, 2]
+    if in_planes is None:
+        in_planes = _STAGE_OUT_PLANES[client_layers - 1]
     return _resnet_sl_auxiliary(
         server, BasicBlock, layers, in_planes, weights, progress,
-        num_classes=num_classes, device=device, **kwargs
+        client_layers=client_layers, num_classes=num_classes, device=device,
+        **kwargs
     )
 
 # ------------------------------------------------------------------------------

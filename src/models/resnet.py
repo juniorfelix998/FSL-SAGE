@@ -355,11 +355,21 @@ class ResNetClient(nn.Module):
         width_per_group: int = 64,
         replace_stride_with_dilation: Optional[List[bool]] = None,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
+        # how many of the 4 ResNet stages (layer1..layer4) live on the client
+        # -- 1 = "shallow" cut, 2 = "middle" cut (default, unchanged prior
+        # behavior), 3 = "deep" cut. The matching ResNetServer/ResNetAuxiliary
+        # must be constructed with the same value. See CLAUDE.md's
+        # "Cuts: early/middle/late" benchmark dimension.
+        client_layers: int = 2,
     ) -> None:
         super().__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
+
+        if client_layers not in (1, 2, 3):
+            raise ValueError(f"client_layers must be 1, 2, or 3, got {client_layers}")
+        self.client_layers = client_layers
 
         self.inplanes = 64
         self.dilation = 1
@@ -379,7 +389,10 @@ class ResNetClient(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        if client_layers >= 2:
+            self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        if client_layers >= 3:
+            self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -448,11 +461,20 @@ class ResNetClient(nn.Module):
         x = self.maxpool(x)
 
         x = self.layer1(x)
-        x = self.layer2(x)
+        if self.client_layers >= 2:
+            x = self.layer2(x)
+        if self.client_layers >= 3:
+            x = self.layer3(x)
         return x
 
     def forward(self, x: Tensor) -> Tensor:
         return self._forward_impl(x)
+
+# ------------------------------------------------------------------------------
+# channel width at the output of each of the 4 ResNet stages (before block
+# expansion), used to derive the server's starting `inplanes` for whichever
+# cut boundary it's built with.
+_STAGE_OUT_PLANES = [64, 128, 256, 512]
 
 # ------------------------------------------------------------------------------
 class ResNetServer(nn.Module):
@@ -467,11 +489,22 @@ class ResNetServer(nn.Module):
         width_per_group: int = 64,
         replace_stride_with_dilation: Optional[List[bool]] = None,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
+        # must match the paired ResNetClient's client_layers -- see its
+        # docstring. Only used to decide which of layer2/layer3 the server
+        # itself must build (layer1 is always client-side, layer4 is always
+        # server-side); `inplanes` (above) still governs the server's actual
+        # starting channel width and is expected to already be set
+        # consistently with client_layers by the caller.
+        client_layers: int = 2,
     ) -> None:
         super().__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
+
+        if client_layers not in (1, 2, 3):
+            raise ValueError(f"client_layers must be 1, 2, or 3, got {client_layers}")
+        self.client_layers = client_layers
 
         self.inplanes = inplanes  # TODO: changed
         self.dilation = 1
@@ -486,7 +519,10 @@ class ResNetServer(nn.Module):
             )
         self.groups = groups
         self.base_width = width_per_group
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
+        if client_layers <= 1:
+            self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        if client_layers <= 2:
+            self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(512 * block.expansion, num_classes)
@@ -552,8 +588,10 @@ class ResNetServer(nn.Module):
 
     def _forward_impl(self, x: Tensor) -> Tensor:
         # See note [TorchScript super()]
-        #x = self.layer2(x)
-        x = self.layer3(x)
+        if self.client_layers <= 1:
+            x = self.layer2(x)
+        if self.client_layers <= 2:
+            x = self.layer3(x)
         x = self.layer4(x)
 
         x = self.avgpool(x)
@@ -628,7 +666,8 @@ def resnet18_sl_client(*,
 
 # ------------------------------------------------------------------------------
 def resnet18_sl_server(*,
-    in_planes: int = 128, weights: Optional[Any] = None, progress: bool = True,
+    client_layers: int = 2, in_planes: Optional[int] = None,
+    weights: Optional[Any] = None, progress: bool = True,
     **kwargs: Any
 ):
     """ResNet-18 from `Deep Residual Learning for Image Recognition
@@ -650,8 +689,11 @@ def resnet18_sl_server(*,
     .. autoclass:: torchvision.models.ResNet18_Weights
         :members:
     """
+    if in_planes is None:
+        in_planes = _STAGE_OUT_PLANES[client_layers - 1]
     return _resnet_sl_server(
-        BasicBlock, [2, 2, 2, 2], in_planes, weights, progress, **kwargs
+        BasicBlock, [2, 2, 2, 2], in_planes, weights, progress,
+        client_layers=client_layers, **kwargs
     )
 
 # ------------------------------------------------------------------------------

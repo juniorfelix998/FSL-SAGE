@@ -104,7 +104,14 @@ def create_save_dir(cfg):
     train_info += f"-seed{cfg.seed}"
 
     timestamp = datetime.now().strftime(r'%y%m%d-%H%M%S')
-    dir_name = os.path.join(cfg.algorithm.name, cfg.model.name, client_info, train_info)
+    # cut_name (shallow/middle/deep, see hydra_config/cut/*.yaml) is part of
+    # the path so results from different cuts don't collide under the same
+    # (algo, model, dataset-distribution, train_info) folder and can be
+    # looked up separately by results_loader.find_latest_run.
+    cut_name = cfg.get('cut_name', 'middle')
+    dir_name = os.path.join(
+        cfg.algorithm.name, cfg.model.name, cut_name, client_info, train_info
+    )
     exp_dir = os.path.join(dir_name, timestamp)
     if cfg.save:
         os.makedirs(os.path.join(cfg.save_dir_prefix, dir_name), exist_ok=True)

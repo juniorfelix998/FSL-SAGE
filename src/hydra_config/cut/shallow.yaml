@@ -1,0 +1,18 @@
+# @package _global_
+# Shallow cut: client keeps only the stem + layer1 (1 of 4 ResNet stages).
+# Smallest possible client-side model in this harness's 3-cut scheme.
+# `in_planes` for server/auxiliary is auto-derived from client_layers by
+# resnet18_sl_server/resnet18_sl_aux -- no need to set it here. Harmless no-op
+# for non-resnet18 models (their own client_layers-unaware constructors
+# silently absorb and ignore this kwarg via **kwargs).
+cut_name: shallow
+model:
+  client:
+    options:
+      client_layers: 1
+  server:
+    options:
+      client_layers: 1
+  auxiliary:
+    options:
+      client_layers: 1

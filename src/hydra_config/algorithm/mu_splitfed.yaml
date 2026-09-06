@@ -6,9 +6,11 @@ zo_mu   : 0.005
 lr_c    : 0.005
 lr_s    : 0.01
 lr_g    : 0.3
-# number of independent random ZO directions averaged per gradient estimate
-# (both client and server steps) -- mirrors ho_sfl.yaml's zo_p, adapted here
-# to reduce single-direction finite-difference variance. Starting point for
-# a correctness fix, not a tuned value: multiplies per-round compute by
-# ~tau * zo_p on top of today's ~tau.
-zo_p    : 5
+# matches the reference's own conf/mu_splitfed.yaml (HKU-WILL-Lab/HO-SFL):
+# use_pretrained loads an ImageNet-pretrained ResNet18 backbone at init;
+# freeze_bn freezes BatchNorm's affine weight/bias (requires_grad=False) so
+# the ZO perturbation loop skips them, while running mean/var still adapt
+# normally in train mode -- see src/algos/mu_splitfed.py's header comment for
+# the full explanation and why this does NOT mean BatchNorm runs in eval mode.
+use_pretrained : true
+freeze_bn      : true

@@ -19,9 +19,13 @@ from results_loader import find_latest_run, load_run
 DEFAULT_CONFIG_PATH = os.path.join(
     os.path.dirname(__file__), 'benchmark_table_config.yaml'
 )
-DEFAULT_OUT_PATH = os.path.join(
-    os.path.dirname(__file__), 'benchmark_table_mnist.txt'
-)
+def default_out_path(cut='middle', num_clients=None):
+    suffix = '' if cut == 'middle' else f'_{cut}'
+    if num_clients is not None:
+        suffix += f'_nc{num_clients}'
+    return os.path.join(
+        os.path.dirname(__file__), f'benchmark_table_mnist{suffix}.txt'
+    )
 # per-method provenance footnotes, keyed by the algorithm's config key
 # (`cfg['methods'][name]['key']`) -- each row that's flagged `reimplementation:
 # true` in benchmark_table_config.yaml gets labeled with its own symbol, and
@@ -50,18 +54,18 @@ def load_config(config_path=None):
         return yaml.safe_load(f)
 
 # ------------------------------------------------------------------------------
-def collect_cell(cfg, algo_key, distribution, alpha=None):
-    '''Find the latest run for (algo_key, distribution[, alpha]) and pull its
-    final-round test accuracy (%), cut/weights/total comm_load (bytes), and
-    the run's latency (s) and peak memory (MB). Returns None if no matching
-    run exists yet.
+def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle', num_clients=None):
+    '''Find the latest run for (algo_key, distribution[, alpha], cut[,
+    num_clients]) and pull its final-round test accuracy (%),
+    cut/weights/total comm_load (bytes), and the run's latency (s) and peak
+    memory (MB). Returns None if no matching run exists yet.
 
     `latency_s`/`peak_memory_mb` are bare scalars in `results.json` (unlike
     `test_acc`/`comm_load*`, which are per-round lists) -- not `[-1]`-indexed.
     '''
     path = find_latest_run(
         cfg['prefix_dir'], algo_key, cfg['model'], cfg['dataset'], distribution,
-        alpha=alpha
+        alpha=alpha, cut=cut, num_clients=num_clients
     )
     if path is None:
         return None
@@ -92,14 +96,17 @@ def to_mb(comm_load_bytes):
     return comm_load_bytes / (1024 ** 2)
 
 # ------------------------------------------------------------------------------
-def build_table(cfg=None, out_path=None):
+def build_table(cfg=None, out_path=None, cut='middle', num_clients=None):
     cfg = cfg or load_config()
     columns = columns_spec(cfg)
     methods = list(cfg['methods'].keys())
 
     cells = {
         name: [
-            collect_cell(cfg, cfg['methods'][name]['key'], dist, alpha)
+            collect_cell(
+                cfg, cfg['methods'][name]['key'], dist, alpha,
+                cut=cut, num_clients=num_clients
+            )
             for _, dist, alpha in columns
         ] for name in methods
     }
@@ -141,12 +148,15 @@ def build_table(cfg=None, out_path=None):
                 row += ['N/A'] * 7
         table.add_row(row)
 
+    header = f"Cut: {cut}, num_clients: {num_clients if num_clients is not None else 'default'}"
+    print(header)
     print(table)
     for footnote in footnotes_used:
         print(footnote)
 
-    out_path = out_path or DEFAULT_OUT_PATH
+    out_path = out_path or default_out_path(cut, num_clients)
     with open(out_path, 'w') as f:
+        print(header, file=f)
         print(table, file=f)
         for footnote in footnotes_used:
             print(footnote, file=f)

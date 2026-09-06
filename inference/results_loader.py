@@ -9,22 +9,32 @@ import glob
 import json
 
 # ------------------------------------------------------------------------------
-def find_latest_run(prefix_dir, algo_key, model, dataset, distribution, alpha=None):
+def find_latest_run(prefix_dir, algo_key, model, dataset, distribution,
+                     alpha=None, cut='middle', num_clients=None):
     '''Find the most recently produced `results.json` for a given
-    (algorithm, model, dataset, distribution[, alpha]) combination.
+    (algorithm, model, dataset, distribution[, alpha], cut[, num_clients])
+    combination.
 
     Mirrors the save path built by `create_save_dir()` in `src/utils/utils.py`:
-        <prefix_dir>/<algo_key>/<model>/<dataset>-<distribution>/<train_info>/<timestamp>/results.json
-    where `train_info` includes a `-alp{alpha:.2e}` substring when
-    `distribution == 'noniid_dirichlet'`, which is why `alpha` needs its own
-    glob term rather than just filtering on `distribution`.
+        <prefix_dir>/<algo_key>/<model>/<cut>/<dataset>-<distribution>/<train_info>/<timestamp>/results.json
+    where `train_info` looks like `R{rounds}m{num_clients}E{epoch}B{batch}...`,
+    optionally followed by `-alp{alpha:.2e}` when
+    `distribution == 'noniid_dirichlet'`. `num_clients=None` matches any
+    client count (glob `*`); pass an int to filter to a specific sweep value.
+    `cut` defaults to 'middle' (this harness's original, pre-cut-support
+    behavior) -- pass 'shallow'/'deep' to look up those cuts' runs instead.
 
     Returns the path to the most recent matching `results.json` (by directory
     name, which sorts chronologically since timestamps are `%y%m%d-%H%M%S`), or
     None if no run matches.
     '''
-    base = os.path.join(prefix_dir, algo_key, model, f"{dataset}-{distribution}")
-    train_info_glob = f"*alp{alpha:.2e}*" if alpha is not None else "*"
+    base = os.path.join(prefix_dir, algo_key, model, cut, f"{dataset}-{distribution}")
+    filters = []
+    if num_clients is not None:
+        filters.append(f"m{num_clients}E")
+    if alpha is not None:
+        filters.append(f"alp{alpha:.2e}")
+    train_info_glob = "*" + "*".join(filters) + "*" if filters else "*"
     pattern = os.path.join(base, train_info_glob, "**", "results.json")
     matches = sorted(glob.glob(pattern, recursive=True))
     return matches[-1] if matches else None
