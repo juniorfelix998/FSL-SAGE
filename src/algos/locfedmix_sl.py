@@ -96,7 +96,7 @@ class LocFedMixSL(FLAlgorithm):
         client_layers = getattr(self.clients[0].model, 'client_layers', 2)
         in_channels = _STAGE_OUT_PLANES[client_layers - 1]
 
-        decoder0 = _ReconstructionDecoder(in_channels)
+        decoder0 = _ReconstructionDecoder(in_channels).to(self.device)
         self.decoders = [decoder0] + [
             copy.deepcopy(decoder0) for _ in self.clients[1:]
         ]
