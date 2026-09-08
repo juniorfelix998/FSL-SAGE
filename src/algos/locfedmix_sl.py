@@ -163,7 +163,7 @@ class LocFedMixSL(FLAlgorithm):
             _, predicted = torch.max(out.data, 1)
             train_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
-        self._round_buf.append((smashed_data.detach(), y.detach()))
+        self._round_buf.append((i, smashed_data.detach(), y.detach()))
 
         return {
             'acc': train_correct / y.size(dim=0),
@@ -180,10 +180,20 @@ class LocFedMixSL(FLAlgorithm):
         mixup_loss_total = 0.0
         if n >= 2:
             for idx in range(n):
-                s_a, y_a = self._round_buf[idx]
-                delta_i = self.agg_factor[idx]
+                client_a, s_a, y_a = self._round_buf[idx]
+                delta_i = self.agg_factor[client_a]
                 for p in range(1, self.mixup_partners + 1):
-                    s_b, y_b = self._round_buf[(idx + p) % n]
+                    # advance until we land on a different client's smashed
+                    # data -- the buffer is filled one client's local batches
+                    # at a time, so a plain (idx+p)%n mostly re-pairs a
+                    # client with its own other batches, whereas the paper's
+                    # mixup (Eq. 5) is defined between two DIFFERENT clients.
+                    partner_idx = (idx + p) % n
+                    tries = 0
+                    while self._round_buf[partner_idx][0] == client_a and tries < n:
+                        partner_idx = (partner_idx + 1) % n
+                        tries += 1
+                    _, s_b, y_b = self._round_buf[partner_idx]
                     m = min(s_a.size(0), s_b.size(0))
                     lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
                     mixed = lam * s_a[:m] + (1 - lam) * s_b[:m]
