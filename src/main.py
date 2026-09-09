@@ -251,8 +251,20 @@ def main(cfg: DictConfig):
         'comm_load'         : results.comm_load,
         'comm_load_cut'     : results.comm_load_cut,
         'comm_load_weights' : results.comm_load_weights,
+        # per-category cumulative bytes per round -- makes the headline ranking
+        # inspectable (e.g. a BP-free method must show cut.grad_down == 0)
+        'comm_breakdown'    : results.comm_breakdown,
         'latency_s'         : total_latency_s,
+        # whole-process RSS. Kept under its historical key for backward
+        # compatibility, but it is a DIAGNOSTIC, not the per-device memory
+        # metric: it is dominated by the interpreter, torch, the dataset in RAM
+        # and every simulated client's model being resident at once. Use
+        # peak_client_mem_mb / peak_server_mem_mb below for the benchmark.
         'peak_memory_mb'    : peak_memory_mb,
+        'peak_process_mem_mb': peak_memory_mb,
+        'run_manifest'      : utils.run_manifest(cfg, global_torch_device),
+        **results.comm_to_target,
+        **results.memory_metrics,
         **train_metrics,
         **results.avg_compute_times
     }

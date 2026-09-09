@@ -68,44 +68,63 @@ class DSLAux(FLAlgorithm):
         for c in self.clients:
             c.auxiliary_model.eval()
 
+    # the local auxiliary classifier head is resident on the client device
+    def client_side_modules(self, i):
+        return [self.clients[i].model, self.clients[i].auxiliary_model]
+
+    def client_side_optimizers(self, i):
+        return [self.clients[i].optimizer, self.clients[i].auxiliary_model.optimizer]
+
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
 
-        self.clients[i].optimizer.zero_grad()
-        self.clients[i].auxiliary_model.optimizer.zero_grad()
-        self.server.optimizer.zero_grad()
+        # NOTE this method interleaves one client graph across the cut: the
+        # client's graph is built, held while the server runs, and then
+        # backwarded TWICE (once for the local auxiliary loss with
+        # retain_graph=True, once for the injected server gradient). Phases are
+        # therefore bracketed by which MODULE owns the work, not by wall-clock
+        # ordering -- `smashed_data` is a fresh detached leaf, so none of the
+        # client's graph is mis-attributed to the server.
+        with self.phase('client', i):
+            self.clients[i].optimizer.zero_grad()
+            self.clients[i].auxiliary_model.optimizer.zero_grad()
 
-        # real client forward -- graph stays attached (not detached) so both
-        # the real server gradient and the local auxiliary loss's gradient
-        # can later accumulate into this client model's own parameters.
-        splitting_output = self.clients[i].model(x)
+            # real client forward -- graph stays attached (not detached) so both
+            # the real server gradient and the local auxiliary loss's gradient
+            # can later accumulate into this client model's own parameters.
+            splitting_output = self.clients[i].model(x)
 
         # separate leaf sent across the cut to the server (real activation
         # upload, matching the reference's `train_standard_split`).
         smashed_data = splitting_output.clone().detach().requires_grad_(True)
-        self.comm_load_cut += smashed_data.numel() * smashed_data.element_size()
+        self.charge_cut_activation(smashed_data)
+        self.charge_cut_labels(y)     # loss is computed server-side
 
-        # real server forward + backward (first-order -- unlike ho_sfl/mu_splitfed).
-        out = self.server.model(smashed_data)
-        loss = self.criterion(out, y)
-        loss.backward()
-        self.server.optimizer.step()
+        with self.phase('server', i):
+            self.server.optimizer.zero_grad()
+            # real server forward + backward (first-order, unlike ho_sfl/mu_splitfed)
+            out = self.server.model(smashed_data)
+            loss = self.criterion(out, y)
+            loss.backward()
+            self.server.optimizer.step()
 
         grad_at_cut = smashed_data.grad.clone().detach()
-        self.comm_load_cut += grad_at_cut.numel() * grad_at_cut.element_size()
+        self.charge_cut_gradient(grad_at_cut)
+        self.hold('client', grad_at_cut, i=i)
 
-        # client-side auxiliary local loss on the same (still-attached)
-        # output -- its backward adds gradient into the client's own conv
-        # params too, on top of the real server gradient injected below.
-        aux_out = self.clients[i].auxiliary_model.forward_inner(splitting_output)
-        aux_loss = self.criterion(aux_out, y)
-        (self.aux_loss_weight * aux_loss).backward(retain_graph=True)
+        with self.phase('client', i):
+            # client-side auxiliary local loss on the same (still-attached)
+            # output -- its backward adds gradient into the client's own conv
+            # params too, on top of the real server gradient injected below.
+            aux_out = self.clients[i].auxiliary_model.forward_inner(splitting_output)
+            aux_loss = self.criterion(aux_out, y)
+            (self.aux_loss_weight * aux_loss).backward(retain_graph=True)
 
-        # inject the real server gradient at the cut into the same client graph.
-        splitting_output.backward(grad_at_cut)
+            # inject the real server gradient at the cut into the same client graph.
+            splitting_output.backward(grad_at_cut)
 
-        self.clients[i].optimizer.step()
-        self.clients[i].auxiliary_model.optimizer.step()
+            self.clients[i].optimizer.step()
+            self.clients[i].auxiliary_model.optimizer.step()
 
         with torch.no_grad():
             _, predicted = torch.max(out.data, 1)

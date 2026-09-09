@@ -10,6 +10,7 @@
 # `results_loader.find_latest_run` rather than requiring hand-edited paths, so
 # this can be re-run as more methods/seeds are added without config edits.
 # ------------------------------------------------------------------------------
+import math
 import os
 import yaml
 from prettytable import PrettyTable
@@ -77,34 +78,90 @@ def load_config(config_path=None):
         return yaml.safe_load(f)
 
 # ------------------------------------------------------------------------------
-def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle', num_clients=None):
-    '''Find the latest run for (algo_key, distribution[, alpha], cut[,
-    num_clients]) and pull its final-round test accuracy (%),
-    cut/weights/total comm_load (bytes), and the run's latency (s) and peak
-    memory (MB). Returns None if no matching run exists yet.
+def _summarise(runs, key, scale=1.0, per_round=False):
+    '''(mean, std, n) of one metric across the seed runs for a cell.
 
-    `latency_s`/`peak_memory_mb` are bare scalars in `results.json` (unlike
-    `test_acc`/`comm_load*`, which are per-round lists) -- not `[-1]`-indexed.
+    Returns (None, None, 0) when no run reports the metric -- which happens for
+    a metric added after those runs were produced, and for `comm_to_target` when
+    a method never reached the target accuracy. That is deliberately propagated
+    as "not available" rather than silently coerced to 0: a method that did not
+    converge must not be ranked as if it had.
     '''
-    path = find_latest_run(
-        cfg['prefix_dir'], algo_key, cfg['model'], cfg['dataset'], distribution,
-        alpha=alpha, cut=cut, num_clients=num_clients
-    )
-    if path is None:
+    vals = []
+    for run in runs:
+        v = run.get(key)
+        if per_round:
+            v = v[-1] if v else None
+        if v is None:
+            continue
+        vals.append(float(v) * scale)
+    if not vals:
+        return None, None, 0
+    mean = sum(vals) / len(vals)
+    if len(vals) == 1:
+        return mean, 0.0, 1
+    var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+    return mean, math.sqrt(var), len(vals)
+
+
+# ------------------------------------------------------------------------------
+def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
+                  num_clients=None, seeds=None):
+    '''Collect one table cell, averaged over `seeds` (CLAUDE.md: "Seeds: 3
+    default"). With `seeds=None` the single most recent matching run is used,
+    which is the pre-multi-seed behaviour.
+
+    Also returns the run's own (rounds, num_clients, cut, seed) so `build_table`
+    can flag cells that are not actually comparable -- the previous version
+    silently compared a 5-round 1-client run against a 3-round 2-client one.
+    '''
+    seed_list = seeds if seeds else [None]
+    runs = []
+    for seed in seed_list:
+        path = find_latest_run(
+            cfg['prefix_dir'], algo_key, cfg['model'], cfg['dataset'],
+            distribution, alpha=alpha, cut=cut, num_clients=num_clients,
+            seed=seed
+        )
+        if path is not None:
+            runs.append(load_run(path))
+    if not runs:
         return None
-    run = load_run(path)
-    comm_cut = run['comm_load_cut'][-1]
-    comm_weights = run['comm_load_weights'][-1]
-    comm_total = run['comm_load'][-1]
-    return {
-        'acc': run['test_acc'][-1] * 100.0,
-        'comm_load_cut': comm_cut,
-        'comm_load_weights': comm_weights,
-        'comm_load': comm_total,
-        'cut_share_pct': 100.0 * comm_cut / comm_total if comm_total > 0 else 0.0,
-        'latency_s': run['latency_s'],
-        'peak_memory_mb': run['peak_memory_mb'],
-    }
+
+    MB = 1024 ** 2
+    cut_mean, _, _ = _summarise(runs, 'comm_load_cut', per_round=True)
+    tot_mean, _, _ = _summarise(runs, 'comm_load', per_round=True)
+
+    def fields(*specs):
+        return {label: _summarise(runs, key, scale, per_round)
+                for label, key, scale, per_round in specs}
+
+    cell = fields(
+        ('acc',            'test_acc',                      100.0, True),
+        ('comm_cut',       'comm_load_cut',              1.0 / MB, True),
+        ('comm_weights',   'comm_load_weights',          1.0 / MB, True),
+        ('comm_total',     'comm_load',                  1.0 / MB, True),
+        ('comm_to_target', 'comm_to_target',             1.0 / MB, False),
+        ('latency_s',      'latency_s',                       1.0, False),
+        ('client_mem',     'peak_client_mem_mb',              1.0, False),
+        ('server_mem',     'peak_server_mem_mb',              1.0, False),
+        ('held_mem',       'client_mem_held_across_cut_mb',   1.0, False),
+        ('process_rss',    'peak_memory_mb',                  1.0, False),
+    )
+    cell['cut_share_pct'] = (
+        100.0 * cut_mean / tot_mean if cut_mean is not None and tot_mean else 0.0
+    )
+    cell['n_seeds'] = len(runs)
+    cell['settings'] = [
+        (
+            r.get('run_manifest', {}).get('rounds', len(r.get('test_acc', []))),
+            r.get('run_manifest', {}).get('num_clients'),
+            r.get('run_manifest', {}).get('cut'),
+            r.get('run_manifest', {}).get('device'),
+        )
+        for r in runs
+    ]
+    return cell
 
 # ------------------------------------------------------------------------------
 def columns_spec(cfg):
@@ -114,21 +171,53 @@ def columns_spec(cfg):
         (f"MNIST α={cfg['alpha']}", 'noniid_dirichlet', cfg['alpha']),
     ]
 
-# ------------------------------------------------------------------------------
-def to_mb(comm_load_bytes):
-    return comm_load_bytes / (1024 ** 2)
 
 # ------------------------------------------------------------------------------
-def build_table(cfg=None, out_path=None, cut='middle', num_clients=None):
+# per-column metrics, in table order. `ranked` marks the value the benchmark
+# ranks on: cumulative bytes at the FINAL round is round-count dependent (it
+# penalises a method run for longer and rewards one that converges slowly), so
+# bytes-to-reach-the-target-accuracy is the headline number instead.
+METRIC_COLUMNS = [
+    # (column label, cell key, format precision)
+    ('Comm-cut (MB)',      'comm_cut',       2),
+    ('Comm-weights (MB)',  'comm_weights',   2),
+    ('Comm-total (MB)',    'comm_total',     2),
+    ('Comm-to-target (MB)', 'comm_to_target', 2),
+    ('Acc (%)',            'acc',            2),
+    ('Latency (s)',        'latency_s',      2),
+    ('Client mem (MB)',    'client_mem',     2),
+    ('Held-across-cut (MB)', 'held_mem',     3),
+    ('Server mem (MB)',    'server_mem',     2),
+]
+
+
+def _fmt(cell, key, prec):
+    '''mean+/-std across seeds, or "n/a" when the metric is absent.
+
+    "n/a" for Comm-to-target means the method never reached the target accuracy
+    -- shown as such rather than as a number, because there is no honest
+    communication cost to report for a run that did not converge.
+    '''
+    mean, std, n = cell.get(key, (None, None, 0))
+    if mean is None:
+        return 'n/a'
+    if n > 1:
+        return f"{mean:.{prec}f}+/-{std:.{prec}f}"
+    return f"{mean:.{prec}f}"
+
+
+def build_table(cfg=None, out_path=None, cut='middle', num_clients=None,
+                 seeds=None, target_acc=None):
     cfg = cfg or load_config()
     columns = columns_spec(cfg)
     methods = list(cfg['methods'].keys())
+    target_acc = target_acc if target_acc is not None else cfg.get('target_acc')
 
     cells = {
         name: [
             collect_cell(
                 cfg, cfg['methods'][name]['key'], dist, alpha,
-                cut=cut, num_clients=num_clients
+                cut=cut, num_clients=num_clients, seeds=seeds
             )
             for _, dist, alpha in columns
         ] for name in methods
@@ -137,14 +226,13 @@ def build_table(cfg=None, out_path=None, cut='middle', num_clients=None):
     table = PrettyTable()
     col_names = ['Method']
     for name, _, _ in columns:
-        col_names += [
-            f'{name} Comm-cut (MB)', f'{name} Comm-weights (MB)',
-            f'{name} Comm-total (MB)', f'{name} Cut vs. weights',
-            f'{name} Acc (%)', f'{name} Latency (s)', f'{name} Peak mem (MB)',
-        ]
+        col_names += [f'{name} {label}' for label, _, _ in METRIC_COLUMNS]
+        col_names.append(f'{name} Cut vs. weights')
     table.field_names = col_names
 
     footnotes_used = []
+    observed_settings = set()
+    seed_counts = set()
     for name in methods:
         meta = cfg['methods'][name]
         is_reimpl = meta.get('reimplementation', False)
@@ -158,31 +246,65 @@ def build_table(cfg=None, out_path=None, cut='middle', num_clients=None):
         row = [label]
         for cell in cells[name]:
             if cell is not None:
-                row += [
-                    f"{to_mb(cell['comm_load_cut']):.2f}",
-                    f"{to_mb(cell['comm_load_weights']):.2f}",
-                    f"{to_mb(cell['comm_load']):.2f}",
-                    f"{cell['cut_share_pct']:.0f}% cut",
-                    f"{cell['acc']:.2f}",
-                    f"{cell['latency_s']:.2f}",
-                    f"{cell['peak_memory_mb']:.2f}",
-                ]
+                row += [_fmt(cell, key, prec) for _, key, prec in METRIC_COLUMNS]
+                row.append(f"{cell['cut_share_pct']:.0f}% cut")
+                observed_settings.update(cell['settings'])
+                seed_counts.add(cell['n_seeds'])
             else:
-                row += ['N/A'] * 7
+                row += ['N/A'] * (len(METRIC_COLUMNS) + 1)
         table.add_row(row)
 
     header = f"Cut: {cut}, num_clients: {num_clients if num_clients is not None else 'default'}"
-    print(header)
-    print(table)
-    for footnote in footnotes_used:
-        print(footnote)
+    if target_acc is not None:
+        header += f", Comm-to-target measured at acc >= {float(target_acc) * 100:.1f}%"
 
+    # Comparability guard. Cumulative comm and wall-clock latency are only
+    # comparable across cells that ran the same protocol, and memory is not
+    # comparable across devices at all (cuDNN saves a different set of
+    # intermediates than the CPU kernels). Previously the table just printed
+    # whatever it found; now a mismatch is stated on the face of it.
+    warnings = []
+    distinct = {s for s in observed_settings if any(v is not None for v in s)}
+    if len({d[0] for d in distinct}) > 1:
+        warnings.append(
+            "!! NOT COMPARABLE: cells were run for different round counts "
+            f"({sorted({d[0] for d in distinct})}). Cumulative comm and latency "
+            "scale with rounds -- rank on Comm-to-target, or re-run at matched "
+            "rounds."
+        )
+    if len({d[1] for d in distinct if d[1] is not None}) > 1:
+        warnings.append(
+            "!! NOT COMPARABLE: cells were run with different client counts "
+            f"({sorted({d[1] for d in distinct if d[1] is not None})}). "
+            "Comm and weight traffic scale with the number of clients."
+        )
+    if len({d[2] for d in distinct if d[2] is not None}) > 1:
+        warnings.append(
+            "!! NOT COMPARABLE: cells were run at different cuts "
+            f"({sorted({d[2] for d in distinct if d[2] is not None})})."
+        )
+    devices = {d[3] for d in distinct if d[3] is not None}
+    if len(devices) > 1:
+        warnings.append(
+            f"!! MEMORY NOT COMPARABLE: cells span devices ({sorted(devices)}). "
+            "Retained-activation bytes differ between CPU and cuDNN kernels."
+        )
+    if seed_counts and max(seed_counts) < 3:
+        warnings.append(
+            f"NOTE: at most {max(seed_counts)} seed(s) per cell; CLAUDE.md's "
+            "protocol is 3. Values shown without +/- are single runs."
+        )
+
+    def emit(stream=None):
+        print(header, file=stream) if stream else print(header)
+        print(table, file=stream) if stream else print(table)
+        for line in warnings + footnotes_used:
+            print(line, file=stream) if stream else print(line)
+
+    emit()
     out_path = out_path or default_out_path(cut, num_clients)
     with open(out_path, 'w') as f:
-        print(header, file=f)
-        print(table, file=f)
-        for footnote in footnotes_used:
-            print(footnote, file=f)
+        emit(f)
 
     return table
 

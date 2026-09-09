@@ -45,7 +45,6 @@ import copy
 import torch
 
 from algos import register_algorithm, aggregate_models, FLAlgorithm
-from utils.utils import calculate_load
 
 # ------------------------------------------------------------------------------
 @register_algorithm("fedsplitx")
@@ -74,43 +73,63 @@ class FedSplitX(FLAlgorithm):
         for c in self.clients:
             c.auxiliary_model.eval()
 
+    # auxiliary head lives on the client; the server host holds one
+    # replica per client
+    def client_side_modules(self, i):
+        return [self.clients[i].model, self.clients[i].auxiliary_model]
+
+    def client_side_optimizers(self, i):
+        return [self.clients[i].optimizer,
+                self.clients[i].auxiliary_model.optimizer]
+
+    def server_side_modules(self):
+        return [s.model for s in self.servers]
+
+    def server_side_optimizers(self):
+        return [s.optimizer for s in self.servers]
+
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
 
-        self.clients[i].optimizer.zero_grad()
-        self.clients[i].auxiliary_model.optimizer.zero_grad()
-        self.servers[i].optimizer.zero_grad()
+        with self.phase('client', i):
+            self.clients[i].optimizer.zero_grad()
+            self.clients[i].auxiliary_model.optimizer.zero_grad()
+            self.servers[i].optimizer.zero_grad()
 
-        # Client_Update (Algorithm 1, lines 13-16): local collaborative loss
-        # via the client's own auxiliary head -- at M=1 this is the client's
-        # only auxiliary network, so the "sum over m auxiliary logits" in
-        # Sec. 2.2's F^c_k reduces to this single term.
-        splitting_output = self.clients[i].model(x)
-        aux_out = self.clients[i].auxiliary_model.forward_inner(splitting_output)
-        client_loss = self.criterion(aux_out, y)
-        client_loss.backward()
-        self.clients[i].optimizer.step()
-        self.clients[i].auxiliary_model.optimizer.step()
+            # Client_Update (Algorithm 1, lines 13-16): local collaborative
+            # loss via the client's own auxiliary head -- at M=1 this is the
+            # client's only auxiliary network, so the "sum over m auxiliary
+            # logits" in Sec. 2.2's F^c_k reduces to this single term.
+            splitting_output = self.clients[i].model(x)
+            aux_out = self.clients[i].auxiliary_model.forward_inner(splitting_output)
+            client_loss = self.criterion(aux_out, y)
+            client_loss.backward()
+            self.clients[i].optimizer.step()
+            self.clients[i].auxiliary_model.optimizer.step()
 
-        with torch.no_grad():
-            _, predicted = torch.max(aux_out.data, 1)
-            client_correct = predicted.eq(y.view_as(predicted)).sum().item()
+            with torch.no_grad():
+                _, predicted = torch.max(aux_out.data, 1)
+                client_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
         # server-side: real smashed data through the server's remaining
         # layers, its own local loss (Sec. 2.2's F^s_k with M-m=0 remaining
         # auxiliary terms at M=1, leaving only the final output's loss),
         # real backprop -- no gradient returned to the client.
         smashed_data = splitting_output.detach()
-        self.comm_load_cut += smashed_data.numel() * smashed_data.element_size()
+        self.charge_cut_activation(smashed_data)
+        self.charge_cut_labels(y)     # the server computes its own loss
 
-        server_out = self.servers[i].model(smashed_data)
-        server_loss = self.criterion(server_out, y)
-        server_loss.backward()
-        self.servers[i].optimizer.step()
+        # No gradient is returned to the client, and the client's graph was
+        # already released above, so `client_mem_held_across_cut_mb` is 0 here.
+        with self.phase('server', i):
+            server_out = self.servers[i].model(smashed_data)
+            server_loss = self.criterion(server_out, y)
+            server_loss.backward()
+            self.servers[i].optimizer.step()
 
-        with torch.no_grad():
-            _, predicted = torch.max(server_out.data, 1)
-            server_correct = predicted.eq(y.view_as(predicted)).sum().item()
+            with torch.no_grad():
+                _, predicted = torch.max(server_out.data, 1)
+                server_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
         return {
             'l_loss': client_loss.item(),
@@ -133,7 +152,7 @@ class FedSplitX(FLAlgorithm):
         agg_aux_weights = self.aggregated_auxiliary.state_dict()
         for c in self.clients:
             c.auxiliary_model.load_state_dict(agg_aux_weights)
-            self.comm_load_weights += 2 * calculate_load(self.aggregated_auxiliary)
+            self.charge_weights_roundtrip(self.aggregated_auxiliary, 'aux')
         ret_dict['auxiliary_agg_compute_time'] = time.time() - t0
 
         t0 = time.time()
@@ -143,7 +162,7 @@ class FedSplitX(FLAlgorithm):
         agg_server_weights = self.aggregated_server.state_dict()
         for s in self.servers:
             s.model.load_state_dict(agg_server_weights)
-            self.comm_load_weights += 2 * calculate_load(self.aggregated_server)
+            self.charge_weights_roundtrip(self.aggregated_server, 'server')
         ret_dict['server_agg_compute_time'] = time.time() - t0
 
         return ret_dict

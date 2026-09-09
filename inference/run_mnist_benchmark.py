@@ -30,6 +30,17 @@ DEFAULT_METHODS = [
     'fsl_sage', 'ho_sfl', 'mu_splitfed', 'dsl_aux', 'han_locloss',
     'fedsplitx', 'hosl', 'locfedmix_sl',
 ]
+
+# These two process exactly ONE batch per client per round -- faithful to their
+# reference implementation, which draws `next(loader)` each round. Every other
+# method here takes one optimizer step per BATCH, so on MNIST with 10 clients
+# (6000 samples each, batch 256 -> 24 batches) an equal `rounds` budget hands
+# these two 24x fewer updates; the reference itself runs ~375 effective rounds.
+# Scaling their round count is what makes the accuracy column mean anything.
+# The communication columns stay comparable regardless, because Comm-to-target
+# is read off at a fixed ACCURACY rather than at a fixed round.
+ONE_BATCH_PER_ROUND_METHODS = ('ho_sfl', 'mu_splitfed')
+ZO_ROUND_MULTIPLIER = 24
 DISTRIBUTIONS = [('iid', None), ('noniid_dirichlet', 0.5)]
 ALL_CUTS = ['shallow', 'middle', 'deep']
 
@@ -45,6 +56,28 @@ def parse_args():
                     help="rounds=3 is a pipeline check, not a reportable "
                          "result -- raise this for a real run (README default: 200)")
     p.add_argument('--seed', type=int, default=200)
+    p.add_argument('--seeds', type=int, nargs='+', default=None,
+                    help="run and average over several seeds -- CLAUDE.md's "
+                         "protocol is 3. Overrides --seed; the table then "
+                         "reports mean+/-std per cell instead of one run")
+    p.add_argument('--target_acc', type=float, default=None,
+                    help="accuracy at which Comm-to-target is read off "
+                         "(default: config.yaml's target_acc, 0.97 for MNIST)")
+    p.add_argument('--zo_round_multiplier', type=int,
+                    default=ZO_ROUND_MULTIPLIER,
+                    help="multiply --rounds by this for ho_sfl/mu_splitfed, "
+                         "which do one batch per client per round (see the "
+                         "module comment). Pass 1 to run every method at "
+                         "--rounds")
+    p.add_argument('--comm_threshold_mb', type=float, default=None,
+                    help="raise the communication budget that early-stops a "
+                         "run (config.yaml default 204800 = 200 GiB). "
+                         "MU-SplitFed at 10 clients burns ~890 MB/round and "
+                         "would otherwise truncate silently at ~230 rounds")
+    p.add_argument('--measure_memory', default=None,
+                    choices=['true', 'false'],
+                    help="per-side memory instrumentation (default on). "
+                         "Set false for a pure throughput run")
     p.add_argument('--methods', nargs='+', default=DEFAULT_METHODS,
                     help="algorithm registry keys to sweep")
     p.add_argument('--cuts', nargs='+', default=['middle'], choices=ALL_CUTS,
@@ -67,34 +100,56 @@ def parse_args():
     return p.parse_args()
 
 # ------------------------------------------------------------------------------
-def run_sweep(methods, rounds, seed, device, num_clients_values, cuts):
+def rounds_for(algo, rounds, zo_round_multiplier):
+    '''Round budget for one method. See ONE_BATCH_PER_ROUND_METHODS above for
+    why two of them get a larger one.'''
+    if algo in ONE_BATCH_PER_ROUND_METHODS:
+        return max(1, rounds * max(1, zo_round_multiplier))
+    return rounds
+
+
+def run_sweep(methods, rounds, seeds, device, num_clients_values, cuts,
+               zo_round_multiplier=ZO_ROUND_MULTIPLIER, target_acc=None,
+               comm_threshold_mb=None, measure_memory=None):
     failures = []
     for cut in cuts:
         for num_clients in num_clients_values:
             for algo in methods:
-                for distribution, alpha in DISTRIBUTIONS:
-                    cmd = [
-                        sys.executable, 'main.py',
-                        f'algorithm={algo}', 'model=resnet18', 'dataset=mnist',
-                        f'cut={cut}',
-                        f'dataset.distribution={distribution}',
-                        f'rounds={rounds}', f'seed={seed}', 'save=True',
-                        f'device={device}',
-                    ]
-                    if alpha is not None:
-                        cmd.append(f'dataset.alpha={alpha}')
-                    if num_clients is not None:
-                        cmd.append(f'num_clients={num_clients}')
+                algo_rounds = rounds_for(algo, rounds, zo_round_multiplier)
+                for seed in seeds:
+                    for distribution, alpha in DISTRIBUTIONS:
+                        cmd = [
+                            sys.executable, 'main.py',
+                            f'algorithm={algo}', 'model=resnet18',
+                            'dataset=mnist', f'cut={cut}',
+                            f'dataset.distribution={distribution}',
+                            f'rounds={algo_rounds}', f'seed={seed}',
+                            'save=True', f'device={device}',
+                        ]
+                        if alpha is not None:
+                            cmd.append(f'dataset.alpha={alpha}')
+                        if num_clients is not None:
+                            cmd.append(f'num_clients={num_clients}')
+                        if target_acc is not None:
+                            cmd.append(f'target_acc={target_acc}')
+                        if comm_threshold_mb is not None:
+                            cmd.append(f'comm_threshold_mb={comm_threshold_mb}')
+                        if measure_memory is not None:
+                            cmd.append(f'measure_memory={measure_memory}')
 
-                    tag = f'{algo} / mnist-{distribution} / cut={cut} / num_clients={num_clients}'
-                    tag += f' (alpha={alpha})' if alpha is not None else ''
-                    print(f"\n=== {tag} ===")
+                        tag = (f'{algo} / mnist-{distribution} / cut={cut} / '
+                               f'num_clients={num_clients} / seed={seed} / '
+                               f'rounds={algo_rounds}')
+                        tag += f' (alpha={alpha})' if alpha is not None else ''
+                        print(f"\n=== {tag} ===")
 
-                    env = dict(os.environ, WANDB_MODE='offline')
-                    result = subprocess.run(cmd, cwd=SRC_DIR, env=env)
-                    if result.returncode != 0:
-                        print(f"[FAILED] {tag} (exit {result.returncode})")
-                        failures.append((algo, distribution, cut, num_clients))
+                        env = dict(os.environ, WANDB_MODE='offline')
+                        result = subprocess.run(cmd, cwd=SRC_DIR, env=env)
+                        if result.returncode != 0:
+                            print(f"[FAILED] {tag} (exit {result.returncode})")
+                            failures.append(
+                                (algo, distribution, cut, num_clients, seed)
+                            )
 
     if failures:
         print(f"\nSweep finished with failures: {failures}")
@@ -234,17 +289,25 @@ def main():
         )
 
     num_clients_values = args.num_clients_list or [None]
+    seeds = args.seeds or [args.seed]
 
     if not args.skip_sweep:
         run_sweep(
-            args.methods, args.rounds, args.seed, device, num_clients_values,
-            args.cuts
+            args.methods, args.rounds, seeds, device, num_clients_values,
+            args.cuts, zo_round_multiplier=args.zo_round_multiplier,
+            target_acc=args.target_acc,
+            comm_threshold_mb=args.comm_threshold_mb,
+            measure_memory=args.measure_memory,
         )
 
     cfg = load_table_config()
+    # pass seeds through only for a genuine multi-seed sweep, so a single-seed
+    # run keeps matching whatever seed is on disk rather than pinning one
+    table_seeds = seeds if len(seeds) > 1 else None
     for cut in args.cuts:
         for num_clients in num_clients_values:
-            build_table(cfg, cut=cut, num_clients=num_clients)
+            build_table(cfg, cut=cut, num_clients=num_clients,
+                        seeds=table_seeds, target_acc=args.target_acc)
             make_plots(cfg, cut=cut, num_clients=num_clients)
 
 # ------------------------------------------------------------------------------

@@ -73,48 +73,12 @@ import time
 import copy
 import numpy as np
 import torch
-import torchvision.models as tv_models
 
 from algos import register_algorithm, FLAlgorithm
-from utils.utils import calculate_load
-
-# ------------------------------------------------------------------------------
-def _pretrained_resnet18_state_dict():
-    pretrained = tv_models.resnet18(
-        weights=tv_models.ResNet18_Weights.IMAGENET1K_V1, progress=False
-    )
-    return pretrained.state_dict()
-
-# ------------------------------------------------------------------------------
-# cut-aware: ResNetClient/ResNetServer each carry their own `client_layers`
-# (1/2/3, see src/models/resnet.py) reflecting which of the 4 ResNet stages
-# they were built with -- read directly off the model rather than assumed, so
-# this works correctly under any of the harness's shallow/middle/deep cuts.
-_ALL_STAGE_PREFIXES = ('layer1.', 'layer2.', 'layer3.', 'layer4.')
-
-def _load_pretrained_client(model, full_state):
-    prefixes = ('conv1.', 'bn1.') + _ALL_STAGE_PREFIXES[:model.client_layers]
-    client_state = {
-        k: v for k, v in full_state.items() if k.startswith(prefixes)
-    }
-    model.load_state_dict(client_state, strict=True)
-
-# ------------------------------------------------------------------------------
-def _load_pretrained_server(model, full_state):
-    # fc excluded: pretrained fc is 1000-way (ImageNet), this benchmark's is
-    # num_classes-way -- left at the harness's own random init.
-    prefixes = _ALL_STAGE_PREFIXES[model.client_layers:]
-    server_state = {
-        k: v for k, v in full_state.items() if k.startswith(prefixes)
-    }
-    model.load_state_dict(server_state, strict=False)
-
-# ------------------------------------------------------------------------------
-def _freeze_batchnorm_affine(model):
-    for m in model.modules():
-        if isinstance(m, torch.nn.BatchNorm2d):
-            m.weight.requires_grad_(False)
-            m.bias.requires_grad_(False)
+from models.pretrained import (
+    pretrained_resnet18_state_dict, load_pretrained_client,
+    load_pretrained_server, freeze_batchnorm_affine
+)
 
 # ------------------------------------------------------------------------------
 def _perturb(model, seed, scale_factor):
@@ -161,15 +125,15 @@ class MU_SplitFed(FLAlgorithm):
         # deep copies below, so every copy inherits the same weights/frozen
         # flags without re-doing this per copy.
         if self.use_pretrained:
-            full_state = _pretrained_resnet18_state_dict()
+            full_state = pretrained_resnet18_state_dict()
             for c in self.clients:
-                _load_pretrained_client(c.model, full_state)
-            _load_pretrained_server(self.server.model, full_state)
+                load_pretrained_client(c.model, full_state)
+            load_pretrained_server(self.server.model, full_state)
 
         if self.freeze_bn:
             for c in self.clients:
-                _freeze_batchnorm_affine(c.model)
-            _freeze_batchnorm_affine(self.server.model)
+                freeze_batchnorm_affine(c.model)
+            freeze_batchnorm_affine(self.server.model)
 
         self.servers = [copy.deepcopy(self.server) for _ in self.clients]
 
@@ -186,7 +150,23 @@ class MU_SplitFed(FLAlgorithm):
     def full_model(self, x):
         return self.aggregated_server(self.aggregated_client(x))
 
+    # the server host holds one replica per client
+    def server_side_modules(self):
+        return [s.model for s in self.servers]
+
+    def server_side_optimizers(self):
+        return [s.optimizer for s in self.servers]
+
     def special_models_train_mode(self, t):
+        # Deliberately does NOT force the client/server into eval() around the
+        # zeroth-order probe loop, unlike ho_sfl. Each batch runs 2*tau + 2
+        # perturbed server forwards and 2 perturbed client forwards in train
+        # mode, so BatchNorm running stats are updated with perturbed weights.
+        # That looks like a bug, and was investigated as one -- but the
+        # reference (HKU-WILL-Lab/HO-SFL's mu_splitfed_runner.py) calls a
+        # blanket .train() on the whole model every round and behaves
+        # identically, so this is FAITHFUL. Do not "fix" it without also
+        # changing the reference comparison.
         if t > 0:
             self.aggregated_server.train()
 
@@ -222,66 +202,73 @@ class MU_SplitFed(FLAlgorithm):
         self.clients[i].optimizer.zero_grad()
         self.servers[i].optimizer.zero_grad()
 
-        with torch.no_grad():
-            h_fixed = self.clients[i].model(x)
-        self.comm_load_cut += h_fixed.numel() * h_fixed.element_size()
+        # client forward under no_grad -- a zeroth-order client retains no
+        # autograd activations, so its activation peak is ~0 by construction
+        with self.phase('client', i):
+            with torch.no_grad():
+                h_fixed = self.clients[i].model(x)
+        self.charge_cut_activation(h_fixed)
+        self.charge_cut_labels(y)     # every loss below is computed server-side
 
         # tau local server-only zeroth-order steps, reusing h_fixed -- no
         # further client communication needed for these.
-        t0_s = time.time()
-        for _ in range(self.tau):
-            self.servers[i].optimizer.zero_grad()
-            s_seed = int(np.random.randint(0, 1_000_000))
+        with self.phase('server', i):
+            for _ in range(self.tau):
+                self.servers[i].optimizer.zero_grad()
+                s_seed = int(np.random.randint(0, 1_000_000))
 
-            _perturb(self.servers[i].model, s_seed, self.mu)
-            with torch.no_grad():
-                out_p = self.servers[i].model(h_fixed)
-                loss_p = self.criterion(out_p, y)
+                _perturb(self.servers[i].model, s_seed, self.mu)
+                with torch.no_grad():
+                    out_p = self.servers[i].model(h_fixed)
+                    loss_p = self.criterion(out_p, y)
 
-            _perturb(self.servers[i].model, s_seed, -2 * self.mu)
-            with torch.no_grad():
-                out_n = self.servers[i].model(h_fixed)
-                loss_n = self.criterion(out_n, y)
+                _perturb(self.servers[i].model, s_seed, -2 * self.mu)
+                with torch.no_grad():
+                    out_n = self.servers[i].model(h_fixed)
+                    loss_n = self.criterion(out_n, y)
 
-            _perturb(self.servers[i].model, s_seed, self.mu)  # restore
+                _perturb(self.servers[i].model, s_seed, self.mu)  # restore
 
-            scalar_s = (loss_p.item() - loss_n.item()) / (2 * self.mu)
-            _perturb_accumulate_grad(self.servers[i].model, s_seed, scalar_s)
-            self.servers[i].optimizer.step()
-        t_s = time.time() - t0_s
+                scalar_s = (loss_p.item() - loss_n.item()) / (2 * self.mu)
+                _perturb_accumulate_grad(self.servers[i].model, s_seed, scalar_s)
+                self.servers[i].optimizer.step()
 
         # client-side zeroth-order step: two more client forwards, each a
-        # fresh activation upload.
-        t0_c = time.time()
+        # fresh activation upload. The perturbed forwards are the CLIENT's
+        # compute and the evaluations against the server are the SERVER's --
+        # bracketed separately so neither is charged the other's time.
         c_seed = int(np.random.randint(0, 1_000_000))
 
         _perturb(self.clients[i].model, c_seed, self.mu)
-        with torch.no_grad():
-            h_pos = self.clients[i].model(x)
-        self.comm_load_cut += h_pos.numel() * h_pos.element_size()
+        with self.phase('client', i):
+            with torch.no_grad():
+                h_pos = self.clients[i].model(x)
+        self.charge_cut_activation(h_pos)
 
         _perturb(self.clients[i].model, c_seed, -2 * self.mu)
-        with torch.no_grad():
-            h_neg = self.clients[i].model(x)
-        self.comm_load_cut += h_neg.numel() * h_neg.element_size()
+        with self.phase('client', i):
+            with torch.no_grad():
+                h_neg = self.clients[i].model(x)
+        self.charge_cut_activation(h_neg)
 
         _perturb(self.clients[i].model, c_seed, self.mu)  # restore
 
-        with torch.no_grad():
-            out_c_p = self.servers[i].model(h_pos)
-            loss_c_p = self.criterion(out_c_p, y)
-            out_c_n = self.servers[i].model(h_neg)
-            loss_c_n = self.criterion(out_c_n, y)
+        with self.phase('server', i):
+            with torch.no_grad():
+                out_c_p = self.servers[i].model(h_pos)
+                loss_c_p = self.criterion(out_c_p, y)
+                out_c_n = self.servers[i].model(h_neg)
+                loss_c_n = self.criterion(out_c_n, y)
 
         scalar_c = (loss_c_p.item() - loss_c_n.item()) / (2 * self.mu)
         # one scalar sent back so the client can replay its own update --
         # drives this client's own update this round, same role as HO-SFL's
         # g_a_m, so it's classified as cut traffic, not an aggregation event.
-        self.comm_load_cut += torch.zeros(1).element_size()
+        self.charge_cut_scalar(1, direction='down')
 
-        _perturb_accumulate_grad(self.clients[i].model, c_seed, scalar_c)
-        self.clients[i].optimizer.step()
-        t_c = time.time() - t0_c
+        with self.phase('client', i):
+            _perturb_accumulate_grad(self.clients[i].model, c_seed, scalar_c)
+            self.clients[i].optimizer.step()
 
         with torch.no_grad():
             _, predicted = torch.max(out_c_p.data, 1)
@@ -290,8 +277,6 @@ class MU_SplitFed(FLAlgorithm):
         return {
             'acc': train_correct / y.size(dim=0),
             'loss': (loss_c_p.item() + loss_c_n.item()) / 2.0,
-            'client_model_compute_time': t_c,
-            'server_model_compute_time': t_s,
         }
 
     def aggregate(self):
@@ -314,10 +299,10 @@ class MU_SplitFed(FLAlgorithm):
         # reloads at the top of each client's turn instead) would introduce.
         for c in self.clients:
             c.model.load_state_dict(agg_client)
-            self.comm_load_weights += 2 * calculate_load(self.aggregated_client)
+            self.charge_weights_roundtrip(self.aggregated_client, 'client')
         for s in self.servers:
             s.model.load_state_dict(agg_server)
-            self.comm_load_weights += 2 * calculate_load(self.aggregated_server)
+            self.charge_weights_roundtrip(self.aggregated_server, 'server')
 
         return {'client_agg_compute_time': time.time() - t0}
 

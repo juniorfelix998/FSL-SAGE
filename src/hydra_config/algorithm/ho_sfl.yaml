@@ -5,5 +5,16 @@ optimizer     : adamw
 lr            : 0.001
 betas         : [0.9, 0.999]
 weight_decay  : 0.0001
-zo_p          : 10
-zo_mu         : 1e-4
+# zo_p/zo_mu match the values the reference ACTUALLY RUNS WITH: all four of its
+# experiment scripts (cifar10iid.sh, cifar100iid.sh, cifar10niid.sh,
+# cifar100niid.sh) override conf/base.yaml's defaults with
+# `algo.zo_mu=1e-3 algo.zo_p=5`. This harness previously used the unused
+# base.yaml defaults (zo_p=10, zo_mu=1e-4); at mu=1e-4 the probe difference
+# `a_tilde - a_m` is a ~1e-4-relative difference in fp32, i.e. near
+# catastrophic cancellation, so the estimator was reading mostly rounding noise.
+zo_p          : 5
+zo_mu         : 1e-3
+# matches the reference's conf/base.yaml -- see src/models/pretrained.py for why
+# a pretrained client is load-bearing for a zeroth-order method, not optional.
+use_pretrained: true
+freeze_bn     : true

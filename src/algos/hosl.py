@@ -77,22 +77,28 @@ class HOSL(FLAlgorithm):
         self.clients[i].optimizer.zero_grad()
         self.server.optimizer.zero_grad()
 
-        with torch.no_grad():
-            h_fixed = self.clients[i].model(x)
-        self.comm_load_cut += h_fixed.numel() * h_fixed.element_size()
+        # The client forward runs under no_grad -- it retains NO autograd
+        # activations at all, which is what makes a zeroth-order client cheap
+        # in memory. `client_act_peak_mem_mb` should come out ~0 here.
+        with self.phase('client', i):
+            with torch.no_grad():
+                h_fixed = self.clients[i].model(x)
+        self.charge_cut_activation(h_fixed)
+        self.charge_cut_labels(y)     # loss is computed server-side
 
         # real server-side update on the real (unperturbed) smashed data --
         # ordinary backprop, server-only; no gradient returned to the client.
         smashed_data = h_fixed.clone().detach().requires_grad_(True)
-        out = self.server.model(smashed_data)
-        loss = self.criterion(out, y)
-        loss.backward()
-        self.server.optimizer.step()
+        with self.phase('server', i):
+            out = self.server.model(smashed_data)
+            loss = self.criterion(out, y)
+            loss.backward()
+            self.server.optimizer.step()
 
-        with torch.no_grad():
-            baseline_loss = loss.item()
-            _, predicted = torch.max(out.data, 1)
-            train_correct = predicted.eq(y.view_as(predicted)).sum().item()
+            with torch.no_grad():
+                baseline_loss = loss.item()
+                _, predicted = torch.max(out.data, 1)
+                train_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
         # client-side zeroth-order update: m single-sided perturbations,
         # each evaluated against the (already-updated) server -- every
@@ -101,15 +107,24 @@ class HOSL(FLAlgorithm):
             seed = int(np.random.randint(0, 1_000_000))
 
             _perturb(self.clients[i].model, seed, self.mu)
-            with torch.no_grad():
-                h_pert = self.clients[i].model(x)
-                out_pert = self.server.model(h_pert)
-                loss_pert = self.criterion(out_pert, y)
+            # split the probe by side: the perturbed forward is the CLIENT's
+            # compute, evaluating it against the server is the SERVER's. Fusing
+            # them into one no_grad block would charge the server's time to the
+            # client.
+            with self.phase('client', i):
+                with torch.no_grad():
+                    h_pert = self.clients[i].model(x)
+            with self.phase('server', i):
+                with torch.no_grad():
+                    out_pert = self.server.model(h_pert)
+                    loss_pert = self.criterion(out_pert, y)
             _perturb(self.clients[i].model, seed, -self.mu)  # restore
 
-            self.comm_load_cut += h_pert.numel() * h_pert.element_size()
-            # one scalar loss difference sent back per perturbation
-            self.comm_load_cut += torch.zeros(1).element_size()
+            # the perturbed activation really is uploaded by this
+            # implementation, so it is charged in full; only the returned loss
+            # difference is a scalar
+            self.charge_cut_activation(h_pert)
+            self.charge_cut_scalar(1, direction='down')
 
             scalar = (loss_pert.item() - baseline_loss) / self.mu
             _perturb_accumulate_grad(

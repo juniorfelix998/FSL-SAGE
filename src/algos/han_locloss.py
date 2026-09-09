@@ -45,7 +45,6 @@ import copy
 import torch
 
 from algos import register_algorithm, aggregate_models, FLAlgorithm
-from utils.utils import calculate_load
 
 # ------------------------------------------------------------------------------
 @register_algorithm("han_locloss")
@@ -74,39 +73,59 @@ class HanLocalLoss(FLAlgorithm):
         for c in self.clients:
             c.auxiliary_model.eval()
 
+    # auxiliary head lives on the client; the server host holds one
+    # replica per client
+    def client_side_modules(self, i):
+        return [self.clients[i].model, self.clients[i].auxiliary_model]
+
+    def client_side_optimizers(self, i):
+        return [self.clients[i].optimizer,
+                self.clients[i].auxiliary_model.optimizer]
+
+    def server_side_modules(self):
+        return [s.model for s in self.servers]
+
+    def server_side_optimizers(self):
+        return [s.optimizer for s in self.servers]
+
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
 
-        self.clients[i].optimizer.zero_grad()
-        self.clients[i].auxiliary_model.optimizer.zero_grad()
-        self.servers[i].optimizer.zero_grad()
+        with self.phase('client', i):
+            self.clients[i].optimizer.zero_grad()
+            self.clients[i].auxiliary_model.optimizer.zero_grad()
+            self.servers[i].optimizer.zero_grad()
 
-        # client-side local loss (Eq. 1): auxiliary head on the client's own
-        # output, updates w_C + a_C alone -- no server signal involved.
-        splitting_output = self.clients[i].model(x)
-        aux_out = self.clients[i].auxiliary_model.forward_inner(splitting_output)
-        client_loss = self.criterion(aux_out, y)
-        client_loss.backward()
-        self.clients[i].optimizer.step()
-        self.clients[i].auxiliary_model.optimizer.step()
+            # client-side local loss (Eq. 1): auxiliary head on the client's
+            # own output, updates w_C + a_C alone -- no server signal involved.
+            splitting_output = self.clients[i].model(x)
+            aux_out = self.clients[i].auxiliary_model.forward_inner(splitting_output)
+            client_loss = self.criterion(aux_out, y)
+            client_loss.backward()
+            self.clients[i].optimizer.step()
+            self.clients[i].auxiliary_model.optimizer.step()
 
-        with torch.no_grad():
-            _, predicted = torch.max(aux_out.data, 1)
-            client_correct = predicted.eq(y.view_as(predicted)).sum().item()
+            with torch.no_grad():
+                _, predicted = torch.max(aux_out.data, 1)
+                client_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
         # server-side local loss (Eq. 2): real smashed data, real backprop,
         # updates w_S alone -- gradient never sent back to the client.
         smashed_data = splitting_output.detach()
-        self.comm_load_cut += smashed_data.numel() * smashed_data.element_size()
+        self.charge_cut_activation(smashed_data)
+        self.charge_cut_labels(y)     # the server computes its own loss
 
-        server_out = self.servers[i].model(smashed_data)
-        server_loss = self.criterion(server_out, y)
-        server_loss.backward()
-        self.servers[i].optimizer.step()
+        # No gradient is returned to the client, and the client's graph was
+        # already released above, so `client_mem_held_across_cut_mb` is 0 here.
+        with self.phase('server', i):
+            server_out = self.servers[i].model(smashed_data)
+            server_loss = self.criterion(server_out, y)
+            server_loss.backward()
+            self.servers[i].optimizer.step()
 
-        with torch.no_grad():
-            _, predicted = torch.max(server_out.data, 1)
-            server_correct = predicted.eq(y.view_as(predicted)).sum().item()
+            with torch.no_grad():
+                _, predicted = torch.max(server_out.data, 1)
+                server_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
         return {
             'l_loss': client_loss.item(),
@@ -126,7 +145,7 @@ class HanLocalLoss(FLAlgorithm):
         agg_aux_weights = self.aggregated_auxiliary.state_dict()
         for c in self.clients:
             c.auxiliary_model.load_state_dict(agg_aux_weights)
-            self.comm_load_weights += 2 * calculate_load(self.aggregated_auxiliary)
+            self.charge_weights_roundtrip(self.aggregated_auxiliary, 'aux')
         ret_dict['auxiliary_agg_compute_time'] = time.time() - t0
 
         t0 = time.time()
@@ -136,7 +155,7 @@ class HanLocalLoss(FLAlgorithm):
         agg_server_weights = self.aggregated_server.state_dict()
         for s in self.servers:
             s.model.load_state_dict(agg_server_weights)
-            self.comm_load_weights += 2 * calculate_load(self.aggregated_server)
+            self.charge_weights_roundtrip(self.aggregated_server, 'server')
         ret_dict['server_agg_compute_time'] = time.time() - t0
 
         return ret_dict

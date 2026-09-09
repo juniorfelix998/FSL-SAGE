@@ -30,27 +30,33 @@ class FedAvg(FLAlgorithm):
     def full_model(self, x):
         return self.aggregated_client(x)
 
+    # nothing crosses a cut and there is no separate server host: the server
+    # model was merged into every client's model in __init__ above.
+    def server_side_modules(self):
+        return []
+
+    def server_side_optimizers(self):
+        return []
+
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
-        t0 = time.time()
-        self.clients[i].optimizer.zero_grad()
-        out = self.clients[i].model(x)
-        loss = self.criterion(out, y)
-        t1 = time.time()
 
-        with torch.no_grad():
-            train_loss = loss.item()
-            _, predicted = torch.max(out.data, 1)
-            train_correct = predicted.eq(y.view_as(predicted)).sum().item()
+        with self.phase('client', i):
+            self.clients[i].optimizer.zero_grad()
+            out = self.clients[i].model(x)
+            loss = self.criterion(out, y)
 
-        t2 = time.time()
-        loss.backward()
-        self.clients[i].optimizer.step()
-        t_c = (time.time() - t2 + t1 - t0)
+            with torch.no_grad():
+                train_loss = loss.item()
+                _, predicted = torch.max(out.data, 1)
+                train_correct = predicted.eq(y.view_as(predicted)).sum().item()
+
+            loss.backward()
+            self.clients[i].optimizer.step()
+
         return {
             'acc' : train_correct / y.size(dim=0),
             'loss': train_loss,
-            'client_model_compute_time' : t_c
         }
     
 # ------------------------------------------------------------------------------
@@ -63,49 +69,42 @@ class SplitFedv2(FLAlgorithm):
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
 
-        t0_c = time.time()
-        self.clients[i].optimizer.zero_grad()
-
-        # pass smashed data through full model 
-        splitting_output = self.clients[i].model(x)
-        t1_c = time.time()
+        with self.phase('client', i):
+            self.clients[i].optimizer.zero_grad()
+            # pass smashed data through full model
+            splitting_output = self.clients[i].model(x)
 
         # Represents the uploaded data
         smashed_data = splitting_output.clone().detach().requires_grad_(True)
+        self.charge_cut_activation(smashed_data)
+        self.charge_cut_labels(y)     # loss is computed server-side
 
-        # Comm cost for upload splitting output to server
-        self.comm_load_cut += smashed_data.numel() * smashed_data.element_size() 
+        # NOTE the client's graph (`splitting_output`) stays alive throughout the
+        # server phase below -- that stall is what `client_mem_held_across_cut_mb`
+        # measures, and it is the memory cost of sending a gradient back.
+        with self.phase('server', i):
+            self.server.optimizer.zero_grad()
+            output = self.server.model(smashed_data)
+            loss = self.server.criterion(output, y)
 
-        t0_s = time.time()
-        self.server.optimizer.zero_grad()
-        output = self.server.model(smashed_data) 
-        loss = self.server.criterion(output, y)
-        t1_s = time.time()
+            with torch.no_grad():
+                train_loss = loss.item()
+                _, predicted = torch.max(output.data, 1)
+                train_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
-        with torch.no_grad():
-            train_loss = loss.item()
-            _, predicted = torch.max(output.data, 1)
-            train_correct = predicted.eq(y.view_as(predicted)).sum().item()
+            loss.backward()
+            self.server.optimizer.step()
 
-        t2_s = time.time()
-        loss.backward()
-        self.server.optimizer.step()
-        t_s = time.time() - t2_s + t1_s - t0_s
+        self.charge_cut_gradient(smashed_data.grad)
+        self.hold('client', smashed_data.grad, i=i)
 
-        # Comm cost for downloading grads of smashed data
-        self.comm_load_cut += smashed_data.grad.numel() * smashed_data.grad.element_size()
-
-        # Backprop split output with smashed data grad
-        t2_c = time.time()
-        splitting_output.backward(smashed_data.grad)
-        self.clients[i].optimizer.step()
-        t_c = time.time() - t2_c + t1_c - t0_c
+        with self.phase('client', i):
+            splitting_output.backward(smashed_data.grad)
+            self.clients[i].optimizer.step()
 
         return {
             'acc' : train_correct / y.size(dim=0),
             'loss': train_loss,
-            'client_model_compute_time' : t_c,
-            'server_model_compute_time' : t_s
         }
 
 # ------------------------------------------------------------------------------
@@ -130,52 +129,49 @@ class SplitFedv1(FLAlgorithm):
     def special_models_eval_mode(self):
         self.aggregated_server.eval()
 
+    # the server host really does hold one replica per client
+    def server_side_modules(self):
+        return [s.model for s in self.servers]
+
+    def server_side_optimizers(self):
+        return [s.optimizer for s in self.servers]
+
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
 
-        t0_c = time.time()
-        self.clients[i].optimizer.zero_grad()
-
-        # pass smashed data through full model 
-        splitting_output = self.clients[i].model(x)
-        t1_c = time.time()
+        with self.phase('client', i):
+            self.clients[i].optimizer.zero_grad()
+            # pass smashed data through full model
+            splitting_output = self.clients[i].model(x)
 
         # Represents the uploaded data
         smashed_data = splitting_output.clone().detach().requires_grad_(True)
+        self.charge_cut_activation(smashed_data)
+        self.charge_cut_labels(y)     # loss is computed server-side
 
-        # Upload the smashed data to the server
-        self.comm_load_cut += smashed_data.numel() * smashed_data.element_size() 
+        with self.phase('server', i):
+            self.servers[i].optimizer.zero_grad()
+            output = self.servers[i].model(smashed_data)
+            loss = self.criterion(output, y)
 
-        t0_s = time.time()
-        self.servers[i].optimizer.zero_grad()
-        output = self.servers[i].model(smashed_data) 
-        loss = self.criterion(output, y)
-        t1_s = time.time()
+            with torch.no_grad():
+                train_loss = loss.item()
+                _, predicted = torch.max(output.data, 1)
+                train_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
-        with torch.no_grad():
-            train_loss = loss.item()
-            _, predicted = torch.max(output.data, 1)
-            train_correct = predicted.eq(y.view_as(predicted)).sum().item()
+            loss.backward()
+            self.servers[i].optimizer.step()
 
-        t2_s = time.time()
-        loss.backward()
-        self.servers[i].optimizer.step()
-        t_s = time.time() - t2_s + t1_s - t0_s
+        self.charge_cut_gradient(smashed_data.grad)
+        self.hold('client', smashed_data.grad, i=i)
 
-        # Download gradients of the smashed data
-        self.comm_load_cut += smashed_data.grad.numel() * smashed_data.grad.element_size() 
-
-        # Backprop grads back to splitting_output
-        t2_c = time.time()
-        splitting_output.backward(smashed_data.grad)
-        self.clients[i].optimizer.step()
-        t_c = time.time() - t2_c + t1_c - t0_c
+        with self.phase('client', i):
+            splitting_output.backward(smashed_data.grad)
+            self.clients[i].optimizer.step()
 
         return {
             'acc' : train_correct / y.size(dim=0),
             'loss': train_loss,
-            'client_model_compute_time' : t_c,
-            'server_model_compute_time' : t_s
         }
 
     def aggregate(self):
@@ -189,6 +185,12 @@ class SplitFedv1(FLAlgorithm):
 
         for s in self.servers:
             s.model.load_state_dict(agg_weights)
+            # BUGFIX: this exchange used to be charged ZERO bytes, while every
+            # other multi-server method here (fedsplitx, han_locloss,
+            # mu_splitfed) charges a full round trip for the identical
+            # operation. That biased SplitFedv1 low on Comm-TOTAL, the value the
+            # benchmark ranks on.
+            self.charge_weights_roundtrip(self.aggregated_server, 'server')
 
         ret_dict['server_agg_compute_time'] = time.time() - t0
         return ret_dict

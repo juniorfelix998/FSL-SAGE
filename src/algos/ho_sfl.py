@@ -30,6 +30,11 @@ import numpy as np
 import torch
 
 from algos import register_algorithm, FLAlgorithm
+from utils.comm import tensor_bytes
+from models.pretrained import (
+    pretrained_resnet18_state_dict, load_pretrained_client,
+    load_pretrained_server, freeze_batchnorm_affine
+)
 
 # ------------------------------------------------------------------------------
 def _perturb(model, seed, scale_factor):
@@ -64,6 +69,31 @@ class HO_SFL(FLAlgorithm):
     def __init__(self, *args, **kwargs):
         super(HO_SFL, self).__init__(*args, **kwargs)
 
+        # ImageNet-pretrained init + frozen BN affine, matching the
+        # reference's conf/base.yaml (`model.use_pretrained: True`,
+        # `model.freeze_bn: True`), applied BEFORE the model is shared out
+        # below so every client sees the same weights.
+        #
+        # This is load-bearing, not cosmetic: the client here is updated ONLY
+        # by a P-direction zeroth-order estimator, whose convergence scales
+        # with d/P. At ~683k client params and P=5 it is untrainable from
+        # scratch in a few hundred rounds -- the reference works because the
+        # client starts near-optimal and the first-order server does the
+        # learning. Compounding that, the client is pinned to .eval() for the
+        # whole run (see special_models_train_mode below, faithful to the
+        # reference), so from a random init its BatchNorm running stats stay at
+        # mean 0 / var 1 forever and the stem never normalises at all. Omitting
+        # this was the dominant cause of this method's near-chance accuracy.
+        self.use_pretrained = self.cfg.get('use_pretrained', True)
+        self.freeze_bn = self.cfg.get('freeze_bn', True)
+        if self.use_pretrained:
+            full_state = pretrained_resnet18_state_dict()
+            load_pretrained_client(self.clients[0].model, full_state)
+            load_pretrained_server(self.server.model, full_state)
+        if self.freeze_bn:
+            freeze_batchnorm_affine(self.clients[0].model)
+            freeze_batchnorm_affine(self.server.model)
+
         # single shared client model across all clients -- no per-client
         # weight divergence, nothing to aggregate as a weight vector.
         shared_model = self.clients[0].model
@@ -80,6 +110,16 @@ class HO_SFL(FLAlgorithm):
         self.P = self.cfg.zo_p
         self.mu = self.cfg.zo_mu
         self._round_buf = []
+
+        # The single-shared-client-model premise above IS the paper's
+        # dimension-free aggregation, and aggregate() below relies on it by
+        # only ever stepping clients[0]. Assert it so a future change that
+        # gives a client its own model/optimizer fails loudly instead of
+        # silently training one client and reporting it as all of them.
+        assert all(c.model is self.clients[0].model for c in self.clients), \
+            "HO-SFL requires one shared client model across all clients"
+        assert all(c.optimizer is self.clients[0].optimizer for c in self.clients), \
+            "HO-SFL requires one shared client optimizer across all clients"
 
     def _get_optimizer(self, params):
         if self.cfg.optimizer == 'adamw':
@@ -114,36 +154,39 @@ class HO_SFL(FLAlgorithm):
         if (j, k) != (0, 0):
             return {'acc': 0.0, 'loss': 0.0}
 
-        t0 = time.time()
-        with torch.no_grad():
-            a_m = self.clients[i].model(x)
-        t1 = time.time()
+        # client forward under no_grad -- a zeroth-order client retains no
+        # autograd activations, so its activation peak is ~0 by construction
+        with self.phase('client', i):
+            with torch.no_grad():
+                a_m = self.clients[i].model(x)
 
         server_input = a_m.clone().detach().requires_grad_(True)
-        out = self.server.model(server_input)
-        loss = self.criterion(out, y)
+        with self.phase('server', i):
+            out = self.server.model(server_input)
+            loss = self.criterion(out, y)
 
-        with torch.no_grad():
-            train_loss = loss.item()
-            _, predicted = torch.max(out.data, 1)
-            train_correct = predicted.eq(y.view_as(predicted)).sum().item()
+            with torch.no_grad():
+                train_loss = loss.item()
+                _, predicted = torch.max(out.data, 1)
+                train_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
-        t2 = time.time()
-        scale = loss.new_tensor(1.0 / len(self.clients))
-        loss.backward(scale)
-        t_s = time.time() - t2
+            scale = loss.new_tensor(1.0 / len(self.clients))
+            loss.backward(scale)
 
         g_a_m = server_input.grad.clone().detach()
-        self.comm_load_cut += a_m.numel() * a_m.element_size()
-        self.comm_load_cut += g_a_m.numel() * g_a_m.element_size()
+        self.charge_cut_activation(a_m)
+        self.charge_cut_labels(y)     # loss is computed server-side
+        self.charge_cut_gradient(g_a_m)
 
+        # This buffer is CLIENT-resident: the zeroth-order probe in aggregate()
+        # replays the client forward locally against the downloaded g_a_m, so
+        # the client must keep x, a_m and g_a_m alive until then.
         self._round_buf.append((x.detach(), a_m.detach(), g_a_m))
+        self.hold('client', x, a_m, g_a_m, i=i)
 
         return {
             'acc': train_correct / y.size(dim=0),
             'loss': train_loss,
-            'client_model_compute_time': t1 - t0,
-            'server_model_compute_time': t_s,
         }
 
     def aggregate(self):
@@ -167,25 +210,31 @@ class HO_SFL(FLAlgorithm):
         seeds = [int(np.random.randint(0, 1_000_000)) for _ in range(self.P)]
         seeds_tensor = torch.tensor(seeds, dtype=torch.int32)
 
+        # The probe loop below is CLIENT-side compute even though it lives in
+        # aggregate(): it replays the client's own forward against the already
+        # downloaded g_a_m. It must be bracketed as such, or HO-SFL's client
+        # memory/time would read as "static only" -- a fake result that would
+        # flatter the method.
         all_v = []
-        for (x_buf, a_m, g_a_m) in self._round_buf:
-            v = torch.zeros(self.P, device=self.device)
-            for p_idx, seed in enumerate(seeds):
-                _perturb(self.clients[0].model, seed, self.mu)
-                with torch.no_grad():
-                    a_tilde = self.clients[0].model(x_buf)
-                diff = a_tilde - a_m
-                v[p_idx] = torch.sum(diff * g_a_m)
-                _perturb(self.clients[0].model, seed, -self.mu)
-            all_v.append(v)
+        with self.phase('client', 0):
+            for (x_buf, a_m, g_a_m) in self._round_buf:
+                v = torch.zeros(self.P, device=self.device)
+                for p_idx, seed in enumerate(seeds):
+                    _perturb(self.clients[0].model, seed, self.mu)
+                    with torch.no_grad():
+                        a_tilde = self.clients[0].model(x_buf)
+                    diff = a_tilde - a_m
+                    v[p_idx] = torch.sum(diff * g_a_m)
+                    _perturb(self.clients[0].model, seed, -self.mu)
+                all_v.append(v)
 
-        bar_v = torch.stack(all_v).mean(dim=0)
-        scale = 1.0 / (self.P * self.mu)
-        for p_idx, seed in enumerate(seeds):
-            _perturb_accumulate_grad(
-                self.clients[0].model, seed, bar_v[p_idx].item() * scale
-            )
-        self.clients[0].optimizer.step()
+            bar_v = torch.stack(all_v).mean(dim=0)
+            scale = 1.0 / (self.P * self.mu)
+            for p_idx, seed in enumerate(seeds):
+                _perturb_accumulate_grad(
+                    self.clients[0].model, seed, bar_v[p_idx].item() * scale
+                )
+            self.clients[0].optimizer.step()
         ret_dict['zo_probe_compute_time'] = time.time() - t0
 
         # dimension-free aggregation: only P scalars (per client, uplink) and
@@ -194,10 +243,10 @@ class HO_SFL(FLAlgorithm):
         # number that should come out far smaller than every other method's
         # weight-transfer cost.
         n_buffered = len(self._round_buf)
-        self.comm_load_weights += v.numel() * v.element_size() * n_buffered
-        self.comm_load_weights += bar_v.numel() * bar_v.element_size() * n_buffered
-        self.comm_load_weights += \
-            seeds_tensor.numel() * seeds_tensor.element_size() * n_buffered
+        self.charge_weights_scalars(
+            (tensor_bytes(v) + tensor_bytes(bar_v) + tensor_bytes(seeds_tensor))
+            * n_buffered
+        )
 
         self.aggregated_client = self.clients[0].model
         return ret_dict

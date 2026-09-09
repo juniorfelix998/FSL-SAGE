@@ -10,7 +10,7 @@ import json
 
 # ------------------------------------------------------------------------------
 def find_latest_run(prefix_dir, algo_key, model, dataset, distribution,
-                     alpha=None, cut='middle', num_clients=None):
+                     alpha=None, cut='middle', num_clients=None, seed=None):
     '''Find the most recently produced `results.json` for a given
     (algorithm, model, dataset, distribution[, alpha], cut[, num_clients])
     combination.
@@ -23,6 +23,8 @@ def find_latest_run(prefix_dir, algo_key, model, dataset, distribution,
     client count (glob `*`); pass an int to filter to a specific sweep value.
     `cut` defaults to 'middle' (this harness's original, pre-cut-support
     behavior) -- pass 'shallow'/'deep' to look up those cuts' runs instead.
+    `seed=None` matches any seed; pass an int to pin one, which is how
+    `benchmark_table.collect_cell` gathers a cell's per-seed runs to average.
 
     Returns the path to the most recent matching `results.json` (by directory
     name, which sorts chronologically since timestamps are `%y%m%d-%H%M%S`), or
@@ -34,6 +36,8 @@ def find_latest_run(prefix_dir, algo_key, model, dataset, distribution,
         filters.append(f"m{num_clients}E")
     if alpha is not None:
         filters.append(f"alp{alpha:.2e}")
+    if seed is not None:
+        filters.append(f"seed{seed}")
     train_info_glob = "*" + "*".join(filters) + "*" if filters else "*"
     pattern = os.path.join(base, train_info_glob, "**", "results.json")
     matches = sorted(glob.glob(pattern, recursive=True))

@@ -61,7 +61,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from algos import register_algorithm, FLAlgorithm
-from utils.utils import calculate_load
 from models.resnet import _STAGE_OUT_PLANES
 
 # ------------------------------------------------------------------------------
@@ -121,49 +120,64 @@ class LocFedMixSL(FLAlgorithm):
         for d in self.decoders:
             d.eval()
 
+    # the Infopro decoder is a permanent resident of the client device
+    def client_side_modules(self, i):
+        return [self.clients[i].model, self.decoders[i]]
+
+    def client_side_optimizers(self, i):
+        return [self.clients[i].optimizer, self.decoder_optimizers[i]]
+
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
 
-        self.clients[i].optimizer.zero_grad()
-        self.decoder_optimizers[i].zero_grad()
+        with self.phase('client', i):
+            self.clients[i].optimizer.zero_grad()
+            self.decoder_optimizers[i].zero_grad()
 
-        # (1) real client forward -- graph stays attached so the local
-        # regularizer's gradient and the real injected grad_at_cut both
-        # accumulate into this client model's own parameters (Eq. 8).
-        splitting_output = self.clients[i].model(x)
+            # (1) real client forward -- graph stays attached so the local
+            # regularizer's gradient and the real injected grad_at_cut both
+            # accumulate into this client model's own parameters (Eq. 8).
+            splitting_output = self.clients[i].model(x)
 
-        # (4) Infopro reconstruction regularizer: decoder updates from this
-        # loss alone; the client model's update below adds this loss's
-        # gradient on top of the real task gradient.
-        recon = self.decoders[i](splitting_output, x.shape[-2:])
-        recon_loss = F.mse_loss(recon, x)
-        recon_loss.backward(retain_graph=True)
+            # (4) Infopro reconstruction regularizer: decoder updates from this
+            # loss alone; the client model's update below adds this loss's
+            # gradient on top of the real task gradient.
+            recon = self.decoders[i](splitting_output, x.shape[-2:])
+            recon_loss = F.mse_loss(recon, x)
+            recon_loss.backward(retain_graph=True)
 
         # (2) real per-client loss/gradient (Eq. 1, 4) -- a real leaf sent to
         # the server, real backprop, real grad_at_cut returned to the client.
         smashed_data = splitting_output.detach().requires_grad_(True)
-        self.comm_load_cut += smashed_data.numel() * smashed_data.element_size()
+        self.charge_cut_activation(smashed_data)
+        self.charge_cut_labels(y)     # loss is computed server-side
 
-        delta_i = self.agg_factor[i]
-        out = self.server.model(smashed_data)
-        loss = self.criterion(out, y)
-        (delta_i * loss).backward()
-        # server optimizer is NOT stepped here -- gradients accumulate across
-        # every client (and every mixup pair) this round, stepped once in
-        # aggregate() per Eq. 6's single dataset-size-weighted server update.
+        with self.phase('server', i):
+            delta_i = self.agg_factor[i]
+            out = self.server.model(smashed_data)
+            loss = self.criterion(out, y)
+            (delta_i * loss).backward()
+            # server optimizer is NOT stepped here -- gradients accumulate across
+            # every client (and every mixup pair) this round, stepped once in
+            # aggregate() per Eq. 6's single dataset-size-weighted server update.
 
         grad_at_cut = smashed_data.grad.clone().detach()
-        self.comm_load_cut += grad_at_cut.numel() * grad_at_cut.element_size()
-        splitting_output.backward(grad_at_cut)
+        self.charge_cut_gradient(grad_at_cut)
+        self.hold('client', grad_at_cut, i=i)
 
-        self.clients[i].optimizer.step()
-        self.decoder_optimizers[i].step()
+        with self.phase('client', i):
+            splitting_output.backward(grad_at_cut)
+            self.clients[i].optimizer.step()
+            self.decoder_optimizers[i].step()
 
         with torch.no_grad():
             _, predicted = torch.max(out.data, 1)
             train_correct = predicted.eq(y.view_as(predicted)).sum().item()
 
+        # the mixup buffer is SERVER-resident: it re-uses smashed data already
+        # uploaded this round, so no further cut bytes are due for it
         self._round_buf.append((i, smashed_data.detach(), y.detach()))
+        self.hold('server', smashed_data, y, i=i)
 
         return {
             'acc': train_correct / y.size(dim=0),
@@ -179,30 +193,31 @@ class LocFedMixSL(FLAlgorithm):
         n = len(self._round_buf)
         mixup_loss_total = 0.0
         if n >= 2:
-            for idx in range(n):
-                client_a, s_a, y_a = self._round_buf[idx]
-                delta_i = self.agg_factor[client_a]
-                for p in range(1, self.mixup_partners + 1):
-                    # advance until we land on a different client's smashed
-                    # data -- the buffer is filled one client's local batches
-                    # at a time, so a plain (idx+p)%n mostly re-pairs a
-                    # client with its own other batches, whereas the paper's
-                    # mixup (Eq. 5) is defined between two DIFFERENT clients.
-                    partner_idx = (idx + p) % n
-                    tries = 0
-                    while self._round_buf[partner_idx][0] == client_a and tries < n:
-                        partner_idx = (partner_idx + 1) % n
-                        tries += 1
-                    _, s_b, y_b = self._round_buf[partner_idx]
-                    m = min(s_a.size(0), s_b.size(0))
-                    lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
-                    mixed = lam * s_a[:m] + (1 - lam) * s_b[:m]
+            with self.phase('server'):
+                for idx in range(n):
+                    client_a, s_a, y_a = self._round_buf[idx]
+                    delta_i = self.agg_factor[client_a]
+                    for p in range(1, self.mixup_partners + 1):
+                        # advance until we land on a different client's smashed
+                        # data -- the buffer is filled one client's local batches
+                        # at a time, so a plain (idx+p)%n mostly re-pairs a
+                        # client with its own other batches, whereas the paper's
+                        # mixup (Eq. 5) is defined between two DIFFERENT clients.
+                        partner_idx = (idx + p) % n
+                        tries = 0
+                        while self._round_buf[partner_idx][0] == client_a and tries < n:
+                            partner_idx = (partner_idx + 1) % n
+                            tries += 1
+                        _, s_b, y_b = self._round_buf[partner_idx]
+                        m = min(s_a.size(0), s_b.size(0))
+                        lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
+                        mixed = lam * s_a[:m] + (1 - lam) * s_b[:m]
 
-                    out = self.server.model(mixed)
-                    mix_loss = lam * self.criterion(out, y_a[:m]) \
-                        + (1 - lam) * self.criterion(out, y_b[:m])
-                    (delta_i * mix_loss / self.mixup_partners).backward()
-                    mixup_loss_total += mix_loss.item()
+                        out = self.server.model(mixed)
+                        mix_loss = lam * self.criterion(out, y_a[:m]) \
+                            + (1 - lam) * self.criterion(out, y_b[:m])
+                        (delta_i * mix_loss / self.mixup_partners).backward()
+                        mixup_loss_total += mix_loss.item()
 
         self.server.optimizer.step()
         mixup_compute_time = time.time() - t0
@@ -221,7 +236,7 @@ class LocFedMixSL(FLAlgorithm):
         self.aggregated_decoder.load_state_dict(agg_state)
         for d in self.decoders:
             d.load_state_dict(agg_state)
-            self.comm_load_weights += 2 * calculate_load(self.aggregated_decoder)
+            self.charge_weights_roundtrip(self.aggregated_decoder, 'aux')
         ret_dict['decoder_agg_compute_time'] = time.time() - t0
         ret_dict['server_mixup_compute_time'] = mixup_compute_time
         if n >= 2:

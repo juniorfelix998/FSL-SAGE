@@ -14,6 +14,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+try:
+    from omegaconf import OmegaConf
+except ImportError:      # utils is importable without hydra installed
+    OmegaConf = None
+
 def calculate_load(model):        
     param_size = 0
     for param in model.parameters():
@@ -74,6 +79,55 @@ def process_counts(counts):
         else:
             str_list.append(f'{c:d}')
     return str_list
+
+def run_manifest(cfg, device=None):
+    '''Provenance record stored with every run (CLAUDE.md: "Keep a run manifest
+    (git commit, config, seed, dataset, cut) with every run").
+
+    Without this, two results.json files that disagree cannot be traced back to
+    which commit or configuration produced them -- which matters here because the
+    measurement layer itself is under active change.
+    '''
+    try:
+        import subprocess
+        repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))
+        commit = subprocess.run(
+            ['git', '-C', repo_dir, 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, timeout=10
+        ).stdout.strip() or None
+        dirty = bool(subprocess.run(
+            ['git', '-C', repo_dir, 'status', '--porcelain'],
+            capture_output=True, text=True, timeout=10
+        ).stdout.strip())
+    except Exception:
+        commit, dirty = None, None
+
+    return {
+        'git_commit'    : commit,
+        'git_dirty'     : dirty,
+        'algorithm'     : cfg.algorithm.name,
+        'model'         : cfg.model.name,
+        'dataset'       : cfg.dataset.name,
+        'distribution'  : cfg.dataset.distribution,
+        'alpha'         : float(cfg.dataset.alpha)
+                          if cfg.dataset.distribution == 'noniid_dirichlet'
+                          else None,
+        'cut'           : cfg.get('cut_name', 'middle'),
+        'num_clients'   : int(cfg.num_clients),
+        'rounds'        : int(cfg.rounds),
+        'seed'          : int(cfg.seed),
+        'batch_size'    : int(cfg.model.client.batch_size),
+        'local_epochs'  : int(cfg.model.client.epoch),
+        'dtype'         : 'float64' if cfg.use_64bit else 'float32',
+        # memory numbers are NOT comparable across devices: cuDNN saves a
+        # different set of intermediates than the CPU kernels do
+        'device'        : str(device) if device is not None else str(cfg.device),
+        'config_sha256' : sha256_of_yaml(OmegaConf.to_container(cfg, resolve=True))
+                          if OmegaConf is not None else None,
+    }
+
 
 def sha256_of_yaml(yaml_dict):
     """Calculates the SHA-256 hash of a YAML dictionary."""

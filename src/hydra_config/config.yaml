@@ -25,6 +25,20 @@ checkpoint_interval : 5
 
 comm_threshold_mb : 204800  # corresponds to 200 GiB
 
+# --- measurement knobs --------------------------------------------------
+# Accuracy at which `comm_to_target` is read off. Ranking on cumulative bytes at
+# the FINAL round is round-count dependent -- it penalises a method that was run
+# longer and rewards one that converges slowly. 0.97 suits MNIST; lower it for
+# CIFAR.
+target_acc : 0.97
+# Per-side (client vs. server) peak memory via autograd saved-tensor hooks.
+# Set false for a pure throughput run.
+measure_memory : true
+# Instrument only the first N batches of each round (j == 0). The hooks cost
+# ~4% when always on; every method's heaviest step is at or near the round's
+# first iteration, so this is amortized to well under 1% with no loss of signal.
+mem_probe_batches : 2
+
 # to prevent logging and working directory creation by hydra
 hydra:  
   output_subdir: null  
