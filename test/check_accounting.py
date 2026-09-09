@@ -23,8 +23,10 @@
 # code path a real run uses while staying runnable in environments where the
 # hydra argparse entry point is unavailable.
 # ------------------------------------------------------------------------------
+import inspect
 import math
 import os
+import re
 import sys
 
 import torch
@@ -537,6 +539,9 @@ NO_GRADIENT_BACK = ('cse_fsl', 'fsl_sage', 'han_locloss', 'fedsplitx',
 ZERO_ORDER_CLIENTS = ('hosl', 'ho_sfl', 'mu_splitfed')
 # non-federated methods, so weight traffic must be zero
 NON_FEDERATED = ('vanilla_sl', 'dsl_aux', 'hosl')
+# methods that do real work only on the round's first batch (faithful to their
+# reference, whose "round" IS one batch -- see run_mnist_benchmark.py)
+ONE_BATCH_PER_ROUND = ('ho_sfl', 'mu_splitfed')
 
 
 def build_real_run(algo_name, extra_algo, num_clients=2, samples=8,
@@ -629,6 +634,9 @@ def test_all_methods_on_real_model():
                      res.memory_metrics['client_act_peak_mem_mb'], 0.0)
         check(f"{algo}: reports non-zero client memory",
               res.memory_metrics['peak_client_mem_mb'] > 0)
+
+        if algo in ONE_BATCH_PER_ROUND:
+            check_one_batch_noop_reports_nothing(algo, res)
         if algo == 'fed_avg':
             # fed_avg merges the server model into every client's model, so
             # there is no separate server host to charge -- 0 is correct here
@@ -637,6 +645,30 @@ def test_all_methods_on_real_model():
         else:
             check(f"{algo}: reports non-zero server memory",
                   res.memory_metrics['peak_server_mem_mb'] > 0)
+
+
+def check_one_batch_noop_reports_nothing(algo, res):
+    '''ho_sfl / mu_splitfed do real work only at (j,k)==(0,0). They must return
+    NO metrics on the other batches.
+
+    Returning {'acc': 0.0, 'loss': 0.0} there (as they used to) is silently
+    wrong: the shared loop mean-reduces a round's per-batch metrics, so on MNIST
+    those 23 no-op batches dragged the reported per-client training accuracy to
+    ~1/24 of its true value. Asserted structurally rather than by inspecting the
+    value, because a genuinely-untrained run can legitimately report 0.0 too.
+    '''
+    alg = ALGORITHM_REGISTRY[algo]
+    src = inspect.getsource(alg.client_step)
+    noop = re.search(r'if \(j, k\) != \(0, 0\):\s*(?:#[^\n]*\n\s*)*return ([^\n]+)',
+                      src)
+    check(f"{algo}: no-op batch returns no metrics (not fake zeros)",
+          noop is not None and noop.group(1).strip() == '{}',
+          f"returns {noop.group(1).strip() if noop else '<pattern not found>'}")
+    # and the surviving value is the real batch's, one entry per round
+    tr = res.train_metrics[0]
+    check(f"{algo}: one training-metric entry per round",
+          len(tr.get('loss', [])) == len(res.accuracy),
+          f"loss entries={len(tr.get('loss', []))} rounds={len(res.accuracy)}")
 
 
 # ==============================================================================

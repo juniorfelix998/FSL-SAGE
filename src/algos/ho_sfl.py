@@ -152,7 +152,14 @@ class HO_SFL(FLAlgorithm):
         t, i, j, k = rd_cl_ep_it
 
         if (j, k) != (0, 0):
-            return {'acc': 0.0, 'loss': 0.0}
+            # Return NO metrics, not zeros. The shared loop mean-reduces
+            # training metrics across a round's batches, so reporting
+            # {'acc': 0.0} on the 23 no-op batches diluted this method's
+            # per-client training accuracy to ~1/24 of its true value. An empty
+            # dict is safe: the loop creates its metric keys at (j,k)==(0,0) --
+            # exactly the batch that does the real work -- and only appends
+            # afterwards, so nothing is dropped.
+            return {}
 
         # client forward under no_grad -- a zeroth-order client retains no
         # autograd activations, so its activation peak is ~0 by construction

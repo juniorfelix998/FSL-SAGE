@@ -197,7 +197,14 @@ class MU_SplitFed(FLAlgorithm):
         t, i, j, k = rd_cl_ep_it
 
         if (j, k) != (0, 0):
-            return {'acc': 0.0, 'loss': 0.0}
+            # Return NO metrics, not zeros. The shared loop mean-reduces
+            # training metrics across a round's batches, so reporting
+            # {'acc': 0.0} on the 23 no-op batches diluted this method's
+            # per-client training accuracy to ~1/24 of its true value. An empty
+            # dict is safe: the loop creates its metric keys at (j,k)==(0,0) --
+            # exactly the batch that does the real work -- and only appends
+            # afterwards, so nothing is dropped.
+            return {}
 
         self.clients[i].optimizer.zero_grad()
         self.servers[i].optimizer.zero_grad()
