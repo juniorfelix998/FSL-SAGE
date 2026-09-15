@@ -263,7 +263,6 @@ def main(cfg: DictConfig):
         'peak_memory_mb'    : peak_memory_mb,
         'peak_process_mem_mb': peak_memory_mb,
         'run_manifest'      : utils.run_manifest(cfg, global_torch_device),
-        **results.comm_to_target,
         **results.memory_metrics,
         **train_metrics,
         **results.avg_compute_times

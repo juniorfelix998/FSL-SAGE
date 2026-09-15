@@ -151,15 +151,15 @@ class HO_SFL(FLAlgorithm):
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
 
-        if (j, k) != (0, 0):
-            # Return NO metrics, not zeros. The shared loop mean-reduces
-            # training metrics across a round's batches, so reporting
-            # {'acc': 0.0} on the 23 no-op batches diluted this method's
-            # per-client training accuracy to ~1/24 of its true value. An empty
-            # dict is safe: the loop creates its metric keys at (j,k)==(0,0) --
-            # exactly the batch that does the real work -- and only appends
-            # afterwards, so nothing is dropped.
-            return {}
+        # MATCHED ROUNDS: this method's reference implementation draws a single
+        # `next(loader)` per round, so this file used to no-op on every batch
+        # except (j,k)==(0,0). That made one round mean 1 optimizer step here
+        # and a full local epoch (24 steps on MNIST) everywhere else, and the
+        # benchmark papered over it with a 24x round multiplier for this method
+        # alone. The benchmark now defines a round as ONE LOCAL EPOCH for every
+        # method, so the zeroth-order update below runs on every batch, exactly
+        # like every first-order method's step does. The ZO update rule itself
+        # is untouched -- only how many batches it is applied to.
 
         # client forward under no_grad -- a zeroth-order client retains no
         # autograd activations, so its activation peak is ~0 by construction

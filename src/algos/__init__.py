@@ -378,7 +378,6 @@ class FLResults():
     avg_compute_times   : Dict[str, float]
     comm_breakdown      : List[Dict[str, float]]
     memory_metrics      : Dict[str, float]
-    comm_to_target      : Dict[str, float]
 
 # ------------------------------------------------------------------------------
 def __aggregate_metrics_dict(
@@ -488,38 +487,6 @@ def log_and_step_lr_per_client(i, alg, alg_name):
         })
 
     return lr_dict, log_dict
-
-# ------------------------------------------------------------------------------
-def compute_comm_to_target(test_acc, comm_load, comm_load_cut,
-                            comm_load_weights, target_acc):
-    '''Cumulative bytes at the first round whose test accuracy reaches
-    `target_acc`.
-
-    This is the round-count-independent number to rank on. Reading the final
-    round's cumulative byte count instead makes a method that was run for more
-    rounds look worse, and rewards a method that converges slowly -- exactly the
-    trap the existing table fell into when a 5-round dsl_aux run was compared
-    against a 3-round SplitFedv1 run.
-
-    Returns None-valued fields when the target was never reached, so a
-    non-converged run is visibly incomparable rather than silently ranked.
-    '''
-    for idx, acc in enumerate(test_acc):
-        if acc >= target_acc:
-            return {
-                'target_acc'              : target_acc,
-                'rounds_to_target'        : idx + 1,
-                'comm_to_target'          : comm_load[idx],
-                'comm_cut_to_target'      : comm_load_cut[idx],
-                'comm_weights_to_target'  : comm_load_weights[idx],
-            }
-    return {
-        'target_acc'              : target_acc,
-        'rounds_to_target'        : None,
-        'comm_to_target'          : None,
-        'comm_cut_to_target'      : None,
-        'comm_weights_to_target'  : None,
-    }
 
 # ------------------------------------------------------------------------------
 def _run_fl_algorithm(
@@ -699,10 +666,6 @@ def _run_fl_algorithm(
         train_metrics, aggregation_metrics
     )
     memory_metrics = alg.memory_report()
-    comm_to_target = compute_comm_to_target(
-        test_acc, comm_load, comm_load_cut, comm_load_weights,
-        float(cfg.get('target_acc', 0.97))
-    )
     logging.info(
         f" > Peak client mem: {memory_metrics['peak_client_mem_mb']:.2f} MiB "
         f"(act {memory_metrics['client_act_peak_mem_mb']:.2f}, "
@@ -713,7 +676,7 @@ def _run_fl_algorithm(
     return FLResults(
         alg.server, alg.clients, test_loss, test_acc, train_metrics,
         aggregation_metrics, comm_load_cut, comm_load_weights, comm_load,
-        avg_compute_times, comm_breakdown, memory_metrics, comm_to_target
+        avg_compute_times, comm_breakdown, memory_metrics
     )
 
 # ------------------------------------------------------------------------------

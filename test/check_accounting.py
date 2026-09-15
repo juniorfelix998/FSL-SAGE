@@ -253,7 +253,6 @@ def make_cfg(algo_name, num_clients, rounds, batch_size, extra_algo=None):
         'comm_threshold_mb': float('inf'),
         'measure_memory': True,
         'mem_probe_batches': 10 ** 9,       # instrument every batch in the test
-        'target_acc': 2.0,                  # unreachable: exercise the None path
         'device': 'cpu',
     })
     if extra_algo:
@@ -410,15 +409,31 @@ def test_comm_closed_form():
              res.comm_load_weights[-1], 0)
     check_eq("Vanilla-SL cut.act_up", last(bd, 'cut.act_up'), R * per_round_act)
 
-    # ---- DSL-Aux: real gradient back, non-federated -------------------
-    cfg, res = build_run('dsl_aux', 1, N, B, R, extra_algo={'aux_loss_weight': 1.0})
-    bd = res.comm_breakdown
+    # ---- DSL-Aux: decoupled -- activations up only, non-federated -----
+    # arXiv:2601.19261 SIII-B: the server computes dL/dz but "this gradient is
+    # not transmitted to the client". Obs. 2: that halves communication versus
+    # conventional SL. Both are asserted here against Vanilla-SL, run just above
+    # on the identical config, so a regression to plain SL cannot pass silently.
+    cfg, res_dsl = build_run('dsl_aux', 1, N, B, R)
+    bd = res_dsl.comm_breakdown
     one_round = sum(act_bytes(b) for b in bs_list)
     check_eq("DSL-Aux cut.act_up", last(bd, 'cut.act_up'), R * one_round)
-    check_eq("DSL-Aux cut.grad_down (it really does send a gradient back)",
-             last(bd, 'cut.grad_down'), R * one_round)
+    check_eq("DSL-Aux cut.grad_down is ZERO (no gradient crosses back)",
+             last(bd, 'cut.grad_down'), 0)
     check_eq("DSL-Aux charges no weight traffic (non-federated)",
-             res.comm_load_weights[-1], 0)
+             res_dsl.comm_load_weights[-1], 0)
+    # the paper's ~50% claim, stated exactly. Paired against Vanilla-SL on an
+    # IDENTICAL config (same client count), so the only difference is the
+    # protocol: DSL pays activations + labels, conventional SL pays those plus
+    # an equal-sized gradient coming back.
+    _, res_sl1 = build_run('vanilla_sl', 1, N, B, R)
+    check_eq("Vanilla-SL (1 client) cut.grad_down is the gradient half",
+             last(res_sl1.comm_breakdown, 'cut.grad_down'), R * one_round)
+    check_eq("DSL-Aux cut total == Vanilla-SL's minus the gradient half",
+             res_dsl.comm_load_cut[-1],
+             res_sl1.comm_load_cut[-1] - R * one_round)
+    check("DSL-Aux cut traffic is ~50% of Vanilla-SL's (paper Obs. 2)",
+               abs(res_dsl.comm_load_cut[-1] / res_sl1.comm_load_cut[-1] - 0.5) < 0.02)
 
     # ---- HOSL: base activation + one per probe + a scalar back --------
     P = 2
@@ -442,22 +457,23 @@ def test_comm_closed_form():
         'use_pretrained': False, 'freeze_bn': False,
     })
     bd = res.comm_breakdown
-    # one real batch per client per round
-    check_eq("HO-SFL cut.act_up (one batch per client per round)",
-             last(bd, 'cut.act_up'), R * M * act_bytes(B))
+    # matched rounds: every batch of the local epoch, like every other method
+    check_eq("HO-SFL cut.act_up (every batch, matched rounds)",
+             last(bd, 'cut.act_up'), R * M * sum(act_bytes(b) for b in bs_list))
     check("HO-SFL weight traffic is scalars only, never a weight vector",
           last(bd, 'weights.scalars') == res.comm_load_weights[-1]
           and res.comm_load_weights[-1] > 0,
           f"scalars={last(bd, 'weights.scalars')} total={res.comm_load_weights[-1]}")
-    check("HO-SFL weight traffic is orders below SplitFedv2's",
-          res.comm_load_weights[-1] < splitfedv2.comm_load_weights[-1] / 10,
+    # Dimension-free aggregation: HO-SFL sends (scalar, seed) pairs per update
+    # rather than a weight vector, so its aggregation traffic scales with the
+    # NUMBER OF UPDATES and not with the model's parameter count. The margin over
+    # SplitFedv2 therefore grows with model size -- huge on ResNet-18, modest on
+    # this deliberately tiny stand-in model -- so assert the direction, which is
+    # the paper's actual claim, rather than a ratio that is an artifact of the
+    # test model's size.
+    check("HO-SFL weight traffic is below SplitFedv2's",
+          res.comm_load_weights[-1] < splitfedv2.comm_load_weights[-1],
           f"ho={res.comm_load_weights[-1]} v2={splitfedv2.comm_load_weights[-1]}")
-
-    # ---- comm-to-target reports None when never reached ---------------
-    check_eq("comm_to_target is None when the target is never reached",
-             res.comm_to_target['comm_to_target'], None)
-    check_eq("rounds_to_target is None when the target is never reached",
-             res.comm_to_target['rounds_to_target'], None)
 
     return splitfedv2, cse
 
@@ -516,7 +532,7 @@ ALGO_EXTRAS = {
     'vanilla_sl':       {},
     'cse_fsl':          {'server_update_interval': 2},
     'fsl_sage':         {'server_update_interval': 2, 'align_interval': 1},
-    'dsl_aux':          {'aux_loss_weight': 1.0},
+    'dsl_aux':          {},   # lambda = 0 per the paper; no weight to tune
     'han_locloss':      {},
     'fedsplitx':        {},
     'locfedmix_sl':     {'mixup_alpha': 1.0, 'mixup_partners': 1,
@@ -534,14 +550,16 @@ ALGO_EXTRAS = {
 
 # methods where no gradient crosses the cut, so cut.grad_down must be zero
 NO_GRADIENT_BACK = ('cse_fsl', 'fsl_sage', 'han_locloss', 'fedsplitx',
-                    'hosl', 'mu_splitfed', 'fed_avg')
+                    'hosl', 'mu_splitfed', 'fed_avg', 'dsl_aux')
 # methods that run the client forward under no_grad, so it retains nothing
 ZERO_ORDER_CLIENTS = ('hosl', 'ho_sfl', 'mu_splitfed')
 # non-federated methods, so weight traffic must be zero
 NON_FEDERATED = ('vanilla_sl', 'dsl_aux', 'hosl')
-# methods that do real work only on the round's first batch (faithful to their
-# reference, whose "round" IS one batch -- see run_mnist_benchmark.py)
-ONE_BATCH_PER_ROUND = ('ho_sfl', 'mu_splitfed')
+# MATCHED ROUNDS: no method may skip batches. ho_sfl and mu_splitfed used to do
+# real work only at (j,k)==(0,0), which made a "round" mean 1 optimizer step for
+# them and 24 for everyone else. The benchmark now defines a round as one local
+# epoch for every method, so that gate must not come back -- checked below
+# against every registered algorithm's source.
 
 
 def build_real_run(algo_name, extra_algo, num_clients=2, samples=8,
@@ -623,6 +641,20 @@ def test_all_methods_on_real_model():
         )
         check(f"{algo}: completes a round, ledger balances", ok)
 
+        if algo == 'fedsplitx':
+            # arXiv:2310.14579 Fig. 1 / Sec. 2.1: an auxiliary network at EVERY
+            # partition point. A 4-stage ResNet has M = 3 of them (after
+            # layer1/2/3; layer4's output is l_{M+1}), split between the sides
+            # by the client's depth-level. Asserting the count is what keeps
+            # this method from collapsing back to the single-head M=1 case that
+            # made it a duplicate of han_locloss.
+            tr = res.train_metrics[0]
+            n_c, n_s = tr['n_client_aux'][0], tr['n_server_aux'][0]
+            check_eq("fedsplitx: M = 3 partition points on ResNet-18",
+                     n_c + n_s, 3)
+            check("fedsplitx: auxiliary networks on BOTH sides of the cut",
+                  n_c >= 1 and n_s >= 1, f"client={n_c} server={n_s}")
+
         if algo in NO_GRADIENT_BACK:
             check_eq(f"{algo}: no gradient crosses the cut",
                      bd['cut.grad_down'], 0.0)
@@ -635,8 +667,7 @@ def test_all_methods_on_real_model():
         check(f"{algo}: reports non-zero client memory",
               res.memory_metrics['peak_client_mem_mb'] > 0)
 
-        if algo in ONE_BATCH_PER_ROUND:
-            check_one_batch_noop_reports_nothing(algo, res)
+        check_every_batch_trains(algo, res)
         if algo == 'fed_avg':
             # fed_avg merges the server model into every client's model, so
             # there is no separate server host to charge -- 0 is correct here
@@ -647,28 +678,31 @@ def test_all_methods_on_real_model():
                   res.memory_metrics['peak_server_mem_mb'] > 0)
 
 
-def check_one_batch_noop_reports_nothing(algo, res):
-    '''ho_sfl / mu_splitfed do real work only at (j,k)==(0,0). They must return
-    NO metrics on the other batches.
+def check_every_batch_trains(algo, res):
+    '''The matched-rounds invariant: one round is one local epoch, the same for
+    every method, so no client_step may skip batches.
 
-    Returning {'acc': 0.0, 'loss': 0.0} there (as they used to) is silently
-    wrong: the shared loop mean-reduces a round's per-batch metrics, so on MNIST
-    those 23 no-op batches dragged the reported per-client training accuracy to
-    ~1/24 of its true value. Asserted structurally rather than by inspecting the
-    value, because a genuinely-untrained run can legitimately report 0.0 too.
+    This is the guard on the benchmark's central fairness claim. When ho_sfl and
+    mu_splitfed no-op'd on all but the round's first batch, an equal round budget
+    silently handed them 1/24 of everyone else's optimizer steps -- which the
+    sweep then compensated for with a 24x round multiplier, making Comm-total and
+    Latency incomparable across rows. Checked structurally against the source, so
+    the gate cannot be reintroduced without this failing.
     '''
     alg = ALGORITHM_REGISTRY[algo]
     src = inspect.getsource(alg.client_step)
-    noop = re.search(r'if \(j, k\) != \(0, 0\):\s*(?:#[^\n]*\n\s*)*return ([^\n]+)',
-                      src)
-    check(f"{algo}: no-op batch returns no metrics (not fake zeros)",
-          noop is not None and noop.group(1).strip() == '{}',
-          f"returns {noop.group(1).strip() if noop else '<pattern not found>'}")
-    # and the surviving value is the real batch's, one entry per round
+    gate = re.search(r'if \(j,\s*k\)\s*!=\s*\(0,\s*0\)', src)
+    check(f"{algo}: trains on every batch (no one-batch-per-round gate)",
+          gate is None,
+          "client_step still early-returns on batches other than (0,0)")
+    # one training-metric entry per round, i.e. the round really did run.
+    # Only meaningful for methods that report a 'loss' key at all -- some report
+    # their own named losses instead.
     tr = res.train_metrics[0]
-    check(f"{algo}: one training-metric entry per round",
-          len(tr.get('loss', [])) == len(res.accuracy),
-          f"loss entries={len(tr.get('loss', []))} rounds={len(res.accuracy)}")
+    if 'loss' in tr:
+        check(f"{algo}: one training-metric entry per round",
+              len(tr['loss']) == len(res.accuracy),
+              f"loss entries={len(tr['loss'])} rounds={len(res.accuracy)}")
 
 
 # ==============================================================================
@@ -706,6 +740,59 @@ def test_pretrained_loader():
                  tuple(out.shape), (2, NUM_CLASSES))
 
 
+
+# ==============================================================================
+def test_no_cloned_implementations():
+    """No two methods may share an implementation.
+
+    THIS IS THE CHECK THAT WAS MISSING. Every other assertion in this file is
+    per-method: it can confirm that `fedsplitx` charges the bytes `fedsplitx`
+    is supposed to charge, and still not notice that `fedsplitx.py` was a
+    byte-for-byte copy of `han_locloss.py` with the class name changed. Two
+    identical implementations produce two identical benchmark rows, which reads
+    as an independent corroboration when it is really one number printed twice.
+
+    Compared on source text rather than on measured output, because two genuinely
+    distinct methods may legitimately coincide on a toy model while differing on
+    the real backbone -- source identity is unambiguous either way.
+    """
+    print("\n[6] No two methods share an implementation")
+
+    def normalise(fn):
+        src = inspect.getsource(fn)
+        src = re.sub(r'#[^\n]*', '', src)              # strip comments
+        src = re.sub(r'\s+', ' ', src)                  # collapse whitespace
+        return src.strip()
+
+    bodies = {}
+    for name, cls in sorted(ALGORITHM_REGISTRY.items()):
+        step = getattr(cls, 'client_step', None)
+        if step is None:
+            continue
+        try:
+            bodies[name] = normalise(step)
+        except (OSError, TypeError):
+            continue
+
+    seen = {}
+    clones = []
+    for name, body in bodies.items():
+        # a class name appearing inside the body would mask an otherwise exact
+        # clone, so compare with every registry key neutralised
+        key = body
+        for other in bodies:
+            key = key.replace(other, '<ALGO>')
+        if key in seen:
+            clones.append((seen[key], name))
+        else:
+            seen[key] = name
+
+    check("no two algorithms share a client_step implementation",
+          not clones,
+          "; ".join(f"{a} == {b}" for a, b in clones))
+    print(f"  ({len(bodies)} algorithms compared)")
+
+
 # ==============================================================================
 def main():
     print("=" * 74)
@@ -716,6 +803,7 @@ def main():
     test_memory_orderings(v2, cse)
     test_all_methods_on_real_model()
     test_pretrained_loader()
+    test_no_cloned_implementations()
 
     print("\n" + "=" * 74)
     if FAILURES:

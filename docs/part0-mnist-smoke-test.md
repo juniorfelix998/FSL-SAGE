@@ -247,9 +247,9 @@ constant offset.
   specifically — a larger change than this smoke test warranted.
 - **`simple_conv` model config is broken** (see Step 1) — needs the missing
   `optimizer` blocks added before it can be used as a benchmark model choice.
-- **`src/algos/fed_rolex.py` is an empty stub** — not implemented, not
-  currently part of the benchmark method list, no action needed unless it
-  becomes relevant later.
+- **`src/algos/fed_rolex.py` was an empty stub** — never implemented and never
+  part of the benchmark method list; deleted, since an empty file that registers
+  nothing is only a source of confusion.
 - **All timings here are CPU-only, single dev machine, 2-client toy runs** —
   useful only to confirm the instrumentation itself works end-to-end, not as
   representative absolute numbers for the GPU-based main benchmark.

@@ -82,10 +82,8 @@ def _summarise(runs, key, scale=1.0, per_round=False):
     '''(mean, std, n) of one metric across the seed runs for a cell.
 
     Returns (None, None, 0) when no run reports the metric -- which happens for
-    a metric added after those runs were produced, and for `comm_to_target` when
-    a method never reached the target accuracy. That is deliberately propagated
-    as "not available" rather than silently coerced to 0: a method that did not
-    converge must not be ranked as if it had.
+    a metric added after those runs were produced. That is deliberately
+    propagated as "not available" rather than silently coerced to 0.
     '''
     vals = []
     for run in runs:
@@ -116,7 +114,7 @@ def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
     silently compared a 5-round 1-client run against a 3-round 2-client one.
     '''
     seed_list = seeds if seeds else [None]
-    runs = []
+    runs, paths = [], []
     for seed in seed_list:
         path = find_latest_run(
             cfg['prefix_dir'], algo_key, cfg['model'], cfg['dataset'],
@@ -125,6 +123,7 @@ def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
         )
         if path is not None:
             runs.append(load_run(path))
+            paths.append(path)
     if not runs:
         return None
 
@@ -141,7 +140,6 @@ def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
         ('comm_cut',       'comm_load_cut',              1.0 / MB, True),
         ('comm_weights',   'comm_load_weights',          1.0 / MB, True),
         ('comm_total',     'comm_load',                  1.0 / MB, True),
-        ('comm_to_target', 'comm_to_target',             1.0 / MB, False),
         ('latency_s',      'latency_s',                       1.0, False),
         ('client_mem',     'peak_client_mem_mb',              1.0, False),
         ('server_mem',     'peak_server_mem_mb',              1.0, False),
@@ -152,6 +150,13 @@ def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
         100.0 * cut_mean / tot_mean if cut_mean is not None and tot_mean else 0.0
     )
     cell['n_seeds'] = len(runs)
+    # Provenance. Which results.json fed a cell used to be invisible, so two
+    # methods resolving to the SAME run printed as two corroborating rows. Kept
+    # per cell and cross-checked in build_table.
+    cell['paths'] = paths
+    cell['config_sha256'] = [
+        r.get('run_manifest', {}).get('config_sha256') for r in runs
+    ]
     cell['settings'] = [
         (
             r.get('run_manifest', {}).get('rounds', len(r.get('test_acc', []))),
@@ -173,16 +178,16 @@ def columns_spec(cfg):
 
 
 # ------------------------------------------------------------------------------
-# per-column metrics, in table order. `ranked` marks the value the benchmark
-# ranks on: cumulative bytes at the FINAL round is round-count dependent (it
-# penalises a method run for longer and rewards one that converges slowly), so
-# bytes-to-reach-the-target-accuracy is the headline number instead.
+# per-column metrics, in table order. The benchmark ranks on `Comm-total`:
+# every method runs the SAME number of rounds and a round means one local epoch
+# for all of them (see docs/METRICS.md), so cumulative bytes at the final round
+# is a like-for-like comparison. This is checked, not assumed -- build_table
+# refuses to emit a table whose cells disagree on round count.
 METRIC_COLUMNS = [
     # (column label, cell key, format precision)
     ('Comm-cut (MB)',      'comm_cut',       2),
     ('Comm-weights (MB)',  'comm_weights',   2),
     ('Comm-total (MB)',    'comm_total',     2),
-    ('Comm-to-target (MB)', 'comm_to_target', 2),
     ('Acc (%)',            'acc',            2),
     ('Latency (s)',        'latency_s',      2),
     ('Client mem (MB)',    'client_mem',     2),
@@ -192,12 +197,8 @@ METRIC_COLUMNS = [
 
 
 def _fmt(cell, key, prec):
-    '''mean+/-std across seeds, or "n/a" when the metric is absent.
-
-    "n/a" for Comm-to-target means the method never reached the target accuracy
-    -- shown as such rather than as a number, because there is no honest
-    communication cost to report for a run that did not converge.
-    '''
+    '''mean+/-std across seeds, or "n/a" when the metric is absent from the
+    run's results.json (e.g. an older run predating a metric).'''
     mean, std, n = cell.get(key, (None, None, 0))
     if mean is None:
         return 'n/a'
@@ -207,11 +208,10 @@ def _fmt(cell, key, prec):
 
 
 def build_table(cfg=None, out_path=None, cut='middle', num_clients=None,
-                 seeds=None, target_acc=None):
+                 seeds=None, rounds=None):
     cfg = cfg or load_config()
     columns = columns_spec(cfg)
     methods = list(cfg['methods'].keys())
-    target_acc = target_acc if target_acc is not None else cfg.get('target_acc')
 
     cells = {
         name: [
@@ -233,6 +233,7 @@ def build_table(cfg=None, out_path=None, cut='middle', num_clients=None,
     footnotes_used = []
     observed_settings = set()
     seed_counts = set()
+    cell_sources = {}
     for name in methods:
         meta = cfg['methods'][name]
         is_reimpl = meta.get('reimplementation', False)
@@ -250,13 +251,15 @@ def build_table(cfg=None, out_path=None, cut='middle', num_clients=None,
                 row.append(f"{cell['cut_share_pct']:.0f}% cut")
                 observed_settings.update(cell['settings'])
                 seed_counts.add(cell['n_seeds'])
+                for pth in cell['paths']:
+                    cell_sources.setdefault(pth, []).append(f'{label} ({name})')
             else:
                 row += ['N/A'] * (len(METRIC_COLUMNS) + 1)
         table.add_row(row)
 
     header = f"Cut: {cut}, num_clients: {num_clients if num_clients is not None else 'default'}"
-    if target_acc is not None:
-        header += f", Comm-to-target measured at acc >= {float(target_acc) * 100:.1f}%"
+    header += ", matched rounds (1 round = 1 local epoch for every method)"
+    header += ", ranked on Comm-total"
 
     # Comparability guard. Cumulative comm and wall-clock latency are only
     # comparable across cells that ran the same protocol, and memory is not
@@ -264,13 +267,29 @@ def build_table(cfg=None, out_path=None, cut='middle', num_clients=None,
     # intermediates than the CPU kernels). Previously the table just printed
     # whatever it found; now a mismatch is stated on the face of it.
     warnings = []
+    # Two cells reading the same results.json is not a near-miss, it is a bug:
+    # it prints one run twice and reads as independent corroboration. This is
+    # exactly how a DSL-Aux row once came out byte-identical to Vanilla-SL's.
+    for pth, users in sorted(cell_sources.items()):
+        if len(set(users)) > 1:
+            warnings.append(
+                "!! DUPLICATE SOURCE: " + ", ".join(sorted(set(users)))
+                + f" all read {pth}. These are not independent results."
+            )
     distinct = {s for s in observed_settings if any(v is not None for v in s)}
-    if len({d[0] for d in distinct}) > 1:
+    observed_rounds = {d[0] for d in distinct}
+    if len(observed_rounds) > 1:
         warnings.append(
-            "!! NOT COMPARABLE: cells were run for different round counts "
-            f"({sorted({d[0] for d in distinct})}). Cumulative comm and latency "
-            "scale with rounds -- rank on Comm-to-target, or re-run at matched "
-            "rounds."
+            "!! INVALID TABLE: cells were run for different round counts "
+            f"({sorted(observed_rounds)}). The benchmark ranks on Comm-total at "
+            "matched rounds, so this table is not a valid comparison -- re-run "
+            "every cell at the same --rounds."
+        )
+    if rounds is not None and observed_rounds and observed_rounds != {rounds}:
+        warnings.append(
+            f"!! INVALID TABLE: expected every cell at rounds={rounds}, found "
+            f"{sorted(observed_rounds)}. A cell short of the requested budget "
+            "was truncated (check comm_threshold_mb) or is a stale run."
         )
     if len({d[1] for d in distinct if d[1] is not None}) > 1:
         warnings.append(

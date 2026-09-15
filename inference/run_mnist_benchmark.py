@@ -31,16 +31,16 @@ DEFAULT_METHODS = [
     'fedsplitx', 'hosl', 'locfedmix_sl',
 ]
 
-# These two process exactly ONE batch per client per round -- faithful to their
-# reference implementation, which draws `next(loader)` each round. Every other
-# method here takes one optimizer step per BATCH, so on MNIST with 10 clients
-# (6000 samples each, batch 256 -> 24 batches) an equal `rounds` budget hands
-# these two 24x fewer updates; the reference itself runs ~375 effective rounds.
-# Scaling their round count is what makes the accuracy column mean anything.
-# The communication columns stay comparable regardless, because Comm-to-target
-# is read off at a fixed ACCURACY rather than at a fixed round.
-ONE_BATCH_PER_ROUND_METHODS = ('ho_sfl', 'mu_splitfed')
-ZO_ROUND_MULTIPLIER = 24
+# MATCHED ROUNDS. Every method here runs for the SAME number of rounds, and a
+# round means the same thing for all of them: one local epoch over each client's
+# shard. ho_sfl and mu_splitfed used to no-op on all but the round's first batch
+# (faithful to their references, whose "round" is one batch), which handed them
+# 24x fewer updates on MNIST and was compensated for with a 24x round multiplier
+# here. That multiplier is gone -- those two now step on every batch like every
+# other method (see the MATCHED ROUNDS note in src/algos/ho_sfl.py), so equal
+# rounds also means equal optimizer steps and equal passes over the data. That
+# is what makes Comm-total, Latency and Accuracy directly comparable across
+# rows, and it is why Comm-to-target is no longer needed.
 DISTRIBUTIONS = [('iid', None), ('noniid_dirichlet', 0.5)]
 ALL_CUTS = ['shallow', 'middle', 'deep']
 
@@ -60,15 +60,6 @@ def parse_args():
                     help="run and average over several seeds -- CLAUDE.md's "
                          "protocol is 3. Overrides --seed; the table then "
                          "reports mean+/-std per cell instead of one run")
-    p.add_argument('--target_acc', type=float, default=None,
-                    help="accuracy at which Comm-to-target is read off "
-                         "(default: config.yaml's target_acc, 0.97 for MNIST)")
-    p.add_argument('--zo_round_multiplier', type=int,
-                    default=ZO_ROUND_MULTIPLIER,
-                    help="multiply --rounds by this for ho_sfl/mu_splitfed, "
-                         "which do one batch per client per round (see the "
-                         "module comment). Pass 1 to run every method at "
-                         "--rounds")
     p.add_argument('--comm_threshold_mb', type=float, default=None,
                     help="raise the communication budget that early-stops a "
                          "run (config.yaml default 204800 = 200 GiB). "
@@ -100,22 +91,13 @@ def parse_args():
     return p.parse_args()
 
 # ------------------------------------------------------------------------------
-def rounds_for(algo, rounds, zo_round_multiplier):
-    '''Round budget for one method. See ONE_BATCH_PER_ROUND_METHODS above for
-    why two of them get a larger one.'''
-    if algo in ONE_BATCH_PER_ROUND_METHODS:
-        return max(1, rounds * max(1, zo_round_multiplier))
-    return rounds
-
-
 def run_sweep(methods, rounds, seeds, device, num_clients_values, cuts,
-               zo_round_multiplier=ZO_ROUND_MULTIPLIER, target_acc=None,
                comm_threshold_mb=None, measure_memory=None):
     failures = []
     for cut in cuts:
         for num_clients in num_clients_values:
             for algo in methods:
-                algo_rounds = rounds_for(algo, rounds, zo_round_multiplier)
+                algo_rounds = rounds     # matched: identical for every method
                 for seed in seeds:
                     for distribution, alpha in DISTRIBUTIONS:
                         cmd = [
@@ -130,8 +112,6 @@ def run_sweep(methods, rounds, seeds, device, num_clients_values, cuts,
                             cmd.append(f'dataset.alpha={alpha}')
                         if num_clients is not None:
                             cmd.append(f'num_clients={num_clients}')
-                        if target_acc is not None:
-                            cmd.append(f'target_acc={target_acc}')
                         if comm_threshold_mb is not None:
                             cmd.append(f'comm_threshold_mb={comm_threshold_mb}')
                         if measure_memory is not None:
@@ -294,8 +274,7 @@ def main():
     if not args.skip_sweep:
         run_sweep(
             args.methods, args.rounds, seeds, device, num_clients_values,
-            args.cuts, zo_round_multiplier=args.zo_round_multiplier,
-            target_acc=args.target_acc,
+            args.cuts,
             comm_threshold_mb=args.comm_threshold_mb,
             measure_memory=args.measure_memory,
         )
@@ -307,7 +286,7 @@ def main():
     for cut in args.cuts:
         for num_clients in num_clients_values:
             build_table(cfg, cut=cut, num_clients=num_clients,
-                        seeds=table_seeds, target_acc=args.target_acc)
+                        seeds=table_seeds, rounds=args.rounds)
             make_plots(cfg, cut=cut, num_clients=num_clients)
 
 # ------------------------------------------------------------------------------
