@@ -42,8 +42,27 @@ class FSLSAGE(FLAlgorithm):
             local_smashed_data = \
                 splitting_output.clone().detach().requires_grad_(True)
 
-        # server model update
         local_iter = j * self.iters_per_epoch[i] + k
+        # An alignment iteration is the ONLY one on which the client genuinely
+        # depends on the server: `align()` below refreshes the surrogate
+        # server-side, and the client's gradient must come from the refreshed
+        # one. On every other iteration the surrogate is already current, so the
+        # client owes the server nothing and can finish locally first.
+        aligning = (t % self.align_interval == 0 and local_iter == 0)
+
+        # Client backward, HOISTED above the server phase on non-alignment
+        # iterations. Left below it (as this file used to be), the client's
+        # whole autograd graph stayed alive across the cut and
+        # `client_mem_held_across_cut_mb` reported ~94 MB of a stall that does
+        # not exist -- an artifact of statement order, not of the algorithm.
+        # cse_fsl already frees its graph this way. Behaviour is unchanged: the
+        # two optimizer steps touch disjoint parameter sets, and the server
+        # consumes `splitting_output`'s VALUES, which a completed backward
+        # leaves intact.
+        if not aligning:
+            self.__client_backward(i, splitting_output, local_smashed_data, y)
+
+        # server model update
         if local_iter % self.server_update_interval == 0:
             smashed_data = splitting_output.clone().detach().requires_grad_(True)
             self.charge_cut_activation(smashed_data)
@@ -84,14 +103,21 @@ class FSLSAGE(FLAlgorithm):
                 self.clients[i].auxiliary_model, 'aux', 'down'
             )
 
-        # client backpropagation using the surrogate's synthesised gradient --
-        # no gradient is requested from the server, so nothing is charged here
+        # On an alignment iteration the client really was waiting for the
+        # server, so its backward stays here and `held_across_cut` correctly
+        # reports a non-zero stall for those iterations.
+        if aligning:
+            self.__client_backward(i, splitting_output, local_smashed_data, y)
+
+        return ret_dict
+
+    def __client_backward(self, i, splitting_output, local_smashed_data, y):
+        '''Client backpropagation using the surrogate's synthesised gradient --
+        no gradient is requested from the server, so nothing is charged here.'''
         with self.phase('client', i):
             client_grad_approx = \
                 self.clients[i].auxiliary_model(local_smashed_data, y)
             splitting_output.backward(client_grad_approx)
             self.clients[i].optimizer.step()
-
-        return ret_dict
 
 # ------------------------------------------------------------------------------

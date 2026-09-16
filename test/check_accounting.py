@@ -435,16 +435,20 @@ def test_comm_closed_form():
     check("DSL-Aux cut traffic is ~50% of Vanilla-SL's (paper Obs. 2)",
                abs(res_dsl.comm_load_cut[-1] / res_sl1.comm_load_cut[-1] - 0.5) < 0.02)
 
-    # ---- HOSL: base activation + one per probe + a scalar back --------
-    P = 2
+    # ---- HOSL: 2Q probe activations + 1 base, 2Q scalars back ---------
+    # Eq. 7 is a SYMMETRIC two-point estimate, so each of the Q perturbation
+    # vectors costs two forward passes (Alg. 1 L13 and L19 both send an
+    # activation), plus one unperturbed upload for the server's first-order
+    # pass in Phase 2.
+    Q = 2
     cfg, res = build_run('hosl', 1, N, B, R, extra_algo={
-        'num_pert': P, 'zo_mu': 1e-3
+        'num_pert': Q, 'zo_mu': 1e-3, 'client_lr': 1e-3, 'server_lr': 1e-3
     })
     bd = res.comm_breakdown
-    check_eq("HOSL cut.act_up (base + one per zeroth-order probe)",
-             last(bd, 'cut.act_up'), R * (1 + P) * one_round)
-    check_eq("HOSL cut.scalar_down (one scalar per probe, dtype-sized)",
-             last(bd, 'cut.scalar_down'), R * P * len(bs_list) * 4)
+    check_eq("HOSL cut.act_up (1 base + 2Q two-sided probes)",
+             last(bd, 'cut.act_up'), R * (1 + 2 * Q) * one_round)
+    check_eq("HOSL cut.scalar_down (one scalar per probe forward)",
+             last(bd, 'cut.scalar_down'), R * 2 * Q * len(bs_list) * 4)
     check_eq("HOSL charges no weight traffic (non-federated)",
              res.comm_load_weights[-1], 0)
 
@@ -503,7 +507,7 @@ def test_memory_orderings(splitfedv2, cse):
 
     # zeroth-order clients run their forward under no_grad -> ~0 retained
     for algo, extra in (
-        ('hosl', {'num_pert': 2, 'zo_mu': 1e-3}),
+        ('hosl', {'num_pert': 2, 'zo_mu': 1e-3, 'client_lr': 1e-3, 'server_lr': 1e-3}),
         ('mu_splitfed', {'tau': 1, 'zo_mu': 5e-3, 'lr_c': 5e-3, 'lr_s': 1e-2,
                          'lr_g': 0.3, 'use_pretrained': False, 'freeze_bn': False}),
     ):
@@ -537,7 +541,7 @@ ALGO_EXTRAS = {
     'fedsplitx':        {},
     'locfedmix_sl':     {'mixup_alpha': 1.0, 'mixup_partners': 1,
                           'decoder_lr': 1e-3},
-    'hosl':             {'num_pert': 2, 'zo_mu': 1e-3},
+    'hosl':             {'num_pert': 2, 'zo_mu': 1e-3, 'client_lr': 1e-3, 'server_lr': 1e-3},
     'ho_sfl':           {'optimizer': 'adamw', 'lr': 1e-3,
                           'betas': [0.9, 0.999], 'weight_decay': 1e-4,
                           'zo_p': 2, 'zo_mu': 1e-3,
@@ -553,6 +557,12 @@ NO_GRADIENT_BACK = ('cse_fsl', 'fsl_sage', 'han_locloss', 'fedsplitx',
                     'hosl', 'mu_splitfed', 'fed_avg', 'dsl_aux')
 # methods that run the client forward under no_grad, so it retains nothing
 ZERO_ORDER_CLIENTS = ('hosl', 'ho_sfl', 'mu_splitfed')
+# Zeroth-order methods whose update is applied IN PLACE from a seed-regenerated
+# perturbation, so no `.grad` tensor is ever allocated -- HOSL Eq. 15 states
+# M_grad = 0 outright. `ho_sfl` is deliberately absent: its own reference uses
+# AdamW, whose moment state the algorithm genuinely needs, so its client
+# legitimately carries gradient and optimizer memory.
+NO_CLIENT_GRAD = ('hosl', 'mu_splitfed')
 # non-federated methods, so weight traffic must be zero
 NON_FEDERATED = ('vanilla_sl', 'dsl_aux', 'hosl')
 # MATCHED ROUNDS: no method may skip batches. ho_sfl and mu_splitfed used to do
@@ -641,6 +651,20 @@ def test_all_methods_on_real_model():
         )
         check(f"{algo}: completes a round, ledger balances", ok)
 
+        if algo in ('han_locloss', 'fedsplitx'):
+            # Both papers specify a LIGHTWEIGHT auxiliary -- Han et al. report
+            # theirs at 0.1-0.6% of full-model parameters. The harness default
+            # (`ResNetAuxiliary`) is a whole mirrored ResNet stage, ~19% of a
+            # ResNet-18 and three times the client-side model, which inflated
+            # both these methods' client memory and their weight-aggregation
+            # traffic. Guarded by size rather than by class name so any
+            # future substitution is checked too.
+            cm = res.memory_metrics
+            check(f"{algo}: auxiliary is small beside the client model",
+                  cm['client_param_mem_mb'] < 2.0 * _client_only_param_mb(),
+                  f"client-side params {cm['client_param_mem_mb']:.4f} MiB "
+                  f"vs client model alone {_client_only_param_mb():.4f} MiB")
+
         if algo == 'fedsplitx':
             # arXiv:2310.14579 Fig. 1 / Sec. 2.1: an auxiliary network at EVERY
             # partition point. A 4-stage ResNet has M = 3 of them (after
@@ -664,6 +688,11 @@ def test_all_methods_on_real_model():
         if algo in ZERO_ORDER_CLIENTS:
             check_eq(f"{algo}: zeroth-order client retains 0 activation bytes",
                      res.memory_metrics['client_act_peak_mem_mb'], 0.0)
+        if algo in NO_CLIENT_GRAD:
+            check_eq(f"{algo}: client allocates NO gradient buffer",
+                     res.memory_metrics['client_grad_mem_mb'], 0.0)
+            check_eq(f"{algo}: client holds NO optimizer state",
+                     res.memory_metrics['client_optim_mem_mb'], 0.0)
         check(f"{algo}: reports non-zero client memory",
               res.memory_metrics['peak_client_mem_mb'] > 0)
 
@@ -793,6 +822,117 @@ def test_no_cloned_implementations():
     print(f"  ({len(bodies)} algorithms compared)")
 
 
+
+def _client_only_param_mb(_cache={}):
+    '''Params of the client-side model alone, for the auxiliary-size guard.'''
+    if 'v' not in _cache:
+        from models import CLIENT_SERVER_MODEL_REGISTRY
+        cli_ctor, _ = CLIENT_SERVER_MODEL_REGISTRY['resnet18']
+        m = cli_ctor(client_layers=1)
+        _cache['v'] = sum(p.numel() * p.element_size()
+                          for p in m.parameters()) / (1024 ** 2)
+    return _cache['v']
+
+
+# ==============================================================================
+def test_system_peak_memory():
+    """The simultaneity peak: does conventional SL really hold both sides at once?
+
+    `peak_client_mem_mb` and `peak_server_mem_mb` are maxed per side
+    INDEPENDENTLY, so neither can express that conventional SL keeps the client's
+    activations alive WHILE the server runs, whereas a decoupled method frees
+    them first. That difference is the whole of DSL-Aux's memory claim
+    (arXiv:2601.19261 Obs. 3, "up to 58%"), and it is what `peak_system_live_mb`
+    measures. Asserted as a RELATION between two methods on an identical config,
+    not against an absolute figure, so it holds on any model size.
+    """
+    print("\n[7] System (simultaneity) peak memory")
+
+    sl = build_real_run('vanilla_sl', ALGO_EXTRAS['vanilla_sl'], cut_layers=2)
+    dsl = build_real_run('dsl_aux', ALGO_EXTRAS['dsl_aux'], cut_layers=2)
+
+    sl_m, dsl_m = sl.memory_metrics, dsl.memory_metrics
+
+    for name, m in (('vanilla_sl', sl_m), ('dsl_aux', dsl_m)):
+        check(f"{name}: reports a non-zero system act peak",
+              m['peak_system_live_mb'] > 0)
+        # A simultaneity peak must be at least as large as either side alone.
+        # (It can exceed the sum of the two *activation* peaks, because it also
+        # counts held buffers -- the input batch, the uploaded activation, the
+        # downloaded gradient -- which the activation-only metrics exclude.)
+        check(f"{name}: system peak >= each side's activation peak",
+              m['peak_system_live_mb'] >= max(m['client_act_peak_mem_mb'],
+                                              m['server_act_peak_mem_mb']) - 1e-6,
+              f"system={m['peak_system_live_mb']} "
+              f"client={m['client_act_peak_mem_mb']} "
+              f"server={m['server_act_peak_mem_mb']}")
+
+    # Conventional SL holds the client graph across the cut, so its simultaneity
+    # peak must exceed the decoupled method's on the same config. This is the
+    # assertion that would fail if dsl_aux ever regressed to holding its graph.
+    check("vanilla_sl's system peak EXCEEDS dsl_aux's (the decoupling saving)",
+          sl_m['peak_system_live_mb'] > dsl_m['peak_system_live_mb'],
+          f"sl={sl_m['peak_system_live_mb']:.4f} "
+          f"dsl={dsl_m['peak_system_live_mb']:.4f}")
+
+    # ...and the mechanism: SL holds a client graph across the cut, DSL does not
+    check_eq("dsl_aux holds nothing across the cut",
+             dsl_m['client_mem_held_across_cut_mb'], 0.0)
+    check("vanilla_sl DOES hold across the cut",
+          sl_m['client_mem_held_across_cut_mb'] > 0)
+
+    saving = 100.0 * (1 - dsl_m['peak_system_live_mb'] / sl_m['peak_system_live_mb'])
+    print(f"  (system live peak: vanilla_sl {sl_m['peak_system_live_mb']:.4f} MiB, "
+          f"dsl_aux {dsl_m['peak_system_live_mb']:.4f} MiB -> {saving:.1f}% saving)")
+
+
+
+# ==============================================================================
+def test_held_across_cut_reflects_the_algorithm():
+    """`held_across_cut` must measure a STALL, not statement order.
+
+    The metric samples client-owned autograd bytes at the instant a server phase
+    opens. That makes it sensitive to where a method happens to put its local
+    backward -- two methods here used to report a large hold purely because
+    their backward sat below the server block, with no data dependency forcing
+    it there. These assertions pin the corrected ordering.
+    """
+    print("\n[8] held-across-cut reflects the algorithm, not statement order")
+
+    sl = build_real_run('vanilla_sl', ALGO_EXTRAS['vanilla_sl'])
+    sl_held = sl.memory_metrics['client_mem_held_across_cut_mb']
+
+    # FSL-SAGE depends on the server ONLY on an alignment iteration, where the
+    # surrogate is refreshed server-side and the client's gradient must come
+    # from the refreshed copy. Its backward is now hoisted above the server
+    # phase on every other iteration.
+    #
+    # Note what this does and does not change. `held_across_cut` is a MAX over
+    # the run, and `t % align_interval == 0` is true at t = 0 for any interval,
+    # so every run contains an alignment iteration and the max is unchanged: the
+    # backbone, exactly what vanilla SL holds. What the hoist changes is how
+    # OFTEN the client stalls -- once per `align_interval` rounds instead of
+    # every iteration -- which a max cannot express. The assertion here is
+    # therefore the honest one: FSL-SAGE never holds MORE than the backbone.
+    fs = build_real_run('fsl_sage', ALGO_EXTRAS['fsl_sage'])
+    check("fsl_sage never holds more than the backbone across the cut",
+          fs.memory_metrics['client_mem_held_across_cut_mb'] <= sl_held + 1e-6,
+          f"fsl_sage={fs.memory_metrics['client_mem_held_across_cut_mb']} "
+          f"vanilla={sl_held}")
+
+    # LocFedMix-SL genuinely waits for the server's gradient (Eq. 4), so it
+    # holds its backbone graph -- but ONLY the backbone. Its Infopro decoder
+    # subgraph has no reason to survive the round trip, and on ResNet-18 that
+    # subgraph is dominated by a single interpolate back to input resolution.
+    # Holding exactly what vanilla SL holds is the precise statement of that.
+    lfm = build_real_run('locfedmix_sl', ALGO_EXTRAS['locfedmix_sl'])
+    check("locfedmix_sl holds only the backbone, same as vanilla SL",
+          abs(lfm.memory_metrics['client_mem_held_across_cut_mb']
+              - sl_held) < 1e-6,
+          f"locfedmix={lfm.memory_metrics['client_mem_held_across_cut_mb']} "
+          f"vanilla={sl_held}")
+
+
 # ==============================================================================
 def main():
     print("=" * 74)
@@ -804,6 +944,8 @@ def main():
     test_all_methods_on_real_model()
     test_pretrained_loader()
     test_no_cloned_implementations()
+    test_system_peak_memory()
+    test_held_across_cut_reflects_the_algorithm()
 
     print("\n" + "=" * 74)
     if FAILURES:

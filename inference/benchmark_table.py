@@ -143,6 +143,7 @@ def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
         ('latency_s',      'latency_s',                       1.0, False),
         ('client_mem',     'peak_client_mem_mb',              1.0, False),
         ('server_mem',     'peak_server_mem_mb',              1.0, False),
+        ('system_mem',     'peak_system_live_mb',             1.0, False),
         ('held_mem',       'client_mem_held_across_cut_mb',   1.0, False),
         ('process_rss',    'peak_memory_mb',                  1.0, False),
     )
@@ -193,6 +194,12 @@ METRIC_COLUMNS = [
     ('Client mem (MB)',    'client_mem',     2),
     ('Held-across-cut (MB)', 'held_mem',     3),
     ('Server mem (MB)',    'server_mem',     2),
+    # The simultaneity peak: live bytes summed across BOTH sides at one instant.
+    # The two per-side columns above are maxed independently, so only this one
+    # can show that synchronous SL holds the client's activations while the
+    # server runs and a decoupled method does not -- the effect DSL-Aux's paper
+    # reports as a peak-memory saving.
+    ('System peak (MB)',   'system_mem',     2),
 ]
 
 

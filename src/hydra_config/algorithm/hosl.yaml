@@ -1,12 +1,31 @@
 defaults:
   - base_algorithm
 name    : hosl
-# ZO perturbation scale and number of perturbations averaged per update --
-# not given precise values in the accessible parts of the paper; starting
-# points in the same range as this harness's other ZO methods (mu_splitfed,
-# ho_sfl), not tuned values.
-zo_mu   : 0.005
-num_pert: 5
+
+# All four values below are the paper's own (arXiv:2601.10940, Appendix VII-A):
+#   "For zeroth-order optimization, we fix eps = 1e-3 and use 10 perturbation
+#    vectors across all configurations. Both client and server use SGD without
+#    momentum."
+# An earlier revision of this file used eps=5e-3, 5 one-sided perturbations and
+# the harness's Adam default, with a comment claiming the paper gave no values.
+# It does; these are them.
+
+# eps: the ZO smoothing parameter in Eq. 6-7.
+zo_mu   : 1.0e-3
+# Q: number of perturbation VECTORS. Each costs TWO forward passes (Eq. 7 is a
+# symmetric two-point estimate), so a batch sends 2Q probe activations plus one
+# unperturbed activation for the server's first-order pass -- 21 uploads at
+# Q=10. That cost is real and the paper concedes it in its Limitations:
+# "the increased number of forward passes required for ZO gradient estimation
+# on the client side". It buys the lowest client memory of any method here.
+num_pert: 10
+
+# SGD-without-momentum step sizes. The client has NO optimizer object at all --
+# its update is applied in place from the regenerated perturbation (Alg. 3
+# ZOUPDATE), so it allocates neither a gradient buffer nor optimizer state,
+# per Eq. 15 (M_grad = 0) and Eq. 18 (M_act = 0).
+client_lr : 1.0e-3
+server_lr : 1.0e-3
 
 # NOTE: this method is non-federated per the paper (single client/server
 # pair) -- num_clients=1 is the paper-faithful run configuration.

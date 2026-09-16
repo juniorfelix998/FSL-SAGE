@@ -7,10 +7,13 @@ name: locfedmix_sl
 # alpha=4 both perform well, so this is a reasonable, not fully paper-tuned,
 # starting point.
 mixup_alpha    : 1.0
-# number of partner clients each client's smashed data is mixed with per
-# round (n_s in the paper) -- 1 = pairwise mixup, matching the paper's own
-# worked two-client example; the paper's own ablation explores larger n_s
-# as a further accuracy/cost trade-off, not replicated here.
-mixup_partners : 1
+# n_s: how many partners each client's smashed data is mixed with per round.
+# `null` follows the paper -- Sec. 3.1 concludes "n_s proportional to n", so
+# the harness uses n_s = num_clients - 1, the maximum the paper's own bound
+# (n_s <= n - 1) permits. Table 1 shows accuracy rising monotonically with n_s
+# (at n = 10: 0.4575 at n_s = 2, 0.5042 at n_s = 6, 0.5245 at n_s = 10), so the
+# previous fixed value of 1 was below the smallest setting the paper evaluates.
+# Set an integer here to pin it for an ablation.
+mixup_partners : null
 # learning rate for each client's local Infopro reconstruction decoder.
 decoder_lr     : 0.001

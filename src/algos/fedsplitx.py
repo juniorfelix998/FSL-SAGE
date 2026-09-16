@@ -58,27 +58,14 @@ import torch.nn.functional as F
 
 from algos import register_algorithm, aggregate_models, FLAlgorithm
 from models import config_optimizer
+from models.aux_models.simple_conv import GAPLinearHead as _AuxHead
 
 _STAGE_NAMES = ('layer1', 'layer2', 'layer3', 'layer4')
 
 
-# ------------------------------------------------------------------------------
-class _AuxHead(nn.Module):
-    '''One FedSplitX auxiliary network a_[i], attached at a partition point.
-
-    Global-average-pool + a single linear layer to class logits. Emits
-    log-probabilities, matching every other head in this harness (the shared
-    criterion is NLLLoss).
-    '''
-
-    def __init__(self, in_features, num_classes):
-        super().__init__()
-        self.fc = nn.Linear(in_features, num_classes)
-
-    def forward(self, x):
-        if x.dim() == 4:
-            x = F.adaptive_avg_pool2d(x, 1)
-        return F.log_softmax(self.fc(x.flatten(1)), dim=1)
+# One FedSplitX auxiliary network a_[i] per partition point. Shared with
+# han_locloss so there is a single definition of "the paper-sized auxiliary
+# head" in the harness rather than one per method.
 
 
 def _stage_modules(model):

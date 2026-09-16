@@ -32,19 +32,33 @@
 # all, unlike every gradient-crossing baseline in this harness. This is the
 # real, measurable communication reduction the paper's title claims.
 #
-# The auxiliary network reuses this harness's existing ResNetAuxiliary
-# (already instantiated for every algorithm, see src/main.py's unconditional
-# init_auxiliary() call) rather than a bespoke architecture -- sufficient for
-# the "runs + logs correctly, non-chance accuracy on MNIST" bar; matching the
-# paper's own tiny-MLP auxiliary network (they report needing only ~0.1-0.6%
-# of the full model's parameter count) is a candidate follow-up if exact
-# reproduction is later pursued.
+# AUXILIARY NETWORK SIZE. The paper reports its auxiliary network needing only
+# ~0.1-0.6% of the full model's parameter count, and that smallness is the
+# point: a_C is a cheap local error source, not a second model. An earlier
+# revision of this file reused the harness's default `ResNetAuxiliary`, which
+# on ResNet-18 is 2.1M parameters -- 18.8% of the full model and THREE TIMES
+# the size of the client-side model it hangs off. That single choice made this
+# method report the highest weight-aggregation traffic of all twelve here
+# (it FedAvgs the auxiliary every round) and badly inflated its client memory.
+# It now uses a flattened single-linear head (~0.18% of the full model), inside
+# the paper's stated range. Note it is deliberately NOT global-average-pooled:
+# pooling first would make the head ~0.01%, an order of magnitude below the
+# budget the paper reports needing.
+#
+# DISCLOSED EXTRAPOLATION: the paper specifies FedAvg over the client-side
+# models and their auxiliary networks. Keeping one server-side replica per
+# client and FedAvg-ing those too is this port's own inference "by symmetry"
+# with the paper's SplitFed baseline -- it is NOT in the paper, and it accounts
+# for a large share of this method's weight traffic. Recorded in the fidelity
+# table rather than silently folded into the number.
 # ------------------------------------------------------------------------------
 import time
 import copy
 import torch
 
 from algos import register_algorithm, aggregate_models, FLAlgorithm
+from models import config_optimizer
+from models.aux_models.simple_conv import GAPLinearHead
 
 # ------------------------------------------------------------------------------
 @register_algorithm("han_locloss")
@@ -55,6 +69,43 @@ class HanLocalLoss(FLAlgorithm):
     def __init__(self, *args, **kwargs):
         super(HanLocalLoss, self).__init__(*args, **kwargs)
         self.servers = [copy.deepcopy(self.server) for _ in self.clients]
+        self.__install_paper_auxiliary_head()
+
+    def __install_paper_auxiliary_head(self):
+        '''Swap the harness-default auxiliary for the paper-sized one.
+
+        Width is measured, not assumed: one eval-mode forward through the client
+        model gives the cut activation's channel count, and the server model
+        applied to it gives the class count -- so the head is correct at every
+        cut without hardcoding. Eval mode because BatchNorm rejects a 1-sample
+        batch while training, and the probe must not disturb running stats.
+        '''
+        sample = next(iter(self.test_loader))[0][:1].to(self.device)
+        cm, sm = self.clients[0].model, self.server.model
+        was = (cm.training, sm.training)
+        cm.eval(); sm.eval()
+        try:
+            with torch.no_grad():
+                z = cm(sample)
+                # flattened, not pooled: a pooled head would be ~0.01% of the
+                # model, an order of magnitude BELOW the 0.1-0.6% the paper
+                # reports needing. Flattening lands at ~0.18%, inside its range.
+                in_features = int(z.flatten(1).shape[1])
+                num_classes = int(sm(z).shape[1])
+        finally:
+            cm.train(was[0]); sm.train(was[1])
+
+        for c in self.clients:
+            head = GAPLinearHead(in_features, num_classes,
+                                 pool=False).to(self.device)
+            head.set_optimizer_lr_scheduler(
+                config_optimizer(head.parameters(), c.optimizer_options)
+            )
+            c.auxiliary_model = head
+        for c in self.clients[1:]:
+            c.auxiliary_model.load_state_dict(
+                self.clients[0].auxiliary_model.state_dict()
+            )
 
     def full_model(self, x):
         return self.aggregated_server(self.aggregated_client(x))

@@ -181,3 +181,48 @@ class LinearGradScalarAuxiliaryModel(GradScalarAuxiliaryModel):
     #    return x
  
 # ------------------------------------------------------------------------------
+
+
+# ------------------------------------------------------------------------------
+class GAPLinearHead(nn.Module):
+    """A lightweight auxiliary classifier: one linear layer to the class logits,
+    over either the globally-average-pooled activation or the flattened one.
+
+    `pool=True` (default) reduces a 4-D activation to its channel vector first,
+    so the head's size depends only on channel count -- the right choice when one
+    head type is attached at several different depths (FedSplitX). `pool=False`
+    flattens instead, giving a larger head whose size tracks the cut's spatial
+    extent -- the right choice when a paper states an auxiliary-size budget, since
+    a pooled head can land an order of magnitude below it.
+
+    Deliberately tiny. Several papers in this benchmark specify an auxiliary
+    network that is a negligible fraction of the model -- Han et al. report
+    theirs at 0.1-0.6% of full-model parameters, and FedSplitX hangs one off
+    every partition point -- so using the harness's default `ResNetAuxiliary`
+    (a whole mirrored ResNet stage, ~19% of a ResNet-18 and three times the size
+    of the client-side model) badly misrepresents both their client memory and
+    their weight-aggregation traffic.
+
+    Emits log-probabilities, matching every other head here (the shared
+    criterion is NLLLoss). `forward_inner` is an alias for `forward`, which is
+    the interface the auxiliary-loss algorithms call.
+    """
+
+    def __init__(self, in_features, num_classes, pool=True):
+        super().__init__()
+        self.pool = pool
+        self.fc = nn.Linear(in_features, num_classes)
+        self.optimizer = None
+        self.lr_scheduler = None
+
+    def set_optimizer_lr_scheduler(self, optimizer, lr_scheduler=None):
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+
+    def forward(self, x):
+        if self.pool and x.dim() == 4:
+            x = F.adaptive_avg_pool2d(x, 1)
+        return F.log_softmax(self.fc(x.flatten(1)), dim=1)
+
+    def forward_inner(self, x):
+        return self.forward(x)

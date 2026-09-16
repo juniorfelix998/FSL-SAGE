@@ -61,7 +61,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from algos import register_algorithm, FLAlgorithm
-from models.resnet import _STAGE_OUT_PLANES
 
 # ------------------------------------------------------------------------------
 class _ReconstructionDecoder(nn.Module):
@@ -90,10 +89,23 @@ class LocFedMixSL(FLAlgorithm):
     def __init__(self, *args, **kwargs):
         super(LocFedMixSL, self).__init__(*args, **kwargs)
         self.mixup_alpha = self.cfg.mixup_alpha
-        self.mixup_partners = self.cfg.mixup_partners
 
-        client_layers = getattr(self.clients[0].model, 'client_layers', 2)
-        in_channels = _STAGE_OUT_PLANES[client_layers - 1]
+        # n_s: how many partners each client's smashed data is mixed with.
+        # Sec. 3.1 concludes "n_s proportional to n", and Table 1 shows accuracy
+        # climbing monotonically with it (n = 10: n_s = 2 -> 0.4575,
+        # n_s = 6 -> 0.5042, n_s = 10 -> 0.5245). An earlier revision pinned this
+        # at 1 -- below the smallest value the paper tests -- which handed the
+        # method its weakest configuration. `null` means "follow the paper":
+        # n_s = n - 1, the maximum the paper's own bound (n_s <= n - 1) allows.
+        cfg_ns = self.cfg.get('mixup_partners', None)
+        self.mixup_partners = int(cfg_ns) if cfg_ns is not None \
+            else max(1, len(self.clients) - 1)
+
+        # Channel width of the cut activation. Derived by probing the model
+        # rather than read off a ResNet stage table, so a backbone without
+        # `client_layers` (e.g. simple_conv) no longer crashes the decoder with
+        # a channel mismatch.
+        in_channels = self.__cut_channels()
 
         decoder0 = _ReconstructionDecoder(in_channels).to(self.device)
         self.decoders = [decoder0] + [
@@ -106,6 +118,19 @@ class LocFedMixSL(FLAlgorithm):
         self.aggregated_decoder = decoder0
 
         self._round_buf = []
+
+    def __cut_channels(self):
+        '''Channels of the cut activation, measured with one eval-mode forward.'''
+        sample = next(iter(self.test_loader))[0][:1].to(self.device)
+        cm = self.clients[0].model
+        was = cm.training
+        cm.eval()
+        try:
+            with torch.no_grad():
+                z = cm(sample)
+        finally:
+            cm.train(was)
+        return int(z.shape[1])
 
     def full_model(self, x):
         return self.server.model(self.aggregated_client(x))
@@ -139,12 +164,34 @@ class LocFedMixSL(FLAlgorithm):
             # accumulate into this client model's own parameters (Eq. 8).
             splitting_output = self.clients[i].model(x)
 
-            # (4) Infopro reconstruction regularizer: decoder updates from this
-            # loss alone; the client model's update below adds this loss's
-            # gradient on top of the real task gradient.
+            # (4) Infopro reconstruction regularizer (Eq. 8): the decoder
+            # updates from this loss alone, and the client model's update adds
+            # this loss's gradient on top of the real task gradient.
+            #
+            # `torch.autograd.grad` rather than `.backward(retain_graph=True)`:
+            # Eq. 8 only requires the two gradients to be SUMMED into w_c,i, and
+            # the decoder's own subgraph is dead the moment its gradient exists.
+            # Retaining it (as this file used to) kept it alive across the whole
+            # server phase, and on ResNet-18 at the middle cut its
+            # `F.interpolate` back to full input resolution is a single 128 MiB
+            # tensor -- 64x the smashed data -- which is why
+            # `client_mem_held_across_cut_mb` read 241 MB where the backbone
+            # alone accounts for ~94. Same arithmetic, ~60% less reported hold.
             recon = self.decoders[i](splitting_output, x.shape[-2:])
             recon_loss = F.mse_loss(recon, x)
-            recon_loss.backward(retain_graph=True)
+            dec_params = [p for p in self.decoders[i].parameters()
+                          if p.requires_grad]
+            # retain_graph=False frees the DECODER subgraph here and now. It
+            # does not touch the backbone: this traversal stops at
+            # `splitting_output`, so everything below it -- which the server's
+            # returned gradient still needs -- is untouched.
+            grads = torch.autograd.grad(
+                recon_loss, dec_params + [splitting_output],
+                retain_graph=False,
+            )
+            for p_, g_ in zip(dec_params, grads[:-1]):
+                p_.grad = g_ if p_.grad is None else p_.grad + g_
+            recon_grad_at_cut = grads[-1]
 
         # (2) real per-client loss/gradient (Eq. 1, 4) -- a real leaf sent to
         # the server, real backprop, real grad_at_cut returned to the client.
@@ -166,7 +213,9 @@ class LocFedMixSL(FLAlgorithm):
         self.hold('client', grad_at_cut, i=i)
 
         with self.phase('client', i):
-            splitting_output.backward(grad_at_cut)
+            # Eq. 8: the client model descends the SUM of the task gradient
+            # returned by the server and the local regularizer's gradient.
+            splitting_output.backward(grad_at_cut + recon_grad_at_cut)
             self.clients[i].optimizer.step()
             self.decoder_optimizers[i].step()
 

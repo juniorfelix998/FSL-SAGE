@@ -177,6 +177,17 @@ class MemoryMeter:
         self._cur = {}          # (owner, kind) -> live bytes
         self.peak = {}          # owner -> high-water bytes (saved + held)
         self.peak_saved = {}    # owner -> high-water autograd-retained bytes
+        # SYSTEM (simultaneity) peak: the high-water mark of live bytes summed
+        # ACROSS every owner at one instant. `peak`/`peak_saved` are maxed per
+        # owner independently, so their sum is an upper bound that may never have
+        # occurred -- it cannot express that conventional SL keeps the client's
+        # activations alive WHILE the server runs, whereas a decoupled method
+        # frees them first. That simultaneity is precisely what DSL-Aux's paper
+        # (arXiv:2601.19261, Fig. 6) measures as whole-process peak GPU memory.
+        # Safe to sum because `_entries` is keyed by storage data_ptr GLOBALLY,
+        # so a storage is counted once no matter which side touched it.
+        self._live_total = 0
+        self.peak_system = 0
         self._stack = []        # phase-owner stack
         self._param_ptrs = set()
 
@@ -216,6 +227,7 @@ class MemoryMeter:
             return
         nbytes, owner, kind = entry[0], entry[1], entry[2]
         self._cur[(owner, kind)] = self._cur.get((owner, kind), 0) - nbytes
+        self._live_total -= nbytes
 
     def _release_saved(self, key):
         """Called from a sentinel's finalizer when a saved-tensor slot is
@@ -250,6 +262,10 @@ class MemoryMeter:
             1,
         ]
         self._cur[(owner, kind)] = self._cur.get((owner, kind), 0) + nbytes
+
+        self._live_total += nbytes
+        if self._live_total > self.peak_system:
+            self.peak_system = self._live_total
 
         saved = self._cur.get((owner, self.SAVED), 0)
         total = saved + self._cur.get((owner, self.HELD), 0)
@@ -320,6 +336,9 @@ class MemoryMeter:
         """
         self._entries.clear()
         self._cur.clear()
+        # must be reset WITH `_cur`: a late-firing _SavedSlot finalizer whose
+        # entry has already been cleared would otherwise drive this negative.
+        self._live_total = 0
 
     def end_step(self, warn=True):
         """Report autograd bytes still live after a step. Non-zero means a graph

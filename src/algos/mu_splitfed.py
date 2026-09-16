@@ -59,13 +59,17 @@
 #     running stats to fall back on; this version matches the reference
 #     exactly instead.)
 #
-# Known, documented simplification vs. the reference (see plan discussion):
-# one real batch per client per round -- `client_step` does real work only at
-# the first (epoch, iter) of the round; every other call that round is a
-# no-op, analogous to the reference's own per-round `next(iter(loader))`. Uses
-# a single zeroth-order perturbation direction per gradient estimate (no
+# SCHEDULE, vs. the reference. The reference draws ONE batch per client per
+# round (`next(iter(loader))`) and caps the run at 120k processed samples, i.e.
+# ~375 zeroth-order steps per model. This harness defines a round as one local
+# epoch for every method, so MU-SplitFed takes a step on every batch. That is
+# the benchmark's fairness rule, but it means we run a MORE aggressive schedule
+# of an update rule that is already divergent under its own published
+# hyperparameters -- worth stating wherever this row is reported.
+#
+# Uses a single zeroth-order perturbation direction per gradient estimate (no
 # averaging), exactly matching the reference -- an earlier version of this
-# file added multi-direction averaging as an from-scratch stabilization
+# file added multi-direction averaging as a from-scratch stabilization
 # attempt; that's a real deviation from the reference and has been reverted
 # for a faithful, fair comparison.
 # ------------------------------------------------------------------------------
@@ -93,7 +97,17 @@ def _perturb(model, seed, scale_factor):
     torch.set_rng_state(rng_state)
 
 # ------------------------------------------------------------------------------
-def _perturb_accumulate_grad(model, seed, scalar_weight):
+def _zo_update(model, seed, step):
+    """theta <- theta - step * u, with u REGENERATED from its seed.
+
+    Mathematically identical to what this file used to do -- accumulate
+    `scalar * u` into `param.grad` and call `SGD(lr).step()` -- because the
+    reference uses plain SGD with no momentum or weight decay, so its update is
+    exactly `param -= lr * grad`. The difference is purely in what gets
+    allocated: no `.grad` buffer is created for any parameter. That matters here
+    because client memory is the metric a backprop-free method is measured on,
+    and a full-size gradient tensor is precisely the thing it claims not to
+    need."""
     rng_state = torch.get_rng_state()
     torch.manual_seed(seed)
     with torch.no_grad():
@@ -101,9 +115,7 @@ def _perturb_accumulate_grad(model, seed, scalar_weight):
             if not param.requires_grad:
                 continue
             u = torch.randn_like(param)
-            if param.grad is None:
-                param.grad = torch.zeros_like(param)
-            param.grad.add_(u, alpha=scalar_weight)
+            param.add_(u, alpha=-step)
     torch.set_rng_state(rng_state)
 
 # ------------------------------------------------------------------------------
@@ -137,12 +149,19 @@ class MU_SplitFed(FLAlgorithm):
 
         self.servers = [copy.deepcopy(self.server) for _ in self.clients]
 
+        # Both sides are zeroth-order: the update is applied in place by
+        # _zo_update, so no `.grad` is ever allocated. The SGD objects are still
+        # constructed because the shared loop reads their `param_groups` to log
+        # the learning rate -- they carry no state of their own (plain SGD, no
+        # momentum or weight decay), so they cost nothing in the memory report.
+        self.lr_c = float(self.cfg.lr_c)
+        self.lr_s = float(self.cfg.lr_s)
         for c in self.clients:
-            c.optimizer = torch.optim.SGD(c.model.parameters(), lr=self.cfg.lr_c)
+            c.optimizer = torch.optim.SGD(c.model.parameters(), lr=self.lr_c)
             c.lr_scheduler = None
-        for s in self.servers:
-            s.optimizer = torch.optim.SGD(s.model.parameters(), lr=self.cfg.lr_s)
-            s.lr_scheduler = None
+        for srv in self.servers:
+            srv.optimizer = torch.optim.SGD(srv.model.parameters(), lr=self.lr_s)
+            srv.lr_scheduler = None
 
         self.aggregated_client = copy.deepcopy(self.clients[0].model)
         self.aggregated_server = copy.deepcopy(self.server.model)
@@ -196,6 +215,12 @@ class MU_SplitFed(FLAlgorithm):
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
 
+        # The reference skips single-sample batches (its L138-139). BatchNorm in
+        # train mode raises on a batch of 1, which a skewed non-IID shard can
+        # produce as its final batch.
+        if x.size(0) == 1:
+            return {}
+
         # MATCHED ROUNDS: this method's reference implementation draws a single
         # `next(loader)` per round, so this file used to no-op on every batch
         # except (j,k)==(0,0). That made one round mean 1 optimizer step here
@@ -205,9 +230,6 @@ class MU_SplitFed(FLAlgorithm):
         # method, so the zeroth-order update below runs on every batch, exactly
         # like every first-order method's step does. The ZO update rule itself
         # is untouched -- only how many batches it is applied to.
-
-        self.clients[i].optimizer.zero_grad()
-        self.servers[i].optimizer.zero_grad()
 
         # client forward under no_grad -- a zeroth-order client retains no
         # autograd activations, so its activation peak is ~0 by construction
@@ -221,7 +243,6 @@ class MU_SplitFed(FLAlgorithm):
         # further client communication needed for these.
         with self.phase('server', i):
             for _ in range(self.tau):
-                self.servers[i].optimizer.zero_grad()
                 s_seed = int(np.random.randint(0, 1_000_000))
 
                 _perturb(self.servers[i].model, s_seed, self.mu)
@@ -237,8 +258,7 @@ class MU_SplitFed(FLAlgorithm):
                 _perturb(self.servers[i].model, s_seed, self.mu)  # restore
 
                 scalar_s = (loss_p.item() - loss_n.item()) / (2 * self.mu)
-                _perturb_accumulate_grad(self.servers[i].model, s_seed, scalar_s)
-                self.servers[i].optimizer.step()
+                _zo_update(self.servers[i].model, s_seed, self.lr_s * scalar_s)
 
         # client-side zeroth-order step: two more client forwards, each a
         # fresh activation upload. The perturbed forwards are the CLIENT's
@@ -274,8 +294,7 @@ class MU_SplitFed(FLAlgorithm):
         self.charge_cut_scalar(1, direction='down')
 
         with self.phase('client', i):
-            _perturb_accumulate_grad(self.clients[i].model, c_seed, scalar_c)
-            self.clients[i].optimizer.step()
+            _zo_update(self.clients[i].model, c_seed, self.lr_c * scalar_c)
 
         with torch.no_grad():
             _, predicted = torch.max(out_c_p.data, 1)

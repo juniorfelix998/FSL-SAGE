@@ -118,15 +118,29 @@ class FLAlgorithm(ABC):
 
     def charge_cut_activation(self, t):
         self.ledger.charge_cut('act_up', tensor_bytes(t))
+        # An uploaded activation is resident on the SERVER once it arrives, and
+        # for a synchronous method it is resident there while the client still
+        # holds its own graph -- which is exactly the simultaneity
+        # `peak_system_live_mb` exists to capture. Charged here rather than at
+        # each call site so no method can forget it. When the upload shares
+        # storage with the client's own tensor (a bare `.detach()`), the ledger
+        # keys on storage ptr and counts it once, to whichever side saw it
+        # first -- never twice.
+        self.hold('server', t)
 
     def charge_cut_gradient(self, t):
         self.ledger.charge_cut('grad_down', tensor_bytes(t))
 
     def charge_cut_labels(self, y):
         '''Labels must cross the cut whenever the LOSS is computed server-side.
-        Deliberately not charged for client-local-loss branches (cse_fsl's
-        auxiliary head, han_locloss) -- that asymmetry is part of what those
-        methods buy.'''
+
+        Deliberately NOT charged for a purely client-local loss -- cse_fsl's
+        auxiliary head needs no labels at the server -- and that asymmetry is
+        part of what such a method buys. Note `han_locloss` and `fedsplitx` DO
+        charge labels despite being local-loss methods: their servers compute
+        their own cross-entropy, so the labels really do cross. (An earlier
+        version of this docstring listed han_locloss as not charging them,
+        which contradicted the code.)'''
         self.ledger.charge_cut('labels_up', tensor_bytes(y))
 
     def charge_cut_scalar(self, n=1, direction='down'):
@@ -266,6 +280,28 @@ class FLAlgorithm(ABC):
             'server_optim_mem_mb'          : so / MB,
             'server_act_peak_mem_mb'       : sact / MB,
             'peak_client_mem_mb_per_client': [d['total'] / MB for d in per_client],
+            # -- system (simultaneity) peak -------------------------------
+            # The two metrics above are per-DEVICE: each side's high-water mark
+            # is taken independently, so neither can express that conventional
+            # SL holds the client's activations alive WHILE the server runs,
+            # while a decoupled method frees them first. These two do.
+            # `peak_system_live_mb` is the measured live-byte high-water summed
+            # across both sides at one instant -- the direct analogue of the
+            # whole-process figure DSL-Aux's paper reports (arXiv:2601.19261
+            # Fig. 6), and the number to compare against its 58% claim.
+            # It counts autograd-SAVED plus explicitly-HELD bytes (input batch,
+            # uploaded activation, downloaded gradient), matching what a
+            # whole-process allocator figure would see -- hence "live", not
+            # "act". `peak_system_mem_mb` adds the static term, i.e. what one host
+            # running this simulation must actually provide. Static uses the
+            # WORST client plus the server, not a sum over all simulated
+            # clients, matching the max-not-sum rule above.
+            'peak_system_live_mb'           : self.meter.peak_system / MB,
+            'peak_system_mem_mb'           : (
+                self.meter.peak_system
+                + worst['params'] + worst['grads'] + worst['optim']
+                + sp + sg + so
+            ) / MB,
         }
 
     @abstractmethod
@@ -670,7 +706,8 @@ def _run_fl_algorithm(
         f" > Peak client mem: {memory_metrics['peak_client_mem_mb']:.2f} MiB "
         f"(act {memory_metrics['client_act_peak_mem_mb']:.2f}, "
         f"held across cut {memory_metrics['client_mem_held_across_cut_mb']:.2f}), "
-        f"peak server mem: {memory_metrics['peak_server_mem_mb']:.2f} MiB."
+        f"peak server mem: {memory_metrics['peak_server_mem_mb']:.2f} MiB, "
+        f"system live peak: {memory_metrics['peak_system_live_mb']:.2f} MiB."
     )
 
     return FLResults(
