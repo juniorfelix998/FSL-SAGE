@@ -10,8 +10,25 @@
 # with no weight averaging step needed since there's only one copy to begin
 # with. Mirrors ho_sfl.py's `shared_model` pattern for the client side.
 #
-# comm_load_weights stays 0 for the whole run (no aggregation event ever
-# happens), matching this harness's convention for non-federated methods.
+# THE RELAY IS CHARGED, and earlier it was not. `comm_load_weights` used to be
+# 0 for the whole run, justified as "no aggregation event ever happens". That
+# conflates two different things: aggregation indeed never happens here, but
+# model MOVEMENT does. Client i finishes its turn and client i+1 continues from
+# i's just-updated weights -- in a real deployment that handover is a network
+# transfer of the client-side model, once per turn. This simulation only got it
+# for free because `shared_model` below aliases one Python object across every
+# client, so no copy is ever made and nothing was ever charged.
+#
+# Charged as `weights.client_relay`: ONE transmission per handover (client i
+# sends directly to client i+1 -- the peer-to-peer relay of Gupta & Raskar
+# 2018), and `num_clients` handovers per round, counting the wrap back to client
+# 0 that begins the next round, which is a real transfer in a continuing run.
+#
+# Note this is NOT the same situation as `dsl_aux` / `hosl`, which also report
+# zero weight traffic. Those give every client an independently constructed
+# model and genuinely never share or move one, so zero is physically correct
+# there. The distinguishing question is not "does it aggregate?" but "does a
+# model cross the wire?".
 # ------------------------------------------------------------------------------
 import torch
 
@@ -84,8 +101,14 @@ class VanillaSL(FLAlgorithm):
         }
 
     def aggregate(self):
-        # non-federated: nothing to average -- there is only one shared
-        # client model and one shared server model already.
+        # Nothing is AVERAGED -- there is one shared client model and one shared
+        # server model. But the sequential relay moves that client model from
+        # each client to the next, and once more to hand back to client 0 for
+        # the next round, so `num_clients` one-way handovers are due per round.
+        # See the header note on why this is charged where dsl_aux/hosl are not.
+        self.charge_weights_relay(
+            self.aggregated_client, n_handovers=len(self.clients)
+        )
         return {}
 
 # ------------------------------------------------------------------------------

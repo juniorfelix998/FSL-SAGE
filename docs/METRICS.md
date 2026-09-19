@@ -19,7 +19,7 @@ against the source rather than taken on trust.
 **One round = one local epoch over each client's shard, for every method.**
 
 The shared training loop is the only loop; no method has its own
-(`src/algos/__init__.py:577`):
+(`src/algos/__init__.py:590`):
 
 ```
 for t in range(cfg.rounds)                     # round
@@ -53,13 +53,79 @@ table refuses to emit if its cells disagree on round count.
 
 ## 1. Communication
 
+### Is this a running log, or a conceptual calculation?
+
+Both, and the distinction matters enough to state before anything else:
+
+- **The event is real.** Every charge fires *during the run*, inside
+  `client_step()` or `aggregate()`, at the actual point in the algorithm where
+  the transfer would happen, with the actual tensor. Nothing is extrapolated
+  from a formula afterwards. A run that stops early logs only what it actually
+  did, and a ragged final batch is priced at its real size, not a nominal one.
+- **The price is analytic.** `tensor_bytes(t) = t.numel() * t.element_size()`.
+  There are no sockets in the simulation, so there is no wire to measure: no
+  serialization, no protocol headers, no compression, no retransmission.
+
+So: **a running log of analytically priced events.** The useful consequence is
+that it is checkable two independent ways -- the ledger produces a number at
+runtime, *and* every cell reproduces from a closed form by hand. When those two
+disagree, something is wrong. Worked example, from a 5-client / 3-round sweep:
+
+```
+client-side ResNet-18 @ middle cut (params + buffers) = 2,740,048 B = 2.6131 MiB
+server-side                                           = 42,025,080 B = 40.0782 MiB
+
+SplitFedv2  = 3 rounds x 5 clients x 2 (up+down) x 2.6131            =   78.39 MiB
+SplitFedv1  = 3 x 5 x 2 x (2.6131 + 40.0782)                         = 1280.74 MiB
+CSE-FSL     = (3 x 5 x 2 x 2.6131) + (3 x 10 x 8.0294)               =  319.27 MiB
+FSL-SAGE    = (3 x 5 x 2 x 2.6131) + (5 x 8.0294, one-way)           =  118.54 MiB
+Vanilla-SL  = 3 x 5 x 2.6131 (relay, ONE way per handover)           =   39.20 MiB
+```
+
+Each of those matches its reported cell exactly. If a number looks wrong, this is
+the first thing to check -- and if the arithmetic reproduces it, the disagreement
+is not about the sums but about **which events count as transfers**, which is the
+next subsection.
+
+### What counts as a transfer
+
+This is where the accounting has actually been wrong before, so it is worth
+being explicit. The test is **"does a model cross the wire?"** -- not "does the
+method aggregate?". Three methods report near-zero weight traffic for two
+completely different reasons:
+
+| Method | Weights | Why |
+|---|---|---|
+| DSL-Aux, HOSL | **0** | Every client owns an independently constructed model that is never shared, averaged, or handed on. Nothing crosses the wire. Physically zero. |
+| Vanilla-SL | **the relay** | Never aggregates either -- but it *relays* one client-side model from each client to the next. Movement without aggregation still costs bytes. |
+| HO-SFL | **0.04** | Also shares one model, but prices its synchronization as the paper's dimension-free scalar + seed exchange rather than as a model transfer. |
+
+**Vanilla-SL's relay used to be charged zero, and that was a bug.**
+`src/algos/vanilla_sl.py` aliases a single `nn.Module` across every client and
+the driver trains them sequentially, so client *i*'s updated weights are consumed
+by client *i+1*. The file's own comment describes this ("sequential training
+naturally carries each client's just-updated weights forward to the next") -- in
+a deployment each handover is a network transfer of the client-side model. The
+simulation got it free because no copy is ever made. The old justification, "no
+aggregation event ever happens", conflated aggregation with movement.
+
+It is now charged as `weights.client_relay`: **one** transmission per handover
+(peer-to-peer, client *i* straight to client *i+1* -- not a round-trip, nothing
+comes back), and `num_clients` handovers per round, counting the wrap back to
+client 0 that begins the next round. At 5 clients that is `5 x 2.6131 = 13.07`
+MiB/round.
+
+This was the same class of bug as the one already fixed one layer up: the inline
+`BUGFIX` note at `src/algos/baselines.py:188-193` records SplitFedv1's
+server-side exchange having been charged zero for exactly the same reason.
+
 ### What we claim to measure
 Bytes that would cross a network link during training, split into **cut traffic**
 (activations/gradients/scalars across the client↔server split) and **weight
 traffic** (model/aggregation transfers). The ranked number is their sum.
 
 ### The code that does it
-One ledger prices every transfer — `CommLedger`, `src/utils/comm.py:47`, one
+One ledger prices every transfer — `CommLedger`, `src/utils/comm.py:51`, one
 instance per run (`src/algos/__init__.py:100`). Methods never compute bytes
 themselves; they call typed helpers on the base class
 (`src/algos/__init__.py:119` onward), so two methods cannot silently disagree
@@ -74,7 +140,7 @@ def tensor_bytes(t):
 `numel()` so a ragged final batch is priced correctly rather than assumed full;
 `element_size()` so `use_64bit: true` is reflected automatically.
 
-**Categories** (`src/utils/comm.py:21` and `:30`):
+**Categories** (`src/utils/comm.py:24` and `:30`):
 
 | Cut | meaning |
 |---|---|
@@ -84,8 +150,9 @@ def tensor_bytes(t):
 | `scalar_down` | scalar loss differences, server → client (zeroth-order) |
 | `labels_up` | labels, client → server (only when the loss is computed server-side) |
 
-Weight categories are `client_up/down`, `aux_up/down`, `server_up/down`, plus
-`scalars` for HO-SFL's dimension-free aggregation (scalars + seeds, never a
+Weight categories are `client_up/down`, `aux_up/down`, `server_up/down`,
+`client_relay` (the sequential-SL handover -- one way, no aggregator involved),
+plus `scalars` for HO-SFL's dimension-free aggregation (scalars + seeds, never a
 weight vector).
 
 ### Granularity
@@ -116,9 +183,14 @@ include **buffers** — BatchNorm running stats are real bytes on the wire
    per-client server replicas live on one host, so averaging them is a memory
    copy rather than network traffic. This harness charges it because the
    alternative — charging some methods and not others for the identical
-   operation — biases the ranked column. **The consequence is real and should be
-   read with the table**: it inflates Comm-weights for those four methods
-   relative to their papers' own accounting.
+   operation — biases the ranked column.
+
+   **This dominates those methods' weight traffic**: measured at 5 clients,
+   SplitFedv1's 426.82 MiB/round is 400.68 MiB of server-side FedAvg — **94%**.
+   So the table now carries an `of which server-side` sub-column, derived from
+   `weights.server_up + weights.server_down`, letting a reader subtract the
+   convention and compare against a paper's own accounting either way. The
+   ranked Comm-total is unchanged; the convention is simply no longer invisible.
 
 ### Expected accounting signature per method
 A row that violates its signature is a bug, not a finding.
@@ -126,13 +198,13 @@ A row that violates its signature is a bug, not a finding.
 | Method | `cut.grad_down` | `weights` | note |
 |---|---|---|---|
 | SplitFedv1 / SplitFedv2 | > 0 | > 0 | full BP across the cut, FedAvg |
-| Vanilla-SL | > 0 | **0** | non-federated; one shared model pair |
+| Vanilla-SL | > 0 | `client_relay` only | never aggregates, but relays one model client-to-client |
 | CSE-FSL | **0** | > 0 | local aux head; uploads only every `q`-th batch |
 | FSL-SAGE | **0** | > 0 | surrogate synthesises the cut gradient; aux charged download-only |
-| DSL-Aux | **0** | **0** | decoupled *and* non-federated (see §6) |
+| DSL-Aux | **0** | **0** | decoupled *and* genuinely shares nothing (see §6) |
 | Han-et-al (LGL-SL) | **0** | > 0 | local losses both sides |
 | FedSplitX | **0** | > 0 | collaborative local loss both sides, M=3 auxiliary heads |
-| HOSL | **0** | **0** | zeroth-order, non-federated; **2Q+1 `act_up` and 2Q `scalar_down` per batch** |
+| HOSL | **0** | **0** | zeroth-order, shares nothing; **2Q+1 `act_up` and 2Q `scalar_down` per batch** |
 | HO-SFL | > 0 | > 0, `scalars` only | client needs the cut gradient for its ZO probe |
 | MU-SplitFed | **0** | > 0 | 3× `act_up` (fixed + two probes), 1 `scalar_down` |
 | LocFedMix-SL | > 0 | > 0 | server-side Mixup; the *regularizer* is local, the cut gradient is real |
@@ -146,15 +218,91 @@ downlink, `ho_sfl_runner.py:157`).
 
 ## 2. Memory
 
-Three columns, three different questions. They are **not** interchangeable, and
-most confusion about this benchmark's memory results comes from reading one as
-if it were another.
+Three reported columns, three different questions. They are **not**
+interchangeable, and most confusion about this benchmark's memory results comes
+from reading one as if it were another. §2.0 first answers the prior question —
+how any of them can be separated at all when both sides share one GPU.
 
 | Metric | Question it answers |
 |---|---|
 | `peak_client_mem_mb` | What must **one client device** provide? |
 | `client_mem_held_across_cut_mb` | How much is the client forced to keep alive **while waiting** on the server? |
 | `peak_system_live_mb` | What must **one host** provide for both sides **at once**? |
+
+### 2.0 If client and server share ONE GPU, how are they tracked separately?
+
+The sweeps run on a single Colab T4 with both sides resident in the same VRAM,
+so this is the first question the memory columns have to answer.
+
+**The short answer: we never ask the device.** The CUDA allocator has no notion
+of "which model requested this block", so `torch.cuda.max_memory_allocated()`
+cannot be split by side no matter how it is bracketed. Instead every byte is
+attributed **at the moment of allocation, by which side caused it**. Two
+mechanisms, covering the two kinds of memory:
+
+**(a) Static bytes are computed exactly, never measured.** Each algorithm
+*declares* which modules live on which side — `client_side_modules(i)` /
+`server_side_modules()` (`src/algos/__init__.py:235-245`), overridden by methods
+that put an auxiliary head on the client or keep per-client server replicas.
+`module_static_bytes()` then sums `nelement() * element_size()` over exactly
+those modules (`src/utils/memory.py:45`), and `optimizer_state_bytes()` does the
+same for optimizer state, deduplicated by storage pointer. No device query is
+involved, so this half is exact and identical on CPU and T4.
+
+**(b) Working bytes are attributed by the phase bracket that was open when
+autograd saved them.** `MemoryMeter.phase()` installs
+`torch.autograd.graph.saved_tensors_hooks` and pushes an owner
+(`src/utils/memory.py`); every tensor autograd retains while that bracket is open
+is charged to that owner:
+
+```python
+with self.phase('client', i):     # owner = ('client', i)
+    z = self.clients[i].model(x)  # every saved tensor -> the client
+with self.phase('server', i):     # owner = ('server',)
+    out = self.server.model(z)    # every saved tensor -> the server
+```
+
+So the split is by **causal ownership in program order**, not by physical
+location. Both tensors sit in the same T4 VRAM; we know which side put them
+there. Keyed on `untyped_storage().data_ptr()` so views and in-place-shared
+storages count once, and released exactly via a finalizer when the graph is
+freed — which is what makes the result an instantaneous high-water mark rather
+than a running total.
+
+**Why this is the right answer here, not merely a different one.** On a
+simulation the allocator's number describes the *simulation*: all N clients'
+models resident at once, the dataset, cuDNN workspace, fragmentation, allocator
+caching. A real deployment has one client model on the client device.
+`max_memory_allocated` therefore answers a question nobody asked, and cannot
+answer the one we did.
+
+**The four memory numbers a T4 run produces:**
+
+| Number | Answers | Device-dependent? |
+|---|---|---|
+| `peak_client_mem_mb` | what **one client device** would need if deployed for real | no — analytic + ownership |
+| `peak_server_mem_mb` | what the **server host** would need | no |
+| `peak_system_live_mb` / `peak_system_mem_mb` | what **one host running both sides** must hold at one instant (the paper-comparable number) | no |
+| `peak_cuda_memory_mb` | what the **T4's allocator actually peaked at** during the simulation | yes |
+
+These must satisfy
+
+```
+peak_cuda_memory_mb  >=  peak_system_mem_mb  >=  max(peak_client, peak_server)
+```
+
+and `src/main.py` asserts exactly that on every CUDA run, logging `OK` or
+`VIOLATED`. A violation would mean the meter is counting bytes the allocator
+never handed out — double counting or mis-attribution — so it is a real check.
+The *gap* between the first two is logged too: it is the simulation's own
+overhead (N−1 extra client models, dataset, workspace, fragmentation), i.e.
+precisely the part a real deployment would not pay.
+
+**The honest limitation.** Because attribution is analytic, we measure the
+*logical* memory requirement. Allocator caching, fragmentation and cuDNN
+workspace are excluded by construction. That is the trade that makes the number
+portable across CPU and T4 and comparable between methods — but it means our
+figure is not what `nvidia-smi` shows.
 
 ### 2a. Per-device peak
 
@@ -177,7 +325,7 @@ attribute bytes to a device.
   views are not double-counted, released exactly via a finalizer.
 
 **Reduction is `max` at every level** — across batches, epochs, rounds, and
-finally across clients (`src/algos/__init__.py:244`). Never a mean: the metric is
+finally across clients (`src/algos/__init__.py:257`). Never a mean: the metric is
 what a *single* device must provide. Instrumentation runs only on the first
 `mem_probe_batches` (default 2) batches of each round's first local epoch
 (`:201`).
@@ -185,7 +333,7 @@ what a *single* device must provide. Instrumentation runs only on the first
 ### 2b. Held across the cut — the decoupling signature
 
 Client-owned autograd bytes still live *at the instant the server phase opens*
-(`src/algos/__init__.py:174`). Exactly `0` means the client never stalls holding
+(`src/algos/__init__.py:187`). Exactly `0` means the client never stalls holding
 its graph. This column is sensitive to **statement order**, so two methods were
 corrected so it measures the algorithm rather than the port's code layout:
 
@@ -210,9 +358,9 @@ that conventional SL keeps the client's activations alive **at the same instant*
 as the server's, while a decoupled method frees them first. That simultaneity is
 the whole of DSL-Aux's memory claim.
 
-`peak_system_live_mb` (`src/algos/__init__.py:299`) is the high-water mark of
+`peak_system_live_mb` (`src/algos/__init__.py:312`) is the high-water mark of
 live bytes summed across **all owners at one instant**. It is maintained at the
-meter's single choke point — `_account` (`src/utils/memory.py:242`) is the only
+meter's single choke point — `_account` (`src/utils/memory.py:247`) is the only
 place live bytes are added and `_drop` (`:224`) the only place they are removed —
 and it is sound to sum because `_entries` is keyed by storage `data_ptr`
 **globally**, so a storage is counted once no matter which side touched it.
@@ -277,7 +425,7 @@ Wall clock for the whole application run: `src/main.py:33` stamps
 State this plainly when presenting: it is an **application-level** number, not
 pure training time. For a compute-only breakdown use
 `client_model_compute_time` / `server_model_compute_time`, accumulated inside the
-same `phase()` bracket that measures memory (`src/algos/__init__.py:174`).
+same `phase()` bracket that measures memory (`src/algos/__init__.py:187`).
 Because it is wall-clock on shared hardware it is the **noisiest** column — treat
 differences of a few percent as nothing.
 
@@ -286,7 +434,7 @@ differences of a few percent as nothing.
 ## 4. Accuracy
 
 Full pass over the test set under `no_grad`, through the method's own
-`full_model(x)`, once per round after aggregation (`src/algos/__init__.py:354`,
+`full_model(x)`, once per round after aggregation (`src/algos/__init__.py:367`,
 called at `:661`). `acc = correct / len(test_loader.dataset)`.
 
 Two methods define `full_model` non-trivially, deliberately:
@@ -389,17 +537,23 @@ ResNet-18 / MNIST / middle cut / IID / 2 clients / 1 round / seed 200, CPU --
 | metric | Vanilla-SL | DSL-Aux | paper's claim | verdict |
 |---|---|---|---|---|
 | Comm-cut | 0.916 GiB | **0.458 GiB** | ~50% less (Obs. 2) | **exactly 50.0%** |
-| Comm-weights | 0.000 | 0.000 | non-federated | both 0 |
+| Comm-weights | 0.005 GiB (relay) | **0.000** | — | DSL shares nothing at all |
+| Comm-total | 0.921 GiB | **0.458 GiB** | — | 49.7% |
 | Held-across-cut | 94.01 MiB | **0.00 MiB** | decoupled (SIII-B) | holds nothing |
 | **System live peak** | **113.05 MiB** | **97.02 MiB** | lower (Obs. 3) | **14.2% lower** |
 | Peak client mem | 109.44 MiB | 107.76 MiB | lower (Obs. 3) | marginally lower |
-| Client activations | 94.01 MiB | 94.02 MiB | -- | *identical* |
-| Latency | 251.54 s | 241.92 s | *higher* (Obs. 4) | within noise |
+| Client activations | 94.01 MiB | 94.02 MiB | — | *identical* |
+| Latency | 257.50 s | 247.32 s | *higher* (Obs. 4) | within noise |
 | Test acc | 97.70% | 97.11% | on par (Obs. 1) | comparable |
 
 Before the fix these two rows were identical on every column.
 
-Three things in this table are worth reading carefully:
+Note Vanilla-SL's Comm-weights is no longer zero: at 2 clients its relay is
+`2 x 2.6131 = 5.23 MiB` per round (§1). DSL-Aux stays at exactly 0 because each
+client owns an independent model that never moves — the two are zero-vs-nonzero
+for a real reason, not by convention.
+
+Four things in this table are worth reading carefully:
 
 - **Client activations are identical (94.01 vs 94.02 MiB), and that is correct.**
   The paper says so itself in SIII-C: "the memory cost for the client includes
@@ -465,30 +619,40 @@ State these when presenting; none are hidden in the code.
 1. **Bytes are analytic, not wire-measured** — no serialization, headers, or
    compression modelled (§1).
 2. **Server-side aggregation is charged a full round-trip** where the references
-   charge zero. Uniform across methods, but it inflates the four multi-server
-   methods.
-3. **Clients are simulated in one process on one device.** Per-side memory is
-   reconstructed analytically plus by autograd hooks precisely because a
-   whole-process measurement cannot express "what one device needs" (§2).
-4. **Memory is sampled on 2 batches per round**, not continuously.
-5. **Latency includes setup and evaluation**, and is the noisiest column (§3).
-6. **MU-SplitFed's near-chance accuracy is a REPRODUCTION, not a failure.** The
+   charge zero. Uniform across methods, but it dominates the four multi-server
+   methods — 94% of SplitFedv1's weight traffic — which is why the table now
+   breaks it out as a sub-column (§1).
+3. **The sequential-SL relay is a modelling choice.** Vanilla-SL's handover is
+   charged peer-to-peer, one transmission per handover, `num_clients` handovers
+   per round. Routing it through the server instead would double it. The
+   convention is stated so it can be disagreed with explicitly rather than
+   silently assumed.
+4. **Clients are simulated in one process on one device.** Per-side memory is
+   attributed by declared module ownership plus autograd phase brackets (§2.0),
+   precisely because a whole-process allocator figure cannot express "what one
+   device needs". The consequence is that we report the *logical* requirement:
+   allocator caching, fragmentation and cuDNN workspace are excluded by
+   construction, so our number is not what `nvidia-smi` shows. On CUDA runs the
+   harness asserts `cuda >= system >= max(side)` as a check on the attribution.
+5. **Memory is sampled on 2 batches per round**, not continuously.
+6. **Latency includes setup and evaluation**, and is the noisiest column (§3).
+7. **MU-SplitFed's near-chance accuracy is a REPRODUCTION, not a failure.** The
    HO-SFL paper's own Figure 3 reports MU-SplitFed flat at ~10–15% for its entire
    run, as a deliberately weak backprop-free baseline that HO-SFL improves on.
    Our port matches the reference line-for-line on every published
    hyperparameter; at its own ε = 5e-3 the perturbation is 12–27% of the weight
    norm and the update diverges from the first step. It is not tuned, by
    decision — tuning it would make it a different method.
-7. **Five reimplementations remain unvalidated against their papers' reported
+8. **Five reimplementations remain unvalidated against their papers' reported
    numbers.** Their *mechanisms* are now checked equation by equation (§7), but
    reproducing their published accuracy is a separate exercise.
-8. **`comm_threshold_mb` can truncate a run** before `cfg.rounds`
-   (`src/algos/__init__.py:697`). Matched rounds are only matched if this never
+9. **`comm_threshold_mb` can truncate a run** before `cfg.rounds`
+   (`src/algos/__init__.py:710`). Matched rounds are only matched if this never
    fires — raise it for long sweeps. The table warns on a mismatch.
-9. **`fsl_sage` with `warm_start: true`** builds a fresh `CommLedger` for the
+10. **`fsl_sage` with `warm_start: true`** builds a fresh `CommLedger` for the
    second phase while inheriting the warm-start phase's series, so the cumulative
    comm curve restarts from 0. Avoid warm-start for benchmark runs.
-10. **HOSL at the paper's Q = 10 is expensive** — 21 activation uploads and 21
+11. **HOSL at the paper's Q = 10 is expensive** — 21 activation uploads and 21
     client forward passes per batch, roughly 7× its previous cost. That is the
     honest trade its own Limitations section concedes, and it dominates sweep
     runtime.

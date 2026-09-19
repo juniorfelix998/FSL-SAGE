@@ -241,6 +241,38 @@ def main(cfg: DictConfig):
             torch.cuda.max_memory_allocated(global_torch_device) / (1024 ** 2)
         logging.info(f"Peak CUDA memory: {peak_cuda_memory_mb:.2f} MiB")
 
+        # ATTRIBUTION CROSS-CHECK. Client and server share one GPU here, so the
+        # obvious question is how their memory can be reported separately at
+        # all. The answer is that we never ask the device: static bytes are
+        # computed from each side's declared module list and working bytes are
+        # attributed to whichever phase() bracket autograd saved them under (see
+        # docs/METRICS.md S2). This block makes that claim falsifiable -- the
+        # allocator's own high-water mark must dominate our system peak, which
+        # must in turn dominate either side alone. A violation would mean we are
+        # counting bytes the allocator never handed out.
+        mm = results.memory_metrics
+        sides = max(mm['peak_client_mem_mb'], mm['peak_server_mem_mb'])
+        ordered = peak_cuda_memory_mb >= mm['peak_system_mem_mb'] >= sides
+        logging.info(
+            f"Memory attribution on {torch.cuda.get_device_name(global_torch_device)}: "
+            f"client {mm['peak_client_mem_mb']:.2f} | "
+            f"server {mm['peak_server_mem_mb']:.2f} | "
+            f"system {mm['peak_system_mem_mb']:.2f} | "
+            f"cuda-allocator {peak_cuda_memory_mb:.2f} MiB"
+        )
+        logging.info(
+            f" > ordering cuda >= system >= max(side): "
+            f"{'OK' if ordered else 'VIOLATED'}; simulation overhead "
+            f"(cuda - system) = {peak_cuda_memory_mb - mm['peak_system_mem_mb']:.2f} MiB "
+            f"-- N-1 extra client models, dataset, cuDNN workspace, fragmentation"
+        )
+        if not ordered:
+            logging.warning(
+                "Memory attribution ordering VIOLATED -- the meter is counting "
+                "bytes the CUDA allocator never allocated. Investigate before "
+                "trusting any memory column from this run."
+            )
+
     # save all results
     train_metrics = {f'client_{i}': tr_met for i, tr_met in
                      enumerate(results.train_metrics)}

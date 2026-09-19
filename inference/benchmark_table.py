@@ -102,6 +102,30 @@ def _summarise(runs, key, scale=1.0, per_round=False):
     return mean, math.sqrt(var), len(vals)
 
 
+def _summarise_breakdown(runs, keys, scale=1.0):
+    '''(mean, std, n) of a SUM of `comm_breakdown` sub-categories.
+
+    The per-category ledger is kept in `comm_breakdown` (a cumulative snapshot
+    per round), not at the top level, so `_summarise` cannot reach it. Used to
+    surface how much of a method's weight traffic is server-side aggregation --
+    a convention this harness charges and the reference implementations do not.
+    '''
+    vals = []
+    for run in runs:
+        bd = run.get('comm_breakdown')
+        if not bd:
+            continue
+        last = bd[-1]
+        vals.append(sum(float(last.get(k, 0.0)) for k in keys) * scale)
+    if not vals:
+        return None, None, 0
+    mean = sum(vals) / len(vals)
+    if len(vals) == 1:
+        return mean, 0.0, 1
+    var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
+    return mean, math.sqrt(var), len(vals)
+
+
 # ------------------------------------------------------------------------------
 def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
                   num_clients=None, seeds=None):
@@ -147,6 +171,17 @@ def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
         ('held_mem',       'client_mem_held_across_cut_mb',   1.0, False),
         ('process_rss',    'peak_memory_mb',                  1.0, False),
     )
+    # How much of `comm_weights` is server-side aggregation: averaging the
+    # per-client SERVER replicas of a multi-server method. Those replicas all
+    # live on one host, so every reference implementation charges this as ZERO.
+    # This harness charges it, because charging some methods and not others for
+    # the identical operation would bias the ranked column -- but a reader
+    # comparing against a paper's own accounting needs to be able to subtract
+    # it, and until now it was invisible. Dominant for SplitFedv1 / Han-et-al /
+    # FedSplitX / MU-SplitFed; exactly 0 for every single-server method.
+    cell['weights_server'] = _summarise_breakdown(
+        runs, ('weights.server_up', 'weights.server_down'), 1.0 / MB
+    )
     cell['cut_share_pct'] = (
         100.0 * cut_mean / tot_mean if cut_mean is not None and tot_mean else 0.0
     )
@@ -188,6 +223,7 @@ METRIC_COLUMNS = [
     # (column label, cell key, format precision)
     ('Comm-cut (MB)',      'comm_cut',       2),
     ('Comm-weights (MB)',  'comm_weights',   2),
+    ('  of which server-side', 'weights_server', 2),
     ('Comm-total (MB)',    'comm_total',     2),
     ('Acc (%)',            'acc',            2),
     ('Latency (s)',        'latency_s',      2),

@@ -161,6 +161,19 @@ class FLAlgorithm(ABC):
         self.charge_weights_model(model, kind, 'up')
         self.charge_weights_model(model, kind, 'down')
 
+    def charge_weights_relay(self, model, n_handovers=1):
+        '''Sequential-SL model handover: client i passes its client-side model
+        on to client i+1.
+
+        ONE transmission per handover -- unlike the FedAvg round-trip, nothing
+        comes back. Charged separately from client_up/client_down because it is
+        a different kind of event: no aggregator is involved, and folding it
+        into the FedAvg categories would misreport what the traffic is.
+        '''
+        self.ledger.charge_weights(
+            'client_relay', n_handovers * calculate_load(model)
+        )
+
     def charge_weights_scalars(self, nbytes):
         self.ledger.charge_weights('scalars', nbytes)
 

@@ -124,10 +124,15 @@ class MemoryMeter:
     tensors autograd retains for backward -- which is the quantity we want, and
     which is zero under `torch.no_grad()`. Two alternatives were evaluated and
     rejected:
-      * `torch.cuda.max_memory_allocated` brackets -- CUDA-only (every run so far
-        has been CPU), and cross-phase *retention* shows up as an inflated
-        baseline in the next phase rather than as attributable bytes. Kept only
-        as a GPU cross-check.
+      * `torch.cuda.max_memory_allocated` brackets -- PROCESS-GLOBAL, so on a
+        single-GPU simulation (both sides on one T4) it cannot attribute a byte
+        to either side no matter how it is bracketed; and cross-phase
+        *retention* shows up as an inflated baseline in the next phase rather
+        than as attributable bytes. It also measures the SIMULATION (all N
+        clients' models resident at once, dataset, cuDNN workspace,
+        fragmentation) rather than what one deployed device would need. Kept as
+        a GPU cross-check -- main.py asserts
+        `cuda >= system >= max(client, server)` on CUDA runs.
       * forward hooks summing module outputs -- measures outputs, not what
         autograd saved. Wrong for `inplace=True` ReLU (which ResNetClient uses)
         and for BatchNorm (which saves save_mean/save_invstd, not its output),

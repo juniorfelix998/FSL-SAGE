@@ -405,8 +405,18 @@ def test_comm_closed_form():
     # ---- Vanilla SL: non-federated, so zero weight traffic ------------
     cfg, res = build_run('vanilla_sl', M, N, B, R)
     bd = res.comm_breakdown
-    check_eq("Vanilla-SL charges no weight traffic at all (non-federated)",
-             res.comm_load_weights[-1], 0)
+    # Vanilla SL never AGGREGATES, but it does MOVE its one client model from
+    # client to client (the sequential relay), so its weight traffic is the
+    # handover, not zero. One transmission per handover, `num_clients` handovers
+    # per round -- see the header note in src/algos/vanilla_sl.py.
+    from utils.utils import calculate_load as _load
+    relay_per_round = M * _load(res.client_list[0].model)
+    check_eq("Vanilla-SL charges its relay handover (NOT zero)",
+             last(bd, 'weights.client_relay'), R * relay_per_round)
+    check_eq("Vanilla-SL's weight traffic is the relay and nothing else",
+             res.comm_load_weights[-1], R * relay_per_round)
+    check("Vanilla-SL weight traffic is non-zero",
+          res.comm_load_weights[-1] > 0)
     check_eq("Vanilla-SL cut.act_up", last(bd, 'cut.act_up'), R * per_round_act)
 
     # ---- DSL-Aux: decoupled -- activations up only, non-federated -----
@@ -564,7 +574,12 @@ ZERO_ORDER_CLIENTS = ('hosl', 'ho_sfl', 'mu_splitfed')
 # legitimately carries gradient and optimizer memory.
 NO_CLIENT_GRAD = ('hosl', 'mu_splitfed')
 # non-federated methods, so weight traffic must be zero
-NON_FEDERATED = ('vanilla_sl', 'dsl_aux', 'hosl')
+# Methods that move NO model at all -- every client owns an independent copy
+# that is never shared, averaged, or handed on. `vanilla_sl` is deliberately NOT
+# here: it also never aggregates, but it relays one shared model between clients,
+# which is a real transfer. "Does it aggregate?" is the wrong question; "does a
+# model cross the wire?" is the right one.
+NON_FEDERATED = ('dsl_aux', 'hosl')
 # MATCHED ROUNDS: no method may skip batches. ho_sfl and mu_splitfed used to do
 # real work only at (j,k)==(0,0), which made a "round" mean 1 optimizer step for
 # them and 24 for everyone else. The benchmark now defines a round as one local
@@ -880,6 +895,15 @@ def test_system_peak_memory():
              dsl_m['client_mem_held_across_cut_mb'], 0.0)
     check("vanilla_sl DOES hold across the cut",
           sl_m['client_mem_held_across_cut_mb'] > 0)
+
+    # On CUDA the allocator gives an independent ground truth: whatever we
+    # attribute must be bytes it actually handed out. No-op on CPU.
+    if torch.cuda.is_available():
+        for name, m in (('vanilla_sl', sl_m), ('dsl_aux', dsl_m)):
+            sides = max(m['peak_client_mem_mb'], m['peak_server_mem_mb'])
+            check(f"{name}: system peak dominates either side alone",
+                  m['peak_system_mem_mb'] >= sides - 1e-6,
+                  f"system={m['peak_system_mem_mb']} max(side)={sides}")
 
     saving = 100.0 * (1 - dsl_m['peak_system_live_mb'] / sl_m['peak_system_live_mb'])
     print(f"  (system live peak: vanilla_sl {sl_m['peak_system_live_mb']:.4f} MiB, "

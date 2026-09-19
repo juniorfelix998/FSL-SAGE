@@ -11,6 +11,9 @@
 #   * HO-SFL should show near-zero weights.* against a nonzero cut.grad_down
 #     (dimension-free aggregation: P scalars + P seeds, never a weight vector)
 #   * the zeroth-order methods' cost should sit almost entirely in cut.act_up
+#   * vanilla SL should show weights.client_relay only -- it never aggregates,
+#     but it does MOVE one model from client to client, which is not the same
+#     thing as having no weight traffic (see src/algos/vanilla_sl.py)
 #
 # `comm_load_cut`, `comm_load_weights` and `comm_load` remain exactly what they
 # were (bytes, cumulative over the run) -- they are now derived sums over the
@@ -29,6 +32,7 @@ CUT_CATEGORIES = (
 # Weight traffic: model/aggregation transfers, ~0 for non-federated methods.
 WEIGHT_CATEGORIES = (
     'client_up', 'client_down',
+    'client_relay',  # sequential-SL handover: client i -> client i+1, ONE way
     'aux_up', 'aux_down',
     'server_up', 'server_down',
     'scalars',       # HO-SFL's dimension-free aggregation (scalars + seeds)
