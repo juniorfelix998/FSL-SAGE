@@ -185,12 +185,64 @@ include **buffers** — BatchNorm running stats are real bytes on the wire
    alternative — charging some methods and not others for the identical
    operation — biases the ranked column.
 
-   **This dominates those methods' weight traffic**: measured at 5 clients,
-   SplitFedv1's 426.82 MiB/round is 400.68 MiB of server-side FedAvg — **94%**.
-   So the table now carries an `of which server-side` sub-column, derived from
-   `weights.server_up + weights.server_down`, letting a reader subtract the
-   convention and compare against a paper's own accounting either way. The
-   ranked Comm-total is unchanged; the convention is simply no longer invisible.
+   **This dominates those methods' weight traffic**, so the table carries an
+   `of which server-side` sub-column to make it separable. That column is
+   important enough to explain on its own — see immediately below.
+
+### Reading the `of which server-side` column
+
+**It is not an extra cost.** It is a *breakdown of* `Comm-weights`, naming how
+much of that number comes from one specific operation: **averaging the
+per-client copies of the SERVER-side model**.
+
+Four methods — SplitFedv1, MU-SplitFed, Han-et-al, FedSplitX — keep **one server
+replica per client**, so each round they FedAvg those replicas as well as the
+client-side models. The server-side model is 40.08 MB against the client-side
+2.61 MB — **15× larger** — so that single operation dominates everything else
+the method sends. Worked from a real run (`rounds × clients = 6`):
+
+```
+client-side aggregation = 6 x 2 x  2.6131 =  31.36 MB   <- every FedAvg method pays this
+server-side aggregation = 6 x 2 x 40.0782 = 480.94 MB   <- only the multi-server methods
+                                            ---------
+SplitFedv1 Comm-weights                    = 512.30 MB
+```
+
+**Why it is broken out.** Every reference implementation charges this as *zero*:
+the replicas share one host, so averaging them is a memory copy, not network
+traffic. This harness charges it anyway, because otherwise SplitFedv1 and
+FedSplitX would be billed for an operation that SplitFedv2 performs internally
+for free — two methods billed differently for the same work. But that is *our*
+convention, not the literature's, so the column exists to let anyone remove it.
+
+Subtract it and the picture changes completely:
+
+| Method | Comm-weights | of which server-side | **net** |
+|---|---|---|---|
+| SplitFedv1 | 512.30 | 480.94 | **31.36** |
+| SplitFedv2 | 31.36 | 0.00 | **31.36** |
+| MU-SplitFed | 512.30 | 480.94 | **31.36** |
+| Han-et-al | 513.23 | 480.94 | **32.29** |
+| FedSplitX | 512.50 | 481.06 | **31.44** |
+| CSE-FSL | 127.71 | 0.00 | 127.71 |
+| FSL-SAGE | 47.42 | 0.00 | 47.42 |
+| LocFedMix-SL | 32.22 | 0.00 | 32.22 |
+| Vanilla-SL | 15.68 | 0.00 | 15.68 |
+| HO-SFL | 0.04 | 0.00 | 0.04 |
+| DSL-Aux, HOSL | 0.00 | 0.00 | 0.00 |
+
+**The four apparently-expensive methods collapse to ≈31.4 MB — the same as
+SplitFedv2.** Their 16× disadvantage is entirely this accounting convention, not
+a property of the algorithms. And the ranking inverts: under the papers' own
+convention **CSE-FSL (127.71) becomes the most weight-expensive method**, because
+its auxiliary network really is FedAvg'd across the network every round.
+
+Neither column is "the right one" — they answer different questions. *Comm-weights*
+asks "what would this protocol cost if every participant were a separate
+machine", which is the deployment question and is why it stays in the ranked
+Comm-total. *Net of server-side* asks "what do the papers count", which is the
+right column for checking our numbers against a published one. Quote whichever
+you are arguing about, but say which.
 
 ### Expected accounting signature per method
 A row that violates its signature is a bug, not a finding.
