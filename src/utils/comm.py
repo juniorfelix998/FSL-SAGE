@@ -54,17 +54,24 @@ class CommLedger:
     def __init__(self):
         self.cut = {k: 0.0 for k in CUT_CATEGORIES}
         self.weights = {k: 0.0 for k in WEIGHT_CATEGORIES}
+        # how many TRANSFERS each category saw, so bytes can be read as
+        # count x size-per-transfer and checked against a paper's schedule
+        # (e.g. "smashed data every h batches", "aux model once per l rounds")
+        self.counts = {f'cut.{k}': 0 for k in CUT_CATEGORIES}
+        self.counts.update({f'weights.{k}': 0 for k in WEIGHT_CATEGORIES})
 
     # -- charging --------------------------------------------------------
     def charge_cut(self, category, nbytes):
         if category not in self.cut:
             raise KeyError(f"unknown cut category {category!r}")
         self.cut[category] += float(nbytes)
+        self.counts[f'cut.{category}'] += 1
 
     def charge_weights(self, category, nbytes):
         if category not in self.weights:
             raise KeyError(f"unknown weight category {category!r}")
         self.weights[category] += float(nbytes)
+        self.counts[f'weights.{category}'] += 1
 
     # -- totals ----------------------------------------------------------
     @property
@@ -85,4 +92,7 @@ class CommLedger:
         per-round record in results.json.'''
         out = {f'cut.{k}': v for k, v in self.cut.items()}
         out.update({f'weights.{k}': v for k, v in self.weights.items()})
+        # event counts under a separate `count.` prefix, so any consumer that
+        # sums the `cut.*` / `weights.*` byte keys is unaffected
+        out.update({f'count.{k}': v for k, v in self.counts.items()})
         return out

@@ -171,6 +171,10 @@ def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
         ('held_mem',       'client_mem_held_across_cut_mb',   1.0, False),
         ('process_rss',    'peak_memory_mb',                  1.0, False),
     )
+    # "Server-model FedAvg" (formerly "of which server-side"). How we get it:
+    #   weights.server_up + weights.server_down
+    #   = N clients x R rounds x 2 (up + down) x |x_s|
+    # e.g. SplitFedv1 on MNIST, 2 clients x 3 rounds: 6 x 2 x 40.08 = 480.94.
     # How much of `comm_weights` is server-side aggregation: averaging the
     # per-client SERVER replicas of a multi-server method. Those replicas all
     # live on one host, so every reference implementation charges this as ZERO.
@@ -223,7 +227,8 @@ METRIC_COLUMNS = [
     # (column label, cell key, format precision)
     ('Comm-cut (MB)',      'comm_cut',       2),
     ('Comm-weights (MB)',  'comm_weights',   2),
-    ('  of which server-side', 'weights_server', 2),
+    # sub-part of Comm-weights, NOT extra: N x R x 2 x |x_s| (see cell above)
+    ('  Server-model FedAvg (MB)', 'weights_server', 2),
     ('Comm-total (MB)',    'comm_total',     2),
     ('Acc (%)',            'acc',            2),
     ('Latency (s)',        'latency_s',      2),

@@ -26,6 +26,7 @@ from models import model_package, Client, Server
 import datasets as dss
 from utils import utils, logs
 from algos import run_fl_algorithm
+from utils.breakdown import render as render_breakdown
 from omegaconf import OmegaConf
 
 # -----------------------------------------------------------------------------
@@ -286,6 +287,8 @@ def main(cfg: DictConfig):
         # per-category cumulative bytes per round -- makes the headline ranking
         # inspectable (e.g. a BP-free method must show cut.grad_down == 0)
         'comm_breakdown'    : results.comm_breakdown,
+        # per-component comm/memory, labelled by paper step (utils/breakdown.py)
+        'breakdown'         : results.breakdown,
         'latency_s'         : total_latency_s,
         # whole-process RSS. Kept under its historical key for backward
         # compatibility, but it is a DIAGNOSTIC, not the per-device memory
@@ -308,6 +311,12 @@ def main(cfg: DictConfig):
         with open(file_name, 'w') as outf:
             json.dump(save_res, outf)
             logging.info(f"[NOTICE] Saved results to '{file_name}'.")
+
+        if results.breakdown is not None:
+            bd_file = os.path.join(cfg.save_path, 'breakdown.md')
+            with open(bd_file, 'w') as outf:
+                outf.write(render_breakdown(results.breakdown) + '\n')
+            logging.info(f"[NOTICE] Saved breakdown to '{bd_file}'.")
         
         metrics_file = os.path.join(cfg.save_path, 'metrics.pt')
         torch.save(

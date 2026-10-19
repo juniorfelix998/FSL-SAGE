@@ -327,6 +327,26 @@ def last(bd, key):
     return bd[-1][key]
 
 
+def check_paper_rows(name, res):
+    '''Every paper-labelled breakdown row's transfer count must match the
+    paper's schedule, and the rows must sum to the Cut / Weights totals.'''
+    bd = res.breakdown
+    for r in bd['comm_rows']:
+        check_eq(f"{name} breakdown {r['id']} count == paper schedule "
+                 f"({r['item']})", r['count'], r['expected_count'])
+    t = bd['comm_totals_mib']
+    check(f"{name} breakdown rows sum to Cut",
+          math.isclose(t['cut_rows_sum'], t['cut'], rel_tol=1e-9, abs_tol=1e-12))
+    check(f"{name} breakdown rows sum to Weights",
+          math.isclose(t['weights_rows_sum'], t['weights'], rel_tol=1e-9,
+                       abs_tol=1e-12))
+    m = bd['memory']
+    check(f"{name} client memory lines sum to client total",
+          math.isclose(m['client_lines_sum'], m['client_total'], rel_tol=1e-9))
+    check(f"{name} server memory lines sum to server total",
+          math.isclose(m['server_lines_sum'], m['server_total'], rel_tol=1e-9))
+
+
 def test_comm_closed_form():
     print("\n[2] Communication vs. closed form")
 
@@ -387,6 +407,7 @@ def test_comm_closed_form():
     check_eq("CSE-FSL cut + weights == total",
              res.comm_load_cut[-1] + res.comm_load_weights[-1],
              res.comm_load[-1])
+    check_paper_rows("CSE-FSL", res)
     cse = res
 
     # ---- FSL-SAGE: activation only, one-way auxiliary download ---------
@@ -401,6 +422,7 @@ def test_comm_closed_form():
     check_eq("FSL-SAGE auxiliary is charged DOWNLOAD only (aligned server-side)",
              (last(bd, 'weights.aux_down'), last(bd, 'weights.aux_up')),
              (R * M * aux_model_bytes(), 0))
+    check_paper_rows("FSL-SAGE", res)
 
     # ---- Vanilla SL: non-federated, so zero weight traffic ------------
     cfg, res = build_run('vanilla_sl', M, N, B, R)

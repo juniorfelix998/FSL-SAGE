@@ -185,11 +185,22 @@ include **buffers** — BatchNorm running stats are real bytes on the wire
    alternative — charging some methods and not others for the identical
    operation — biases the ranked column.
 
-   **This dominates those methods' weight traffic**, so the table carries an
-   `of which server-side` sub-column to make it separable. That column is
+   **This dominates those methods' weight traffic**, so the table carries a
+   `Server-model FedAvg` sub-column (formerly "of which server-side") to make
+   it separable. That column is
    important enough to explain on its own — see immediately below.
 
-### Reading the `of which server-side` column
+### Reading the `Server-model FedAvg` column (formerly "of which server-side")
+
+**How we get it:**
+
+```
+Server-model FedAvg = weights.server_up + weights.server_down      (ledger keys)
+                    = N clients x R rounds x 2 (up + down) x |x_s|
+```
+
+charged by `charge_weights_roundtrip(server_model, 'server')` once per client
+per round, only in methods that keep one server-model copy per client.
 
 **It is not an extra cost.** It is a *breakdown of* `Comm-weights`, naming how
 much of that number comes from one specific operation: **averaging the
@@ -217,7 +228,7 @@ convention, not the literature's, so the column exists to let anyone remove it.
 
 Subtract it and the picture changes completely:
 
-| Method | Comm-weights | of which server-side | **net** |
+| Method | Comm-weights | Server-model FedAvg | **net** |
 |---|---|---|---|
 | SplitFedv1 | 512.30 | 480.94 | **31.36** |
 | SplitFedv2 | 31.36 | 0.00 | **31.36** |

@@ -19,6 +19,7 @@ from models import Server, Client
 from utils.utils import calculate_load, Checkpointer
 from utils.comm import CommLedger, tensor_bytes
 from utils.memory import MemoryMeter, module_static_bytes, optimizer_state_bytes
+from utils.breakdown import build_breakdown, render as render_breakdown
 
 # ------------------------------------------------------------------------------
 def aggregate_models(model_list, weights, device='cpu'):
@@ -58,6 +59,13 @@ def aggregate_models(model_list, weights, device='cpu'):
     # Won't add to the comm load here because I'll add it for when algs load
     # in the agg model
     return aggregated
+
+# ------------------------------------------------------------------------------
+class _OptimizerSlice:
+    '''An optimizer's state restricted to a set of parameter ids, so the
+    existing optimizer_state_bytes can price one module's share of it.'''
+    def __init__(self, opt, param_ids):
+        self.state = {p: s for p, s in opt.state.items() if id(p) in param_ids}
 
 # ------------------------------------------------------------------------------
 class FLAlgorithm(ABC):
@@ -244,6 +252,56 @@ class FLAlgorithm(ABC):
     def server_side_optimizers(self):
         return [self.server.optimizer]
 
+    def schedule(self, rounds):
+        '''What the per-paper expected transfer counts depend on.'''
+        return {
+            'num_clients': len(self.clients),
+            'rounds': rounds,
+            'epochs': [c.epochs for c in self.clients],
+            'iters_per_epoch': [len(c.train_loader) for c in self.clients],
+            'h': self.cfg.get('server_update_interval'),
+            'l': self.cfg.get('align_interval'),
+        }
+
+    def server_side_extra_memory(self):
+        '''[{'item', 'mb', 'note'}] for state the protocol keeps on the server
+        that is NOT folded into `peak_server_mem_mb` (e.g. FSL-SAGE's alignment
+        buffers). Reported as separate lines so headline numbers stay stable.'''
+        return []
+
+    def _module_label(self, m, i=None):
+        if m is self.server.model:
+            return 'server model x_s'
+        if i is not None:
+            if m is self.clients[i].model:
+                return 'client model x_c'
+            if m is getattr(self.clients[i], 'auxiliary_model', None):
+                return 'auxiliary model x_a'
+        return type(m).__name__
+
+    def _module_components(self, modules, optimizers, i=None):
+        '''One {'item', params_mb, grads_mb, optim_mb, mb} row per module. The
+        optimizer state is split by which module owns each parameter, so the
+        rows sum to module_static_bytes + optimizer_state_bytes of the whole.'''
+        MB = 1024 ** 2
+        rows = []
+        for m in modules:
+            if m is None:
+                continue
+            params, grads = module_static_bytes(m)
+            own = {id(p) for p in m.parameters()}
+            optim = 0
+            for opt in optimizers:
+                if opt is None:
+                    continue
+                optim += optimizer_state_bytes(_OptimizerSlice(opt, own))
+            rows.append({
+                'item': self._module_label(m, i),
+                'params_mb': params / MB, 'grads_mb': grads / MB,
+                'optim_mb': optim / MB, 'mb': (params + grads + optim) / MB,
+            })
+        return rows
+
     def register_meter_params(self):
         '''Refresh the parameter-storage exclusion set. Must run once per round:
         FedAvg rebuilds `aggregated_client` every round, and several algorithms
@@ -280,7 +338,36 @@ class FLAlgorithm(ABC):
         worst = max(per_client, key=lambda d: d['total']) if per_client else {
             'params': 0, 'grads': 0, 'optim': 0, 'act': 0, 'total': 0
         }
+        worst_i = per_client.index(worst) if per_client else 0
+
+        # Per-module split of the SAME numbers as the headline keys below, so a
+        # reader can see which model each MiB belongs to. Each side's lines sum
+        # exactly to its headline total (static per module + working peak).
+        client_components = self._module_components(
+            self.client_side_modules(worst_i),
+            self.client_side_optimizers(worst_i), worst_i
+        ) if per_client else []
+        client_components.append({
+            'item': 'working-memory peak (autograd activations + input batch)',
+            'mb': (worst['total'] - worst['params'] - worst['grads']
+                   - worst['optim']) / MB,
+            'of_which_activations_mb': worst['act'] / MB,
+        })
+        server_components = self._module_components(
+            self.server_side_modules(), self.server_side_optimizers()
+        )
+        server_components.append({
+            'item': 'working-memory peak (autograd activations + uploaded batch)',
+            'mb': sresident / MB,
+            'of_which_activations_mb': sact / MB,
+        })
         return {
+            'client_mem_components'        : client_components,
+            'client_mem_components_client' : worst_i,
+            'server_mem_components'        : server_components,
+            # resident on the server in the PROTOCOL but not part of the headline
+            # server figure (see each method's server_side_extra_memory)
+            'server_mem_extra_components'  : self.server_side_extra_memory(),
             'peak_client_mem_mb'           : worst['total'] / MB,
             'client_param_mem_mb'          : worst['params'] / MB,
             'client_grad_mem_mb'           : worst['grads'] / MB,
@@ -427,6 +514,7 @@ class FLResults():
     avg_compute_times   : Dict[str, float]
     comm_breakdown      : List[Dict[str, float]]
     memory_metrics      : Dict[str, float]
+    breakdown           : Dict = None
 
 # ------------------------------------------------------------------------------
 def __aggregate_metrics_dict(
@@ -584,7 +672,8 @@ def _run_fl_algorithm(
         train_metrics = [{} for _ in range(cfg.num_clients)]
     if aggregation_metrics is None:
         aggregation_metrics = {}
-    
+
+    rounds_run = 0
     # main loop
     with logging_redirect_tqdm():
         for t in tqdm(
@@ -658,6 +747,7 @@ def _run_fl_algorithm(
             comm_load_cut.append(alg.comm_load_cut)
             comm_load_weights.append(alg.comm_load_weights)
             comm_breakdown.append(alg.ledger.snapshot())
+            rounds_run = t + 1
             if t == 0:
                 for k, v in agg_metrics.items():
                     aggregation_metrics[k] = [v]
@@ -723,10 +813,20 @@ def _run_fl_algorithm(
         f"system live peak: {memory_metrics['peak_system_live_mb']:.2f} MiB."
     )
 
+    # per-component comm/memory breakdown, labelled by paper step (see
+    # utils/breakdown.py). Printed so it shows even when save=False.
+    breakdown = build_breakdown(
+        cfg.algorithm.name, alg.schedule(rounds_run), alg.ledger.snapshot(),
+        {'cut': alg.comm_load_cut, 'weights': alg.comm_load_weights,
+         'total': alg.comm_load},
+        memory_metrics,
+    )
+    logging.info("\n" + render_breakdown(breakdown))
+
     return FLResults(
         alg.server, alg.clients, test_loss, test_acc, train_metrics,
         aggregation_metrics, comm_load_cut, comm_load_weights, comm_load,
-        avg_compute_times, comm_breakdown, memory_metrics
+        avg_compute_times, comm_breakdown, memory_metrics, breakdown
     )
 
 # ------------------------------------------------------------------------------

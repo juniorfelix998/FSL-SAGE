@@ -30,6 +30,31 @@ class FSLSAGE(FLAlgorithm):
     def client_side_optimizers(self, i):
         return [self.clients[i].optimizer, self.clients[i].auxiliary_model.optimizer]
 
+    def server_side_extra_memory(self):
+        '''What Alg. 3 of the FSL-SAGE paper keeps on the S-server but the
+        headline `peak_server_mem_mb` does not include: one alignment buffer
+        per client ("Store for client i", sizes capped at max_dataset_size),
+        and the copy of each client's auxiliary model the server aligns.'''
+        MB = 1024 ** 2
+        buf = sum(
+            t.numel() * t.element_size()
+            for c in self.clients
+            for t in (c.auxiliary_model.data_x, c.auxiliary_model.data_y,
+                      c.auxiliary_model.data_labels)
+        )
+        aux = self._module_components(
+            [c.auxiliary_model for c in self.clients],
+            [c.auxiliary_model.optimizer for c in self.clients],
+        )
+        return [
+            {'item': f'alignment buffers (z_f, true grad, y) x {len(self.clients)} clients',
+             'mb': buf / MB,
+             'note': 'paper p.5 / Alg.3 "Store for client i"; only z_f is in the headline (as held)'},
+            {'item': f'aux models being aligned x {len(self.clients)} clients (params+grads+Adam)',
+             'mb': sum(r['mb'] for r in aux),
+             'note': 'paper Alg.3 l.9-13; in this simulation the same object is counted on the client'},
+        ]
+
     def client_step(self, rd_cl_ep_it, x, y):
 
         t, i, j, k = rd_cl_ep_it       # (round, client, epoch, iter)
