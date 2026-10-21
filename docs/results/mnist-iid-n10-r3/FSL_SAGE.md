@@ -70,38 +70,58 @@ the count the paper's algorithm predicts. Every row matched (✓).
 
 ## Memory (per device)
 
-### Client: 157.82 MiB (worst single client)
+> **Updated: aux memory moved to the side that actually uses it.** In
+> FSL-SAGE the **client only runs** the aux model, to estimate the cut
+> gradient every batch (Alg.1). The **server trains (aligns)** it every l
+> rounds (Alg.3), and the aux optimizer only steps there. So the client holds
+> the aux model's parameters only, and the aux gradients and Adam state are on
+> the server. The first Colab run charged them to the client.
+>
+> The numbers below are that same T4 run with the model and optimizer bytes
+> re-split. Those bytes are deterministic, and working memory is unchanged.
+> Rerun on Colab to confirm.
+>
+> | | Before | After |
+> |---|---:|---:|
+> | Client | 157.82 | **133.76** (−24.06 aux grads + Adam) |
+> | Server | 186.52 | **218.60** (+32.09 aux copy being aligned) |
+
+### Client: 133.76 MiB (worst single client)
 
 | Item | Params + buffers | Grads | Adam state | MiB |
 |---|---:|---:|---:|---:|
-| Client model x_c | 2.61 | 2.61 | 5.21 | 10.43 |
-| Auxiliary model x_a | 8.03 | 8.02 | 16.04 | 32.09 |
+| Client model x_c (trained here) | 2.61 | 2.61 | 5.21 | 10.43 |
+| Auxiliary model x_a (only **run** here, never trained) | 8.03 | 0.00 | 0.00 | 8.03 |
 | Working-memory peak (activations + input batch) | | | | 115.30 |
 | ↳ of which autograd activations | | | | 112.30 |
-| **Client total** | | | | **157.82** ✓ |
+| **Client total** | | | | **133.76** |
 
 | Item | MiB | Meaning |
 |---|---:|---|
 | **Held-across-cut** | **94.01** | Part of the client's working memory that stays alive *while the client waits for the server*. It happens only on alignment iterations (round 0, first batch here): the client must wait for the freshly aligned aux model before it can backpropagate. It is already inside the 115.30, not extra. |
 
-### Server: 186.52 MiB
+### Server: 218.60 MiB
 
 | Item | Params + buffers | Grads | Adam state | MiB |
 |---|---:|---:|---:|---:|
 | Server model x_s (one copy, shared by all clients) | 40.08 | 40.05 | 80.10 | 160.22 |
+| Aux model x_a, the copy being aligned (Alg.3 l.9–13) | 8.03 | 8.02 | 16.04 | 32.09 |
 | Working-memory peak (activations + uploaded batch + stored z_f) | | | | 26.29 |
 | ↳ of which autograd activations | | | | 22.29 |
-| **Server total** | | | | **186.52** ✓ |
+| **Server total** | | | | **218.60** |
 
-**Also kept on the server by the protocol, but NOT in the 186.52:**
+The server aligns one client's aux model at a time, so the headline carries one
+aux copy with its gradients and Adam state.
+
+**Also kept on the server by the protocol, but NOT in the 218.60:**
 
 | Item | MiB | Why |
 |---|---:|---|
 | Alignment buffers × 10 clients | 98.20 | Paper p.5 / Alg.3 "Store for client i". Per client: up to 1,000 stored z_f (7.81 MiB) + true gradients from the last alignment (256 samples, 2 MiB) + labels. Only z_f is counted in the headline. |
-| Aux models being aligned × 10 clients (params + grads + Adam) | 320.88 | Alg.3 l.9–13: the server trains each client's aux model. 10 × 32.09. In this one-process simulation the same object is already counted on the client side. |
+| Aux models of the other 9 clients (params + grads + Adam) | 288.79 | Alg.3: each client has its own aux model and Adam state, which the server keeps between alignments. 9 × 32.09. |
 
-Adding these would bring a real FSL-SAGE server to about 186.52 + 98.20 +
-320.88 ≈ 606 MiB at 10 clients. They grow with the number of clients, while
+Adding these would bring a real FSL-SAGE server to about 218.60 + 98.20 +
+288.79 ≈ 606 MiB at 10 clients. They grow with the number of clients, while
 the headline Server number does not.
 
 ### System peak
@@ -109,7 +129,7 @@ the headline Server number does not.
 | Item | MiB |
 |---|---:|
 | **System peak** (live bytes, client + server at the same instant) | **123.30** |
-| with static model + optimizer bytes added | 326.04 |
+| with static model + optimizer bytes added | 334.07 |
 
 ---
 
@@ -133,7 +153,7 @@ The CUDA and RSS figures are not benchmark metrics. They include all 10
 simulated clients, the dataset and the cuDNN workspace on one GPU.
 
 <details>
-<summary>Raw breakdown output</summary>
+<summary>Raw breakdown output (first Colab run, before the aux memory re-split)</summary>
 
 ```
 ## Breakdown: fsl_sage  —  FSL-SAGE, Nair et al., arXiv:2505.23182

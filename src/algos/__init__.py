@@ -246,6 +246,12 @@ class FLAlgorithm(ABC):
     def client_side_optimizers(self, i):
         return [self.clients[i].optimizer]
 
+    def client_side_inference_modules(self, i):
+        '''Modules a client keeps and RUNS but never trains, so only their
+        params + buffers live on the client -- no grads, no optimizer state
+        (e.g. FSL-SAGE's auxiliary model, which only the server trains).'''
+        return []
+
     def server_side_modules(self):
         return [self.server.model]
 
@@ -277,9 +283,11 @@ class FLAlgorithm(ABC):
                 return 'client model x_c'
             if m is getattr(self.clients[i], 'auxiliary_model', None):
                 return 'auxiliary model x_a'
+        elif any(m is getattr(c, 'auxiliary_model', None) for c in self.clients):
+            return 'auxiliary model x_a (copy being aligned)'
         return type(m).__name__
 
-    def _module_components(self, modules, optimizers, i=None):
+    def _module_components(self, modules, optimizers, i=None, params_only=False):
         '''One {'item', params_mb, grads_mb, optim_mb, mb} row per module. The
         optimizer state is split by which module owns each parameter, so the
         rows sum to module_static_bytes + optimizer_state_bytes of the whole.'''
@@ -289,9 +297,11 @@ class FLAlgorithm(ABC):
             if m is None:
                 continue
             params, grads = module_static_bytes(m)
+            if params_only:
+                grads = 0
             own = {id(p) for p in m.parameters()}
             optim = 0
-            for opt in optimizers:
+            for opt in ([] if params_only else optimizers):
                 if opt is None:
                     continue
                 optim += optimizer_state_bytes(_OptimizerSlice(opt, own))
@@ -309,6 +319,7 @@ class FLAlgorithm(ABC):
         mods = [self.server.model, getattr(self, 'aggregated_client', None)]
         for i in range(len(self.clients)):
             mods.extend(self.client_side_modules(i))
+            mods.extend(self.client_side_inference_modules(i))
         mods.extend(self.server_side_modules())
         self.meter.register_params(*mods)
 
@@ -321,6 +332,9 @@ class FLAlgorithm(ABC):
         per_client = []
         for i in range(len(self.clients)):
             params, grads = module_static_bytes(*self.client_side_modules(i))
+            params += module_static_bytes(
+                *self.client_side_inference_modules(i)
+            )[0]
             optim = optimizer_state_bytes(*self.client_side_optimizers(i))
             act = self.meter.peak_saved.get(('client', i), 0)
             resident = self.meter.peak.get(('client', i), 0)
@@ -346,6 +360,9 @@ class FLAlgorithm(ABC):
         client_components = self._module_components(
             self.client_side_modules(worst_i),
             self.client_side_optimizers(worst_i), worst_i
+        ) + self._module_components(
+            self.client_side_inference_modules(worst_i), [], worst_i,
+            params_only=True
         ) if per_client else []
         client_components.append({
             'item': 'working-memory peak (autograd activations + input batch)',

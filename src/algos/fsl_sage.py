@@ -22,19 +22,40 @@ class FSLSAGE(FLAlgorithm):
     def special_models_eval_mode(self):
         for c in self.clients: c.auxiliary_model.eval()
 
-    # the surrogate model is a permanent resident of the client device: the
-    # client evaluates it every batch to synthesise a gradient at the cut
+    # Where the auxiliary (surrogate) model lives -- paper Alg. 1 vs Alg. 3:
+    #   * CLIENT keeps x_a and RUNS it every batch to synthesise the cut-layer
+    #     gradient (`__client_backward`), but never trains it: the aux optimizer
+    #     only steps inside `align()`. So the client holds x_a's params + buffers
+    #     and nothing else.
+    #   * SERVER trains (aligns) x_a every l rounds -- that is where its grads
+    #     and Adam state are created. The headline server figure carries ONE
+    #     aux copy being aligned (params + grads + Adam); the other N-1 clients'
+    #     copies and the alignment buffers are listed in server_side_extra_memory.
+    # (Earlier the aux grads + Adam were charged to the client, overstating the
+    # client by ~24 MiB for the 2.1M-param aux head.)
     def client_side_modules(self, i):
-        return [self.clients[i].model, self.clients[i].auxiliary_model]
+        return [self.clients[i].model]
 
     def client_side_optimizers(self, i):
-        return [self.clients[i].optimizer, self.clients[i].auxiliary_model.optimizer]
+        return [self.clients[i].optimizer]
+
+    def client_side_inference_modules(self, i):
+        return [self.clients[i].auxiliary_model]
+
+    def server_side_modules(self):
+        # all clients' aux models are the same shape; client 0's stands for
+        # "the copy currently being aligned"
+        return [self.server.model, self.clients[0].auxiliary_model]
+
+    def server_side_optimizers(self):
+        return [self.server.optimizer, self.clients[0].auxiliary_model.optimizer]
 
     def server_side_extra_memory(self):
-        '''What Alg. 3 of the FSL-SAGE paper keeps on the S-server but the
-        headline `peak_server_mem_mb` does not include: one alignment buffer
-        per client ("Store for client i", sizes capped at max_dataset_size),
-        and the copy of each client's auxiliary model the server aligns.'''
+        '''What Alg. 3 of the FSL-SAGE paper keeps on the S-server beyond the
+        headline `peak_server_mem_mb`: one alignment buffer per client ("Store
+        for client i", capped at max_dataset_size), and the aux models (with
+        their align-optimizer state) of the OTHER N-1 clients -- the headline
+        already carries the one being aligned.'''
         MB = 1024 ** 2
         buf = sum(
             t.numel() * t.element_size()
@@ -42,17 +63,18 @@ class FSLSAGE(FLAlgorithm):
             for t in (c.auxiliary_model.data_x, c.auxiliary_model.data_y,
                       c.auxiliary_model.data_labels)
         )
+        others = self.clients[1:]
         aux = self._module_components(
-            [c.auxiliary_model for c in self.clients],
-            [c.auxiliary_model.optimizer for c in self.clients],
+            [c.auxiliary_model for c in others],
+            [c.auxiliary_model.optimizer for c in others],
         )
         return [
             {'item': f'alignment buffers (z_f, true grad, y) x {len(self.clients)} clients',
              'mb': buf / MB,
              'note': 'paper p.5 / Alg.3 "Store for client i"; only z_f is in the headline (as held)'},
-            {'item': f'aux models being aligned x {len(self.clients)} clients (params+grads+Adam)',
+            {'item': f'aux models of the other {len(others)} clients (params+grads+Adam)',
              'mb': sum(r['mb'] for r in aux),
-             'note': 'paper Alg.3 l.9-13; in this simulation the same object is counted on the client'},
+             'note': 'paper Alg.3 l.9-13: server aligns every client\'s x_a; the headline holds one'},
         ]
 
     def client_step(self, rd_cl_ep_it, x, y):

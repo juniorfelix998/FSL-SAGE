@@ -100,9 +100,15 @@ splits each into lines that **sum exactly to the table number**:
 
 **Client** (table "Client"):
 - `client model x_c`: params + buffers, grads, Adam state.
-- `auxiliary model x_a`: params, grads, Adam state. Both methods keep the aux
-  model on the client permanently, since it replaces the server's gradient.
-  This is why their Client number is above SplitFed's.
+- `auxiliary model x_a`: both methods keep the aux model on the client
+  permanently, since it replaces the server's gradient. Who **trains** it
+  differs:
+  - **CSE-FSL:** the client trains it every batch on its local loss (Step 3,
+    Eq.5). So the client holds params + grads + Adam state (32.09 MiB).
+  - **FSL-SAGE:** the client only **runs** it to estimate the cut gradient
+    (Alg.1). The aux optimizer only steps in `align()` on the server (Alg.3).
+    So the client holds **params only** (8.03 MiB), and the grads and Adam
+    state are counted on the server.
 - `working-memory peak`: autograd activations + the input batch at their
   highest point.
 
@@ -115,14 +121,17 @@ It is already part of the working-memory line, not extra.
 
 **Server** (table "Server"):
 - `server model x_s`: params, grads, Adam state. One copy for both methods.
+- FSL-SAGE only: `auxiliary model x_a (copy being aligned)`: params + grads +
+  Adam state (32.09 MiB). The server aligns one client's aux model at a time.
 - `working-memory peak`: activations + the uploaded smashed batch (+ FSL-SAGE's
   stored z_f alignment buffer).
 
 **Server-side extras (FSL-SAGE, printed separately, NOT in the Server total):**
 Alg.3 keeps on the S-server, per client, an alignment buffer (z_f, true
-gradient, y; ≤ 1000 samples, p.5 "Store for client i") and the aux model being
-aligned plus its optimizer. The headline Server number counts only z_f.
-These lines show the rest, so you can decide whether to add them.
+gradient, y; ≤ 1000 samples, p.5 "Store for client i") and that client's aux
+model plus its optimizer. The headline Server number counts only z_f and the
+one aux copy being aligned. These lines show the rest (all clients' buffers and
+the other N−1 aux copies), so you can decide whether to add them.
 
 **System peak:** live bytes on both sides **at the same instant**, so it
 shows whether the client and server need memory simultaneously.

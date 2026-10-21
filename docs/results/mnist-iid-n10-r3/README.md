@@ -18,11 +18,17 @@ Units are MiB, which is what the benchmark table calls "MB".
 | ↳ Server-model FedAvg | 0.00 | 0.00 | both keep one server model |
 | **Comm: Total** | **938.84** | **537.37** | **FSL-SAGE −401.47 (−43%)** |
 | Cut share of total | 32% | 56% | |
-| Client memory | 148.80 | 157.82 | FSL-SAGE +9.02 |
+| Client memory | 148.80 | 133.76 | FSL-SAGE −15.04 (client never trains the aux) |
 | Held-across-cut | 0.00 | 94.01 | FSL-SAGE stalls on alignment |
-| Server memory | 176.26 | 186.52 | FSL-SAGE +10.26 |
+| Server memory | 176.26 | 218.60 | FSL-SAGE +42.34 (server trains the aux) |
 | System peak (live) | 106.28 | 123.30 | FSL-SAGE +17.02 |
 | Latency (s) | 93.99 | 113.64 | FSL-SAGE +19.65 s (+21%) |
+
+FSL-SAGE memory is re-split so the aux model's gradients and Adam state sit on
+the server, which is where it is trained. Before the re-split the figures were
+client 157.82 and server 186.52; see "Where the aux model lives" below. Those
+FSL-SAGE values are recomputed from the same T4 run, so rerun on Colab to
+confirm.
 
 Accuracy is not in the pasted output. Add it from each run's
 `Round 2 … ts. acc` log line.
@@ -59,21 +65,30 @@ that is 32,118 MiB vs 1,606 MiB of aux traffic.
 
 ## Memory, line by line
 
+### Where the aux model lives (why the two methods differ)
+
+| | CSE-FSL | FSL-SAGE |
+|---|---|---|
+| Who **trains** the aux model | the **client**, every batch, on its local loss (Step 3, Eq.5) | the **server**, every l rounds, by alignment (Alg.3 l.9–13) |
+| Who **runs** it | client | client: it estimates the cut gradient every batch (Alg.1) |
+| On the client | params + grads + Adam = 32.09 | params only = 8.03 |
+| On the server | nothing between rounds | the copy being aligned with its grads + Adam = 32.09 (plus the other 9 clients' copies, listed separately) |
+
 ### Client (worst single client)
 
 | Item | CSE-FSL | FSL-SAGE |
 |---|---:|---:|
 | Client model x_c (params + grads + Adam) | 10.43 | 10.43 |
-| Aux model (params + grads + Adam) | 32.09 | 32.09 |
+| Aux model | 32.09 (params + grads + Adam) | 8.03 (params only) |
 | Working-memory peak | 106.28 | 115.30 |
 | ↳ of which activations | 103.28 | 112.30 |
-| **Client total** | **148.80** | **157.82** |
+| **Client total** | **148.80** | **133.76** |
 | Held-across-cut | 0.00 | 94.01 |
 
-- **Static memory is identical:** both clients keep the client model and the
-  same 2.1M-param aux head.
-- **FSL-SAGE needs 9 MiB more working memory.** Its aux model produces the
-  gradient through a second-order graph (`create_graph=True`).
+- **FSL-SAGE's client is lighter by 15 MiB.** It keeps the aux model only to
+  run it, so it doesn't need its gradients or Adam state (−24 MiB). Its working
+  memory is 9 MiB higher, because the aux model produces the gradient through
+  a second-order graph (`create_graph=True`).
 - **Held-across-cut (the clearest behavioural difference):**
   - CSE-FSL never waits for the server.
   - FSL-SAGE waits on alignment iterations: its client keeps 94 MiB of
@@ -85,26 +100,28 @@ that is 32,118 MiB vs 1,606 MiB of aux traffic.
 | Item | CSE-FSL | FSL-SAGE |
 |---|---:|---:|
 | Server model x_s (params + grads + Adam) | 160.22 | 160.22 |
+| Aux model being aligned (params + grads + Adam) | – | 32.09 |
 | Working-memory peak | 16.04 | 26.29 |
 | ↳ of which activations | 14.04 | 22.29 |
-| **Server total** | **176.26** | **186.52** |
+| **Server total** | **176.26** | **218.60** |
 | *Not in total:* alignment buffers × 10 clients | – | 98.20 |
-| *Not in total:* aux models being aligned × 10 clients | – | 320.88 |
+| *Not in total:* aux models of the other 9 clients | – | 288.79 |
 
 - Both keep **one** server model (160.22 MiB).
-- FSL-SAGE's extra ~10 MiB of working memory comes from the stored z_f
-  alignment buffer and the alignment pass over it.
-- FSL-SAGE's protocol also keeps, **per client**, an alignment buffer and an
-  aux model plus optimizer on the server. These scale with N: 419 MiB at 10
-  clients. They are reported separately because the simulation counts the aux
-  models on the client side.
+- FSL-SAGE's server also holds the aux model it is aligning (32.09), plus
+  ~10 MiB more working memory for the stored z_f buffer and the alignment
+  pass.
+- FSL-SAGE's protocol also keeps, **per client**, an alignment buffer and the
+  other clients' aux models with their Adam state. These scale with N: 387 MiB
+  at 10 clients, so a real server would need ≈ 606 MiB. They are listed
+  separately so the headline stays a per-device peak.
 
 ### System peak
 
 | | CSE-FSL | FSL-SAGE |
 |---|---:|---:|
 | Live bytes, both sides at one instant | 106.28 | 123.30 |
-| + static model/optimizer bytes | 309.02 | 326.04 |
+| + static model/optimizer bytes | 309.02 | 334.07 |
 
 ## Time
 
@@ -121,9 +138,11 @@ by the server.
 
 ## Comparison with the 2-client table
 
-The memory numbers (148.80 / 157.82 client, 0 / 94.01 held, 176.26 / 186.52
-server, 106.28 / 123.30 system) are **the same** as the 2-client benchmark
-table, as expected: memory is per device.
+Before the aux re-split, the memory numbers (148.80 / 157.82 client, 0 / 94.01
+held, 176.26 / 186.52 server, 106.28 / 123.30 system) were **the same** as the
+2-client benchmark table, as expected: memory is per device. With the re-split,
+the table's FSL-SAGE Client becomes 133.76 and Server becomes 218.60. CSE-FSL
+is unchanged.
 
 Communication changes with N:
 

@@ -423,6 +423,25 @@ def test_comm_closed_form():
              (last(bd, 'weights.aux_down'), last(bd, 'weights.aux_up')),
              (R * M * aux_model_bytes(), 0))
     check_paper_rows("FSL-SAGE", res)
+    # The client only RUNS the aux model; the server trains (aligns) it. So in
+    # both the headline and the breakdown, the client's aux line is params only
+    # and the aux grads + Adam state sit on the server.
+    mm = res.memory_metrics
+    c_aux = [r for r in mm['client_mem_components'] if r['item'] == 'auxiliary model x_a']
+    s_aux = [r for r in mm['server_mem_components'] if r['item'].startswith('auxiliary model x_a')]
+    check("FSL-SAGE breakdown: client aux line has params only (no grads, no Adam)",
+          len(c_aux) == 1 and c_aux[0]['params_mb'] > 0
+          and c_aux[0]['grads_mb'] == 0 and c_aux[0]['optim_mb'] == 0, f"{c_aux}")
+    check("FSL-SAGE breakdown: server carries the aux copy being aligned (grads + Adam)",
+          len(s_aux) == 1 and s_aux[0]['grads_mb'] > 0
+          and math.isclose(s_aux[0]['optim_mb'] * 1024 ** 2, optimizer_state_bytes(
+              res.client_list[0].auxiliary_model.optimizer)),
+          f"{s_aux}")
+    check("FSL-SAGE headline client mem excludes aux grads + Adam",
+          math.isclose(mm['client_grad_mem_mb'] + mm['client_optim_mem_mb'],
+                       sum(r['grads_mb'] + r['optim_mb']
+                           for r in mm['client_mem_components'] if 'params_mb' in r)),
+          f"{mm['client_grad_mem_mb']} {mm['client_optim_mem_mb']}")
 
     # ---- Vanilla SL: non-federated, so zero weight traffic ------------
     cfg, res = build_run('vanilla_sl', M, N, B, R)
