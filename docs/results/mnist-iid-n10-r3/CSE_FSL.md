@@ -102,16 +102,20 @@ model needs a temporary copy during aggregation only.
 
 ---
 
-## Time and process diagnostics
+## Accuracy, time and process diagnostics
+
+Values are from the T4 rerun. Every comm and memory number was identical to
+the first run; CSE-FSL is unaffected by the FSL-SAGE aux fix.
 
 | Item | Value |
 |---|---:|
-| **Latency** (application start → end) | **93.99 s** |
-| Client compute time (sum) | 1.20 s |
+| **Test accuracy** (round 2) | **98.80%** |
+| **Latency** (application start → end) | **98.26 s** |
+| Client compute time (sum) | 1.22 s |
 | Server compute time (sum) | 0.22 s |
 | Client FedAvg compute time | 0.42 s |
-| Aux FedAvg compute time | 0.21 s |
-| Peak process RSS (diagnostic) | 1721.70 MiB |
+| Aux FedAvg compute time | 0.20 s |
+| Peak process RSS (diagnostic) | 1721.52 MiB |
 | Peak CUDA allocator (diagnostic) | 934.55 MiB |
 | Ordering check cuda ≥ system ≥ max(side) | OK |
 
@@ -119,9 +123,12 @@ The CUDA and RSS figures are not benchmark metrics. They include all 10
 simulated clients, the dataset and the cuDNN workspace on one GPU.
 
 <details>
-<summary>Raw breakdown output</summary>
+<summary>Raw breakdown output (T4 rerun; identical to the first run apart from timing)</summary>
 
 ```
+> Round 2, avg tr l_loss: 0.06, avg tr l_acc: 0.98, avg tr g_loss: 0.06, avg tr g_acc: 0.98, ts. loss: 0.04, ts. acc: 98.80%, comm cut: 0.293 GiB, comm weights: 0.624 GiB, comm total: 0.917 GiB.
+> Peak client mem: 148.80 MiB (act 103.28, held across cut 0.00), peak server mem: 176.26 MiB, system live peak: 106.28 MiB.
+
 ## Breakdown: cse_fsl  —  CSE-FSL, Mu & Shen, arXiv:2302.05599
 N = 10 clients, R = 3 rounds, local iters/round = [24, 24, 24, 24, 24, 24, 24, 24, 24, 24], h = 5, l = None.  Units: MiB (= table 'MB').
 
@@ -156,8 +163,8 @@ N = 10 clients, R = 3 rounds, local iters/round = [24, 24, 24, 24, 24, 24, 24, 2
 - Server total = 176.26 MiB  (lines sum 176.26 ✓)
 
 - System peak (live) = 106.28 MiB; with static = 309.02 MiB
-Summary of net compute times: client 1.20s, server 0.22s, client_agg 0.42s, auxiliary_agg 0.21s
-Total latency: 93.99s | Peak process memory: 1721.70 MiB | Peak CUDA memory: 934.55 MiB
+Summary of net compute times: client 1.22s, server 0.22s, client_agg 0.42s, auxiliary_agg 0.20s
+Total latency: 98.26s | Peak process memory: 1721.52 MiB | Peak CUDA memory: 934.55 MiB
 Memory attribution on Tesla T4: client 148.80 | server 176.26 | system 309.02 | cuda-allocator 934.55 MiB -- ordering OK
 ```
 </details>

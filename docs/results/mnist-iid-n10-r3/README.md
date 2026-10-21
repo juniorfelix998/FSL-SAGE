@@ -22,16 +22,14 @@ Units are MiB, which is what the benchmark table calls "MB".
 | Held-across-cut | 0.00 | 94.01 | FSL-SAGE stalls on alignment |
 | Server memory | 176.26 | 218.60 | FSL-SAGE +42.34 (server trains the aux) |
 | System peak (live) | 106.28 | 123.30 | FSL-SAGE +17.02 |
-| Latency (s) | 93.99 | 113.64 | FSL-SAGE +19.65 s (+21%) |
+| Test accuracy (round 2) | 98.80% | 98.71% | −0.09 pt (same after 3 rounds) |
+| Latency (s) | 98.26 | 116.23 | FSL-SAGE +17.97 s (+18%) |
 
 FSL-SAGE memory is re-split so the aux model's gradients and Adam state sit on
 the server, which is where it is trained. Before the re-split the figures were
-client 157.82 and server 186.52; see "Where the aux model lives" below. Those
-FSL-SAGE values are recomputed from the same T4 run, so rerun on Colab to
-confirm.
-
-Accuracy is not in the pasted output. Add it from each run's
-`Round 2 … ts. acc` log line.
+client 157.82 and server 186.52; see "Where the aux model lives" below. All
+numbers here are **confirmed by a T4 rerun after the fix**. The comm numbers
+were identical to the first run, and CSE-FSL's memory did not change.
 
 ## Communication, line by line
 
@@ -127,10 +125,10 @@ that is 32,118 MiB vs 1,606 MiB of aux traffic.
 
 | | CSE-FSL | FSL-SAGE |
 |---|---:|---:|
-| **Latency (s)** | **93.99** | **113.64** |
-| Client compute (s) | 1.20 | 0.66 |
-| Server compute (s) | 0.22 | 3.05 |
-| Aggregation compute (s) | 0.42 + 0.21 aux | 0.41 |
+| **Latency (s)** | **98.26** | **116.23** |
+| Client compute (s) | 1.22 | 0.66 |
+| Server compute (s) | 0.22 | 3.11 |
+| Aggregation compute (s) | 0.42 + 0.20 aux | 0.51 |
 
 FSL-SAGE trades server compute (alignment) for communication. The client does
 less work: CSE-FSL trains its aux head every batch, while FSL-SAGE's is trained

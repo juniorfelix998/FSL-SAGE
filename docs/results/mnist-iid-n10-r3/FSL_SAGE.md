@@ -77,9 +77,9 @@ the count the paper's algorithm predicts. Every row matched (✓).
 > the aux model's parameters only, and the aux gradients and Adam state are on
 > the server. The first Colab run charged them to the client.
 >
-> The numbers below are that same T4 run with the model and optimizer bytes
-> re-split. Those bytes are deterministic, and working memory is unchanged.
-> Rerun on Colab to confirm.
+> **Confirmed by a T4 rerun after the fix:** client 133.76, server 218.60,
+> system 334.07. Working memory, Held-across-cut (94.01) and the live system
+> peak (123.30) did not change.
 >
 > | | Before | After |
 > |---|---:|---:|
@@ -133,19 +133,22 @@ the headline Server number does not.
 
 ---
 
-## Time and process diagnostics
+## Accuracy, time and process diagnostics
+
+Values are from the T4 rerun after the fix.
 
 | Item | Value |
 |---|---:|
-| **Latency** (application start → end) | **113.64 s** |
+| **Test accuracy** (round 2) | **98.71%** |
+| **Latency** (application start → end) | **116.23 s** |
 | Client compute time (sum) | 0.66 s |
-| Server compute time (sum), including alignment | 3.05 s |
-| Client FedAvg compute time | 0.41 s |
-| Peak process RSS (diagnostic) | 1854.22 MiB |
+| Server compute time (sum), including alignment | 3.11 s |
+| Client FedAvg compute time | 0.51 s |
+| Peak process RSS (diagnostic) | 1854.51 MiB |
 | Peak CUDA allocator (diagnostic) | 1582.93 MiB |
 | Ordering check cuda ≥ system ≥ max(side) | OK |
 
-Server compute (3.05 s) is much higher than CSE-FSL's (0.22 s) because of
+Server compute (3.11 s) is much higher than CSE-FSL's (0.22 s) because of
 alignment. The server reruns its model over the stored buffer to get true
 gradients, then trains the aux model on them.
 
@@ -153,15 +156,17 @@ The CUDA and RSS figures are not benchmark metrics. They include all 10
 simulated clients, the dataset and the cuDNN workspace on one GPU.
 
 <details>
-<summary>Raw breakdown output (first Colab run, before the aux memory re-split)</summary>
+<summary>Raw breakdown output (T4 rerun after the aux memory re-split)</summary>
 
 ```
+> Round 2, avg tr g_loss: 0.06, avg tr g_acc: 0.98, ts. loss: 0.04, ts. acc: 98.71%, comm cut: 0.293 GiB, comm weights: 0.232 GiB, comm total: 0.525 GiB.
+> Peak client mem: 133.76 MiB (act 112.30, held across cut 94.01), peak server mem: 218.60 MiB, system live peak: 123.30 MiB.
+
 ## Breakdown: fsl_sage  —  FSL-SAGE, Nair et al., arXiv:2505.23182
-N = 10 clients, R = 3 rounds, local iters/round = [24, 24, 24, 24, 24, 24, 24, 24, 24, 24], h = 5, l = 10.  Units: MiB (= table 'MB').
+N = 10 clients, R = 3 rounds, local iters/round = [24 x 10], h = 5, l = 10.  Units: MiB (= table 'MB').
 
 ### Communication
 | # | What is sent | Paper | Column | Count | Expected | MiB / transfer | MiB | |
-|---|---|---|---|---:|---:|---:|---:|---|
 | C1 | Smashed activations z_f, client -> server | Alg.1 l.11-12; p.8: every K/Q = h local steps | Cut | 150 | 150 | 2.0000 | 300.00 | ✓ |
 | C2 | Labels y for each uploaded batch, client -> server | Alg.3 l.3-4: server receives (z_f, y) | Cut | 150 | 150 | 0.0020 | 0.29 | ✓ |
 | C3 | Gradient at the cut, server -> client | Alg.3 l.11-12: true grads used only on the server -> never sent | Cut | 0 | 0 | 0.0000 | 0.00 | ✓ |
@@ -170,29 +175,24 @@ N = 10 clients, R = 3 rounds, local iters/round = [24, 24, 24, 24, 24, 24, 24, 2
 | W3 | Aux model x_a upload | Alg.2: aux models are never averaged -> never sent up | Weights | 0 | 0 | 0.0000 | 0.00 | ✓ |
 | W4 | Aligned aux model x_a download, server -> client i | Alg.1 l.3-4, Fig.1: once every l rounds | Weights | 10 | 10 | 8.0294 | 80.29 | ✓ |
 | W5 | Server-model FedAvg (per-client x_s copies) | p.8: "a single server-side model is maintained" -> none | Weights | 0 | 0 | 0.0000 | 0.00 | ✓ |
-
-- Cut = 300.29 MiB  (rows sum 300.29 ✓)
-- Weights = 237.08 MiB  (rows sum 237.08 ✓)
-  - of that, Server-model FedAvg = 0.00 MiB
-- Total = Cut + Weights = 537.37 MiB
-- Cut share = 56%
+- Cut = 300.29 (rows sum ✓) | Weights = 237.08 (rows sum ✓), Server-model FedAvg 0.00 | Total = 537.37 | Cut share 56%
 
 ### Memory — client (worst client = 0)
-| client model x_c        | 2.61 | 2.61 | 5.21  | 10.43 |
-| auxiliary model x_a     | 8.03 | 8.02 | 16.04 | 32.09 |
+| client model x_c        | 2.61 | 2.61 | 5.21 | 10.43 |
+| auxiliary model x_a     | 8.03 | 0.00 | 0.00 |  8.03 |
 | working-memory peak (activations at own peak: 112.30) | | | | 115.30 |
-- Client total = 157.82 MiB  (lines sum 157.82 ✓)
-- Held-across-cut = 94.01 MiB
+- Client total = 133.76 MiB (lines sum ✓) | Held-across-cut = 94.01 MiB
 
 ### Memory — server
-| server model x_s        | 40.08 | 40.05 | 80.10 | 160.22 |
+| server model x_s                         | 40.08 | 40.05 | 80.10 | 160.22 |
+| auxiliary model x_a (copy being aligned) |  8.03 |  8.02 | 16.04 |  32.09 |
 | working-memory peak (activations at own peak: 22.29) | | | | 26.29 |
-- Server total = 186.52 MiB  (lines sum 186.52 ✓)
-- not in Server total: alignment buffers x 10 clients 98.20 MiB; aux models being aligned x 10 clients 320.88 MiB
+- Server total = 218.60 MiB (lines sum ✓)
+- not in Server total: alignment buffers x 10 clients 98.20 MiB; aux models of the other 9 clients 288.79 MiB
+- System peak (live) = 123.30 MiB; with static = 334.07 MiB
 
-- System peak (live) = 123.30 MiB; with static = 326.04 MiB
-Summary of net compute times: client 0.66s, server 3.05s, client_agg 0.41s
-Total latency: 113.64s | Peak process memory: 1854.22 MiB | Peak CUDA memory: 1582.93 MiB
-Memory attribution on Tesla T4: client 157.82 | server 186.52 | system 326.04 | cuda-allocator 1582.93 MiB -- ordering OK
+Summary of net compute times: client 0.66s, server 3.11s, client_agg 0.51s
+Total latency: 116.23s | Peak process memory: 1854.51 MiB | Peak CUDA memory: 1582.93 MiB
+Memory attribution on Tesla T4: client 133.76 | server 218.60 | system 334.07 | cuda-allocator 1582.93 MiB -- ordering OK
 ```
 </details>
