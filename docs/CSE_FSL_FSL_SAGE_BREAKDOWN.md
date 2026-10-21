@@ -129,7 +129,7 @@ It is already part of the working-memory line, not extra.
 **Server-side extras (FSL-SAGE, printed separately, NOT in the Server total):**
 Alg.3 keeps on the S-server, per client, an alignment buffer (z_f, true
 gradient, y; ≤ 1000 samples, p.5 "Store for client i") and that client's aux
-model plus its optimizer. The headline Server number counts only z_f and the
+model plus its optimizer. The Server total (table value) counts only z_f and the
 one aux copy being aligned. These lines show the rest (all clients' buffers and
 the other N−1 aux copies), so you can decide whether to add them.
 

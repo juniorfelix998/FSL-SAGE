@@ -28,7 +28,7 @@ class FSLSAGE(FLAlgorithm):
     #     only steps inside `align()`. So the client holds x_a's params + buffers
     #     and nothing else.
     #   * SERVER trains (aligns) x_a every l rounds -- that is where its grads
-    #     and Adam state are created. The headline server figure carries ONE
+    #     and Adam state are created. The Server total (table value) carries ONE
     #     aux copy being aligned (params + grads + Adam); the other N-1 clients'
     #     copies and the alignment buffers are listed in server_side_extra_memory.
     # (Earlier the aux grads + Adam were charged to the client, overstating the
@@ -52,9 +52,9 @@ class FSLSAGE(FLAlgorithm):
 
     def server_side_extra_memory(self):
         '''What Alg. 3 of the FSL-SAGE paper keeps on the S-server beyond the
-        headline `peak_server_mem_mb`: one alignment buffer per client ("Store
+        Server total (table value, `peak_server_mem_mb`): one alignment buffer per client ("Store
         for client i", capped at max_dataset_size), and the aux models (with
-        their align-optimizer state) of the OTHER N-1 clients -- the headline
+        their align-optimizer state) of the OTHER N-1 clients -- the Server total
         already carries the one being aligned.'''
         MB = 1024 ** 2
         buf = sum(
@@ -71,10 +71,10 @@ class FSLSAGE(FLAlgorithm):
         return [
             {'item': f'alignment buffers (z_f, true grad, y) x {len(self.clients)} clients',
              'mb': buf / MB,
-             'note': 'paper p.5 / Alg.3 "Store for client i"; only z_f is in the headline (as held)'},
+             'note': 'paper p.5 / Alg.3 "Store for client i"; only z_f is in the Server total (table value)'},
             {'item': f'aux models of the other {len(others)} clients (params+grads+Adam)',
              'mb': sum(r['mb'] for r in aux),
-             'note': 'paper Alg.3 l.9-13: server aligns every client\'s x_a; the headline holds one'},
+             'note': 'paper Alg.3 l.9-13: server aligns every client\'s x_a; the Server total (table value) holds one'},
         ]
 
     def client_step(self, rd_cl_ep_it, x, y):

@@ -100,29 +100,37 @@ the count the paper's algorithm predicts. Every row matched (✓).
 |---|---:|---|
 | **Held-across-cut** | **94.01** | Part of the client's working memory that stays alive *while the client waits for the server*. It happens only on alignment iterations (round 0, first batch here): the client must wait for the freshly aligned aux model before it can backpropagate. It is already inside the 115.30, not extra. |
 
-### Server: 218.60 MiB
+### Server: ≈ 606 MiB in total (10 clients)
+
+The server holds three groups of things. Only the first group is the value in the
+benchmark table's Server column.
 
 | Item | Params + buffers | Grads | Adam state | MiB |
 |---|---:|---:|---:|---:|
 | Server model x_s (one copy, shared by all clients) | 40.08 | 40.05 | 80.10 | 160.22 |
-| Aux model x_a, the copy being aligned (Alg.3 l.9–13) | 8.03 | 8.02 | 16.04 | 32.09 |
+| Aux model x_a, the copy being aligned right now (Alg.3 l.9–13) | 8.03 | 8.02 | 16.04 | 32.09 |
 | Working-memory peak (activations + uploaded batch + stored z_f) | | | | 26.29 |
 | ↳ of which autograd activations | | | | 22.29 |
-| **Server total** | | | | **218.60** |
+| **Server total (table value)** (per-device peak, used in the benchmark table) | | | | **218.60** |
+| Aux models of the other 9 clients (params + grads + Adam), 9 × 32.09 | | | | 288.79 |
+| Alignment buffers × 10 clients (z_f + true gradients + labels) | | | | 98.20 |
+| **Total server memory, all 10 clients** | | | | **≈ 606** (605.59) |
 
-The server aligns one client's aux model at a time, so the headline carries one
-aux copy with its gradients and Adam state.
+**Why the table uses 218.60 and not 606.** The server aligns one client's aux
+model at a time, so 218.60 is what it needs to do that work. The other two
+lines are state it must *keep* for every client between alignments:
+- **Aux models of the other 9 clients:** Alg.3 gives each client its own aux
+  model and Adam state.
+- **Alignment buffers:** paper p.5 "Store for client i". Per client: up to
+  1,000 stored z_f (7.81 MiB), true gradients from the last alignment (256
+  samples, 2 MiB) and labels.
 
-**Also kept on the server by the protocol, but NOT in the 218.60:**
+Both grow with the number of clients, while 218.60 does not. Use **606** when
+asking "how much memory does an FSL-SAGE server need for 10 clients", and
+**218.60** when comparing per-device peaks across methods.
 
-| Item | MiB | Why |
-|---|---:|---|
-| Alignment buffers × 10 clients | 98.20 | Paper p.5 / Alg.3 "Store for client i". Per client: up to 1,000 stored z_f (7.81 MiB) + true gradients from the last alignment (256 samples, 2 MiB) + labels. Only z_f is counted in the headline. |
-| Aux models of the other 9 clients (params + grads + Adam) | 288.79 | Alg.3: each client has its own aux model and Adam state, which the server keeps between alignments. 9 × 32.09. |
-
-Adding these would bring a real FSL-SAGE server to about 218.60 + 98.20 +
-288.79 ≈ 606 MiB at 10 clients. They grow with the number of clients, while
-the headline Server number does not.
+605.59 may count up to ~8 MiB twice: the working-memory line already includes
+one client's stored z_f, which is also part of the 98.20 alignment buffers.
 
 ### System peak
 

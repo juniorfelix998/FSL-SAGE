@@ -248,11 +248,14 @@ def render(bd):
     out.append('')
     out.append('### Memory — server')
     out.append(_mem_table(m['server_lines']))
-    out.append(f"\n- **Server total** = {_f(m['server_total'])} MiB  (lines sum {_f(m['server_lines_sum'])} {_tick(_same(m['server_lines_sum'], m['server_total']))})")
+    out.append(f"\n- **Server total (table value)** = {_f(m['server_total'])} MiB  (lines sum {_f(m['server_lines_sum'])} {_tick(_same(m['server_lines_sum'], m['server_total']))})")
     if m['server_extra_lines']:
-        out.append('- Also kept on the server by the protocol, **not** in the Server total:')
+        out.append('- Also kept on the server by the protocol, **not** in the Server total (table value):')
         for l in m['server_extra_lines']:
             out.append(f"  - {l['item']}: {l['mb']:.2f} MiB  ({l['note']})")
+        full = (m['server_total'] or 0) + sum(l['mb'] for l in m['server_extra_lines'])
+        out.append(f"- **Total server memory incl. all clients' state** = {full:.2f} MiB "
+                   f"(Server total + lines above; the table uses the per-device Server total)")
     out.append('')
     out.append(f"- **System peak** (live bytes, both sides at one instant) = {_f(m['system_peak_live'])} MiB; "
                f"with static model/optimizer bytes = {_f(m['system_peak_with_static'])} MiB")

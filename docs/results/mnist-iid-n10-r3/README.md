@@ -9,7 +9,7 @@ l = 10). Per-method details are in [CSE_FSL.md](CSE_FSL.md) and
 Every transfer count matched the count each paper's algorithm predicts (all ✓).
 Units are MiB, which is what the benchmark table calls "MB".
 
-## Headline
+## Summary
 
 | Metric | CSE-FSL | FSL-SAGE | Difference |
 |---|---:|---:|---|
@@ -21,6 +21,7 @@ Units are MiB, which is what the benchmark table calls "MB".
 | Client memory | 148.80 | 133.76 | FSL-SAGE −15.04 (client never trains the aux) |
 | Held-across-cut | 0.00 | 94.01 | FSL-SAGE stalls on alignment |
 | Server memory | 176.26 | 218.60 | FSL-SAGE +42.34 (server trains the aux) |
+| Server memory incl. all clients' state | 176.26 | ≈ 606 | FSL-SAGE keeps an aux model + buffer per client |
 | System peak (live) | 106.28 | 123.30 | FSL-SAGE +17.02 |
 | Test accuracy (round 2) | 98.80% | 98.71% | −0.09 pt (same after 3 rounds) |
 | Latency (s) | 98.26 | 116.23 | FSL-SAGE +17.97 s (+18%) |
@@ -101,9 +102,10 @@ that is 32,118 MiB vs 1,606 MiB of aux traffic.
 | Aux model being aligned (params + grads + Adam) | – | 32.09 |
 | Working-memory peak | 16.04 | 26.29 |
 | ↳ of which activations | 14.04 | 22.29 |
-| **Server total** | **176.26** | **218.60** |
-| *Not in total:* alignment buffers × 10 clients | – | 98.20 |
-| *Not in total:* aux models of the other 9 clients | – | 288.79 |
+| **Server total (table value)** | **176.26** | **218.60** |
+| + aux models of the other 9 clients | – | 288.79 |
+| + alignment buffers × 10 clients | – | 98.20 |
+| **Total server memory, all 10 clients** | **176.26** | **≈ 606** |
 
 - Both keep **one** server model (160.22 MiB).
 - FSL-SAGE's server also holds the aux model it is aligning (32.09), plus
@@ -112,7 +114,7 @@ that is 32,118 MiB vs 1,606 MiB of aux traffic.
 - FSL-SAGE's protocol also keeps, **per client**, an alignment buffer and the
   other clients' aux models with their Adam state. These scale with N: 387 MiB
   at 10 clients, so a real server would need ≈ 606 MiB. They are listed
-  separately so the headline stays a per-device peak.
+  separately so the Server total (table value) stays a per-device peak.
 
 ### System peak
 
