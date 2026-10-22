@@ -163,6 +163,162 @@ gradients, then trains the aux model on them.
 The CUDA and RSS figures are not benchmark metrics. They include all 10
 simulated clients, the dataset and the cuDNN workspace on one GPU.
 
+## Questions and answers
+
+### 1. Is the aux model on the client or on the server?
+
+**Both, with different jobs.** The paper and the code agree.
+
+| | Client | Server |
+|---|---|---|
+| **What it does with the aux model** | **Runs** it every batch to estimate the gradient at the cut, then backprops its own model with that estimate. It never trains the aux model. | **Trains (aligns)** it every l = 10 rounds against the true gradients, then sends the new copy down. |
+| **Paper** | Alg.1: the client keeps x_{a,i} from the last round and computes its gradient estimate with it | Alg.3 l.9–13: the S-server aligns x_{a,i} on the stored (z_f, y). Fig.1: "S → C_i: x_{a,i}, once in l rounds" |
+| **Code** | `fsl_sage.py`, `__client_backward`, inside `phase('client')` | `fsl_sage.py`, `refresh_data()` + `align()`, inside `phase('server')` |
+| **Memory** | aux **params only** (8.03 MiB) | aux params + grads + Adam state (32.09 MiB per copy) |
+| **Communication** | receives it (W4) | sends it (W4: 10 sends × 8.03 MiB) |
+
+The client never changes the aux model, so the server's copy is always the
+current one. That is why FSL-SAGE never uploads the aux model (W3 = 0).
+
+### 2. What does "↳ of which autograd activations" mean?
+
+**"↳ of which" means the line is a part of the line directly above it, not an
+extra cost.** For the server, the 22.29 is already inside the 26.29:
+160.22 + 32.09 + 26.29 = 218.60, with nothing added for 22.29.
+
+- **Working-memory peak (26.29):** all the temporary memory the server needs at
+  its busiest moment, beyond the models themselves. It has two kinds of tensors:
+  - **Autograd activations:** during a forward pass, each layer saves its
+    intermediate outputs so the backward pass can compute gradients. They exist
+    only between the forward and backward pass, then get freed. This is usually
+    the biggest chunk.
+  - **Explicitly held data:** tensors the server keeps on purpose, not for
+    autograd. Here that's the uploaded smashed batch (2 MiB) and the stored z_f
+    alignment buffer.
+- **↳ of which autograd activations (22.29):** the first kind on its own,
+  measured at its own highest point.
+
+**How to read the gap:** roughly 26.29 − 22.29 ≈ 4 MiB is the held data, mainly
+the 2 MiB uploaded batch plus the stored z_f at that moment. It's "roughly"
+because the two figures can peak at slightly different instants, so the
+difference isn't an exact accounting.
+
+**Why it's shown:** it tells you what drives the working memory. For the server
+it's mostly backprop through the server model (22.29 of 26.29). On the client
+the same split shows 112.30 of 115.30 is activations, the client model's own
+forward graph.
+
+### 3. What does "Server total (table value)" mean?
+
+It is **the single number that goes in the benchmark table's Server column**,
+the one methods are compared and ranked on. For FSL-SAGE it is **218.60 MiB**.
+(Earlier versions of this doc called it the "headline".)
+
+- **In the Server total (table value):** the server model (160.22), one aux
+  model being aligned (32.09) and working memory (26.29).
+- **Not in it:** the other 9 clients' aux models (288.79) and the alignment
+  buffers (98.20). They are real memory and are listed separately.
+
+The client works the same way: its table value is 133.76.
+
+### 4. Why does the Server total hold one aux model, with "the other 9" listed separately?
+
+In FSL-SAGE **every client has its own aux model**, so with 10 clients there are
+10 aux models, and the server is the one that trains them (Alg.3).
+
+- **One copy in the table value:** the server aligns them one after another,
+  so at any instant only one is being trained. That one, with its gradients and
+  Adam state, is the 32.09 in the Server total.
+- **The other 9 listed separately:** the server still has to keep them, plus
+  their Adam state, ready for their turn. That is the 288.79 (9 × 32.09).
+
+Together that's all 10 aux models: 32.09 + 288.79 = 320.88 = 10 × 32.09.
+
+| Piece | MiB | In the Server total (table value)? |
+|---|---:|---|
+| Server model x_s | 160.22 | yes |
+| Aux model being aligned now (1 client) | 32.09 | yes |
+| Working memory | 26.29 | yes |
+| **Server total (table value)** | **218.60** | |
+| Aux models of the other 9 clients | 288.79 | no |
+| Alignment buffers of all 10 clients | 98.20 | no |
+| **Total server memory, all 10 clients** | **≈ 606** | |
+
+**Why the extras are kept out of the table value:** the table value is a
+per-device peak, comparable across methods. The extras grow with the number of
+clients (double the clients and they roughly double), while 218.60 stays the
+same. Listing them separately shows the client-count cost without changing the
+ranked column.
+
+The 606 is approximate: the working-memory line already includes part of one
+client's stored z_f, so adding the full 98.20 counts a few MiB twice.
+
+### 5. Why is the true-gradient buffer smaller than the activation buffer (z_f)?
+
+**Per sample they are the same size.** A true gradient has exactly the shape of
+the activation it belongs to: 128×4×4 = 2,048 floats × 4 B = 8 KiB. The
+difference is in **how many samples** each holds.
+
+| Buffer (per client, end of run) | Samples | Size |
+|---|---:|---:|
+| `data_x` (z_f) | 1,000 (the cap) | 1,000 × 8 KiB = **7.81 MiB** |
+| `data_y` (true gradient) | 256 | 256 × 8 KiB = **2.00 MiB** |
+| `data_labels` | 1,000 | 1,000 × 8 B = 0.01 MiB |
+| **Per client** | | **9.82 MiB** → × 10 clients = **98.20** |
+
+**Why the counts differ:** the two buffers are filled at different times.
+- **z_f grows every upload.** Every 5th batch the server appends the 256
+  uploaded samples (`add_datapoint`). Over 3 rounds that's 15 uploads × 256 =
+  3,840 samples, trimmed to the newest 1,000.
+- **The true gradient is only computed at alignment.** `refresh_data()` runs
+  the server over the whole buffer and stores the gradients in `data_y`. That
+  happens only when `t % 10 == 0` on the first batch. In a 3-round run that's
+  once, at round 0, batch 0, when the buffer held just the first upload (256
+  samples).
+
+So by the end of the run, `data_y` is a stale snapshot from round 0. 98.20 MiB
+is the end-of-run size, not the peak. At the next alignment (round 10),
+`data_y` would be recomputed over all 1,000 samples and become 7.81 MiB, the
+same as z_f, giving about 15.6 MiB per client (≈ 156 MiB for 10 clients).
+
+### 6. Why is the alignment buffer capped at 1,000 samples?
+
+**It's a setting in the original FSL-SAGE authors' code. The paper doesn't give
+a number.**
+
+- **Where it's set:** `src/hydra_config/model/auxiliary/base_auxiliary.yaml`
+  sets `max_dataset_size: 1000`, together with `align_batch_size: 1000` and
+  `align_epochs: 100`. It came in with the upstream authors' commits (late
+  2024), not anything added in this benchmark.
+- **What the paper says:** the buffer grows every round, and in practice "one
+  can discard the older entries in order to maintain a fixed maximum size"
+  (p.5). For its theory it assumes unlimited storage. It never names a size.
+- **Why a cap at all:** without one, the buffer and the alignment cost grow
+  forever. Each alignment reruns the server model over the whole buffer, then
+  trains the aux model on it for 100 passes.
+- **Why 1,000 specifically:** not stated. A likely reason (my inference): with
+  `align_batch_size` also 1,000, each alignment pass is a single batch over the
+  whole buffer, which keeps alignment cheap.
+
+**What it means in practice:** the buffer keeps the newest 1,000 samples, about
+4 uploads' worth (4 × 256 = 1,024, trimmed to 1,000). So when the aux model is
+aligned, it learns only from the most recent activations, not the whole
+history.
+
+### 7. What is "Server-model FedAvg" (formerly "of which server")?
+
+The part of **Weights** spent averaging **per-client copies of the server-side
+model**. It is already included in Weights, not added on top
+(Total = Cut + Weights).
+
+- **How it's computed:** `weights.server_up + weights.server_down` =
+  N clients × R rounds × 2 (up + down) × |x_s|. Example, SplitFedv1 on MNIST
+  with 2 clients × 3 rounds: 2 × 3 × 2 × 40.08 = 480.94 MiB.
+- **Who pays it:** only methods that keep one server model per client
+  (SplitFedv1, MU-SplitFed, Han et al., FedSplitX).
+- **FSL-SAGE pays 0:** it keeps a single server model (p.8: "a single
+  server-side model is maintained").
+
 <details>
 <summary>Raw breakdown output (T4 rerun after the aux memory re-split)</summary>
 
