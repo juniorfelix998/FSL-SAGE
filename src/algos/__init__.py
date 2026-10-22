@@ -225,10 +225,21 @@ class FLAlgorithm(ABC):
         self._phase_times = {}
         self.meter.enabled = (
             bool(self.cfg.get('measure_memory', True))
-            and j == 0 and k < self.mem_probe_batches
+            and self.should_probe_memory(t, i, j, k)
         )
         if self.meter.enabled:
             self.hold('client', x, y, i=i)     # the client owns its own batch
+
+    def should_probe_memory(self, t, i, j, k):
+        '''Which batches the memory meter samples. Overridden by methods whose
+        heaviest server step is NOT within the first `mem_probe_batches`
+        (cse_fsl / fsl_sage upload on the h-th batch of a window).'''
+        return j == 0 and k < self.mem_probe_batches
+
+    def begin_round(self, t):
+        '''Round-boundary work, before any client trains in round t (e.g.
+        FSL-SAGE's alignment, Alg. 1 l.3-4). No-op for most methods.'''
+        pass
 
     def end_step(self):
         self.meter.end_step()
@@ -704,6 +715,7 @@ def _run_fl_algorithm(
             # refresh the meter's parameter-storage exclusion set: FedAvg
             # rebuilds `aggregated_client` every round
             alg.register_meter_params()
+            alg.begin_round(t)
             with tqdm(
                 range(cfg.num_clients), unit="cl", desc="Client", leave=False,
                 colour='blue'
@@ -734,8 +746,11 @@ def _run_fl_algorithm(
                                         k: [v] for k, v in tr_metrics.items()
                                     }
                                 else:
-                                    [tr_mets[k].append(v) for k, v in
-                                    tr_metrics.items()]
+                                    # setdefault: a metric may first appear
+                                    # mid-round (e.g. a server loss on the
+                                    # h-th batch only)
+                                    [tr_mets.setdefault(k, []).append(v)
+                                     for k, v in tr_metrics.items()]
 
                     # compute mean of metrics
                     tr_mets = {k: np.mean(v) if 'model_compute_time' not in k
@@ -745,8 +760,8 @@ def _run_fl_algorithm(
                             k: [v] for k, v in tr_mets.items()
                         }
                     else:
-                        [train_metrics[i][k].append(v) for k, v in
-                        tr_mets.items()]
+                        [train_metrics[i].setdefault(k, []).append(v)
+                         for k, v in tr_mets.items()]
                     log_dict.update({
                         f'Clients/client_{i}/{k}': v for k, v in tr_mets.items()
                     })

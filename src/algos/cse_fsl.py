@@ -1,4 +1,28 @@
 # ------------------------------------------------------------------------------
+# CSE-FSL (Mu & Shen, arXiv:2302.05599), run against the paper's pseudocode.
+#
+# Differences from the original implementation (changed after review):
+#   D. WHICH batch is uploaded. The original code uploaded the smashed data of
+#      the FIRST batch of every h-batch window (local_iter = 0, h, 2h, ...;
+#      5 uploads per round at K = 24). The paper is internally ambiguous:
+#        - Step 2 (p.3): "if current batch number m satisfies m mod h = 0"
+#        - Eq.(6): one window is h steps, m = 0..h-1
+#        - Eq.(8) and Fig. 2 ("When m=h"): the server receives
+#          g_{x_c^{t,h-1}}(z) -- the client model AFTER h-1 updates, i.e. the
+#          output on the h-th (LAST) batch of the window.
+#      Eq.(8) and Fig. 2 agree with each other and with Eq.(6), so this file
+#      uploads on the last batch of each window: local_iter = h-1, 2h-1, ...
+#      (Step 2 read with m counted 1..h). At K = 24, h = 5 that is batches
+#      5,10,15,20 -> 4 uploads per round (was 5), the same schedule as FSL-SAGE.
+#
+# Matches the paper unchanged:
+#   - Step 1: x_c and a_c downloaded every round. The ledger charges the
+#     download when the server broadcasts after aggregation (end of round t
+#     for round t+1); the per-run COUNT is the same N*R as Step 1's.
+#   - Step 4 / Eq.(9): x_c and a_c both FedAvg'd every round.
+#   - Single server model, updated first-come-first-served; labels uploaded
+#     with each smashed batch; no gradient ever sent back.
+# ------------------------------------------------------------------------------
 import time
 import torch
 from algos import register_algorithm, aggregate_models, FLAlgorithm
@@ -33,6 +57,13 @@ class CSEFSL(FLAlgorithm):
 
     def client_side_optimizers(self, i):
         return [self.clients[i].optimizer, self.clients[i].auxiliary_model.optimizer]
+
+    def should_probe_memory(self, t, i, j, k):
+        # also sample the first upload (local_iter = h-1), or the server step
+        # would never be measured
+        return super().should_probe_memory(t, i, j, k) or (
+            j == 0 and k == self.server_update_interval - 1
+        )
 
     def client_step(self, rd_cl_ep_it, x, y):
 
@@ -69,7 +100,8 @@ class CSEFSL(FLAlgorithm):
         # server model update. NOTE the clone is made AFTER the client phase
         # closes, so it is not attributed to the client's activation peak.
         local_iter = j * self.iters_per_epoch[i] + k
-        if local_iter % self.server_update_interval == 0:
+        # fix D: the LAST batch of each h-batch window (Eq.8 / Fig.2)
+        if (local_iter + 1) % self.server_update_interval == 0:
             smashed_data = splitting_output.clone().detach().requires_grad_(True)
             self.charge_cut_activation(smashed_data)
             self.charge_cut_labels(y)     # this loss IS computed server-side

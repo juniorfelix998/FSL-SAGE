@@ -171,10 +171,16 @@ class GradScalarAuxiliaryModel(AuxiliaryModel):
             bar.set_postfix(loss=loss.item())
             if self.lr_scheduler is not None: self.lr_scheduler.step()
 
-    def forward(self, x, label):
+    def forward(self, x, label, create_graph=True):
+        '''Gradient estimate z_b_hat = d loss(aux(x), label) / dx.
+
+        create_graph=True keeps the second-order graph, which `align()` needs to
+        train the aux parameters THROUGH this gradient (Eq. 2). A client only
+        needs the VALUE (FSL-SAGE Alg.1 l.14), so it passes False: same numbers,
+        and the aux forward graph is freed as soon as the client step ends.'''
         x.requires_grad_(True)
         out = self.server.criterion(self.forward_inner(x), label)
-        aux_out = torch.autograd.grad(out, x, create_graph=True)[0]
+        aux_out = torch.autograd.grad(out, x, create_graph=create_graph)[0]
         return aux_out
 
 # ------------------------------------------------------------------------------

@@ -201,10 +201,10 @@ class TinyAux(nn.Module):
     def forward_inner(self, x):
         return torch.log_softmax(self.fc(x.flatten(1)), dim=1)
 
-    def forward(self, x, label):
+    def forward(self, x, label, create_graph=True):
         x = x.requires_grad_(True)
         loss = self.criterion(self.forward_inner(x), label)
-        return torch.autograd.grad(loss, x, create_graph=True)[0]
+        return torch.autograd.grad(loss, x, create_graph=create_graph)[0]
 
     # -- the alignment-buffer interface fsl_sage drives ------------------
     def add_datapoint(self, x, label):
@@ -393,8 +393,10 @@ def test_comm_closed_form():
         'server_update_interval': Q
     })
     bd = res.comm_breakdown
-    uploaded = [bs_list[it] for it in range(0, len(bs_list), Q)]
-    check_eq("CSE-FSL cut.act_up (only every q-th batch)",
+    # paper schedule: the LAST batch of each q-batch window (local_iter = q-1,
+    # 2q-1, ...) -- CSE-FSL Eq.(8)/Fig.2, FSL-SAGE Alg.1 l.11 / Alg.3 l.3
+    uploaded = [bs_list[it] for it in range(Q - 1, len(bs_list), Q)]
+    check_eq("CSE-FSL cut.act_up (last batch of every q-batch window)",
              last(bd, 'cut.act_up'), R * M * sum(act_bytes(b) for b in uploaded))
     check_eq("CSE-FSL cut.grad_down is ZERO (no gradient crosses back)",
              last(bd, 'cut.grad_down'), 0)
@@ -415,13 +417,19 @@ def test_comm_closed_form():
         'server_update_interval': Q, 'align_interval': 1
     })
     bd = res.comm_breakdown
-    check_eq("FSL-SAGE cut.act_up (only every q-th batch)",
+    check_eq("FSL-SAGE cut.act_up (last batch of every q-batch window)",
              last(bd, 'cut.act_up'), R * M * sum(act_bytes(b) for b in uploaded))
     check_eq("FSL-SAGE cut.grad_down is ZERO (surrogate replaces it)",
              last(bd, 'cut.grad_down'), 0)
     check_eq("FSL-SAGE auxiliary is charged DOWNLOAD only (aligned server-side)",
              (last(bd, 'weights.aux_down'), last(bd, 'weights.aux_up')),
              (R * M * aux_model_bytes(), 0))
+    from utils.utils import calculate_load as _load
+    check_eq("FSL-SAGE client download = initial x_c^0 + one per round (Alg.2 l.4, l.8)",
+             last(bd, 'weights.client_down'),
+             (R + 1) * M * _load(res.client_list[0].model))
+    check_eq("FSL-SAGE client upload = one per round (Alg.2 l.6)",
+             last(bd, 'weights.client_up'), R * M * _load(res.client_list[0].model))
     check_paper_rows("FSL-SAGE", res)
     # The client only RUNS the aux model; the server trains (aligns) it. So in
     # both the headline and the breakdown, the client's aux line is params only
@@ -984,6 +992,16 @@ def test_held_across_cut_reflects_the_algorithm():
           fs.memory_metrics['client_mem_held_across_cut_mb'] <= sl_held + 1e-6,
           f"fsl_sage={fs.memory_metrics['client_mem_held_across_cut_mb']} "
           f"vanilla={sl_held}")
+    # Paper Alg.1 l.3-4: the aligned aux model arrives at the START of a round,
+    # so the client never waits for the server mid-step -> exactly 0.
+    check_eq("fsl_sage holds NOTHING across the cut (alignment at round start)",
+             fs.memory_metrics['client_mem_held_across_cut_mb'], 0.0)
+    # The first upload is now on the h-th batch; the probe must still see it.
+    for name in ('fsl_sage', 'cse_fsl'):
+        r = fs if name == 'fsl_sage' else build_real_run(name, ALGO_EXTRAS[name])
+        check(f"{name}: memory probe samples a server step (server act peak > 0)",
+              r.memory_metrics['server_act_peak_mem_mb'] > 0,
+              f"{r.memory_metrics['server_act_peak_mem_mb']}")
 
     # LocFedMix-SL genuinely waits for the server's gradient (Eq. 4), so it
     # holds its backbone graph -- but ONLY the backbone. Its Infopro decoder

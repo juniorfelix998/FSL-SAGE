@@ -1,5 +1,13 @@
 # CSE-FSL: MNIST IID, 10 clients, 3 rounds
 
+> **Superseded.** These results were produced with the **original** CSE-FSL and
+> FSL-SAGE code, before it was changed to follow each paper's pseudocode. The
+> differences (4 uploads per round instead of 5; FSL-SAGE alignment at the round
+> boundary, initial x_c⁰ broadcast, first-order client gradient) are listed in
+> [`docs/CSE_FSL_FSL_SAGE_BREAKDOWN.md`](../../CSE_FSL_FSL_SAGE_BREAKDOWN.md#paper-vs-original-code-changed-after-review).
+> Current results: [`../mnist-iid-n10-r11/`](../mnist-iid-n10-r11/). This page is
+> kept as a record; statements a review found wrong are corrected inline.
+
 **Paper:** Mu & Shen, *Communication and Storage Efficient Federated Split
 Learning*, arXiv:2302.05599.
 
@@ -30,7 +38,9 @@ All units are MiB (1024² bytes), which is what the benchmark table calls "MB".
 ## Communication: 938.84 MiB total
 
 Every row shows how many times something was sent × its size. **Expected** is
-the count the paper's algorithm predicts. Every row matched (✓).
+the count from the original code's schedule. Every row matched (✓), but that
+only shows the code followed its own rule: the papers' pseudocode gives 4
+uploads per round, not 5 (and FSL-SAGE also broadcasts x_c⁰ first).
 
 | # | What is sent | Direction | When (paper) | Count | Expected | Size each | MiB |
 |---|---|---|---|---:|---:|---:|---:|
@@ -52,8 +62,10 @@ the count the paper's algorithm predicts. Every row matched (✓).
 | Cut share | 300.29 / 938.84 | 32% |
 
 **How to read it:**
-- **Cut traffic (C1, C2).** This is identical to FSL-SAGE: same h, same
-  batches, 5 uploads per client per round of 2 MiB each.
+- **Cut traffic (C1, C2).** Identical to FSL-SAGE here: both old
+  implementations uploaded the FIRST batch of each 5-batch window, 5 uploads
+  per client per round. CSE-FSL's paper (Eq.8, Fig.2) uploads the LAST batch
+  of each window, which is 4 per round.
 - **No gradient comes back (C3 = 0).** The client gets its training signal
   from a small local auxiliary head instead of the server.
 - **The aux model dominates (W3 + W4 = 481.76 MiB, 51% of everything sent).**

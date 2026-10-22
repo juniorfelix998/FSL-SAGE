@@ -1,5 +1,13 @@
 # FSL-SAGE: MNIST IID, 10 clients, 3 rounds
 
+> **Superseded.** These results were produced with the **original** CSE-FSL and
+> FSL-SAGE code, before it was changed to follow each paper's pseudocode. The
+> differences (4 uploads per round instead of 5; FSL-SAGE alignment at the round
+> boundary, initial x_c⁰ broadcast, first-order client gradient) are listed in
+> [`docs/CSE_FSL_FSL_SAGE_BREAKDOWN.md`](../../CSE_FSL_FSL_SAGE_BREAKDOWN.md#paper-vs-original-code-changed-after-review).
+> Current results: [`../mnist-iid-n10-r11/`](../mnist-iid-n10-r11/). This page is
+> kept as a record; statements a review found wrong are corrected inline.
+
 **Paper:** Nair et al., *Federated Split Learning via Smashed Activation
 Gradient Estimation*, arXiv:2505.23182 (ICML 2025).
 
@@ -31,7 +39,9 @@ All units are MiB (1024² bytes), which is what the benchmark table calls "MB".
 ## Communication: 537.37 MiB total
 
 Every row shows how many times something was sent × its size. **Expected** is
-the count the paper's algorithm predicts. Every row matched (✓).
+the count from the original code's schedule. Every row matched (✓), but that
+only shows the code followed its own rule: the papers' pseudocode gives 4
+uploads per round, not 5 (and FSL-SAGE also broadcasts x_c⁰ first).
 
 | # | What is sent | Direction | When (paper) | Count | Expected | Size each | MiB |
 |---|---|---|---|---:|---:|---:|---:|
@@ -98,9 +108,9 @@ the count the paper's algorithm predicts. Every row matched (✓).
 
 | Item | MiB | Meaning |
 |---|---:|---|
-| **Held-across-cut** | **94.01** | Part of the client's working memory that stays alive *while the client waits for the server*. It happens only on alignment iterations (round 0, first batch here): the client must wait for the freshly aligned aux model before it can backpropagate. It is already inside the 115.30, not extra. |
+| **Held-across-cut** | **94.01** (artifact; 0 under the paper) | Part of the client's working memory that stays alive *while the client waits for the server*. **Correction:** this came from the original code aligning in the middle of iteration 0; under the paper (Alg.1 l.3–4) the aligned aux model arrives at the start of a round and Held = 0. It happens only on alignment iterations (round 0, first batch here): the client must wait for the freshly aligned aux model before it can backpropagate. It is already inside the 115.30, not extra. |
 
-### Server: ≈ 606 MiB in total (10 clients)
+### Server: ≈ 606 MiB in total (10 clients) — lower bound, see correction below
 
 The server holds three groups of things. Only the first group is the value in the
 benchmark table's Server column.
@@ -129,8 +139,16 @@ Both grow with the number of clients, while 218.60 does not. Use **606** when
 asking "how much memory does an FSL-SAGE server need for 10 clients", and
 **218.60** when comparing per-device peaks across methods.
 
-605.59 may count up to ~8 MiB twice: the working-memory line already includes
-one client's stored z_f, which is also part of the 98.20 alignment buffers.
+**Correction (review).** These server numbers are lower bounds:
+- 98.20 is an end-of-run snapshot (1,000 z_f but only 256 true gradients, from
+  round 0). At steady state each buffer holds 1,000 of both, about 15.6 MiB
+  per client, which puts the full total near 664 MiB.
+- The working-memory line (26.29) only saw the 256-sample round-0 alignment;
+  the full 1,000-sample alignment happens in round 10.
+- About 2 MiB of the current client's z_f is in both the working-memory line
+  and the buffers line.
+
+All three are fixed in the 11-round results.
 
 ### System peak
 

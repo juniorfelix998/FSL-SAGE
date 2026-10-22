@@ -33,17 +33,24 @@ SERVER_FEDAVG_HOW = (
 # -- expected-count schedules ----------------------------------------------------
 # `s` is the schedule dict produced by FLAlgorithm.schedule().
 def _uploads_every_h(s):
-    '''Smashed-data uploads: one per local iteration with local_iter % h == 0,
-    for every client, every round.'''
+    '''Smashed-data uploads on the LAST batch of every h-batch window (paper
+    batch k = h, 2h, ... <= K): floor(K/h) per client per round.
+      CSE-FSL : Eq.(8) / Fig.2 -- server gets g_{x_c^{t,h-1}} "when m = h"
+      FSL-SAGE: Alg.1 l.11 / Alg.3 l.3 -- k in [K], k = 0 mod K/Q'''
     h = s['h']
     per_round = sum(
-        math.ceil(e * it / h) for e, it in zip(s['epochs'], s['iters_per_epoch'])
+        (e * it) // h for e, it in zip(s['epochs'], s['iters_per_epoch'])
     )
     return per_round * s['rounds']
 
 
 def _per_client_per_round(s):
     return s['num_clients'] * s['rounds']
+
+
+def _initial_plus_per_round(s):
+    '''FSL-SAGE Alg.2: broadcast x_c^0 (l.4) + x_c^{t+1} after every round (l.8).'''
+    return s['num_clients'] * (s['rounds'] + 1)
 
 
 def _aux_down_every_l(s):
@@ -63,25 +70,25 @@ PAPER_COMPONENTS = {
         'paper': 'CSE-FSL, Mu & Shen, arXiv:2302.05599',
         'rows': [
             ('C1', 'Smashed activations z_f, client -> server',
-             'Sec.III-B Step 2 (p.3): uploaded only when m mod h = 0',
+             'Eq.(8), Fig.2 (p.3-4): last batch of each h-batch window (m = h); N*R*floor(K/h)',
              ('cut.act_up',), _uploads_every_h, 'Cut'),
             ('C2', 'Labels y for each uploaded batch, client -> server',
-             'Step 2 (p.3): "uploads the smashed data and the labels"',
+             'Step 2 (p.3): "uploads the smashed data and the labels"; N*R*floor(K/h)',
              ('cut.labels_up',), _uploads_every_h, 'Cut'),
             ('C3', 'Gradient at the cut, server -> client',
              'p.3: never sent; client trains on its local aux loss',
              ('cut.grad_down',), _never, 'Cut'),
             ('W1', 'Client model x_c upload (for FedAvg)',
-             'Step 4, Eq.(9) (p.4): every round',
+             'Step 4, Eq.(9) (p.4): every round; N*R',
              ('weights.client_up',), _per_client_per_round, 'Weights'),
             ('W2', 'Averaged client model x_c download',
-             'Step 1 (p.3): start of every round',
+             'Step 1 (p.3): start of every round; N*R',
              ('weights.client_down',), _per_client_per_round, 'Weights'),
             ('W3', 'Aux model a_c upload (for FedAvg)',
-             'Step 4, Eq.(9) (p.4): aux is averaged every round',
+             'Step 4, Eq.(9) (p.4): aux is averaged every round; N*R',
              ('weights.aux_up',), _per_client_per_round, 'Weights'),
             ('W4', 'Averaged aux model a_c download',
-             'Step 1 (p.3): start of every round',
+             'Step 1 (p.3): start of every round; N*R',
              ('weights.aux_down',), _per_client_per_round, 'Weights'),
             ('W5', f'{SERVER_FEDAVG_NAME} (per-client x_s copies)',
              'p.3: "keep only a single server-side model" -> none',
@@ -92,25 +99,25 @@ PAPER_COMPONENTS = {
         'paper': 'FSL-SAGE, Nair et al., arXiv:2505.23182',
         'rows': [
             ('C1', 'Smashed activations z_f, client -> server',
-             'Alg.1 l.11-12; p.8: every K/Q = h local steps',
+             'Alg.1 l.11-12 / Alg.3 l.3: k in [K], k = 0 mod K/Q (K/Q = h); N*R*floor(K/h)',
              ('cut.act_up',), _uploads_every_h, 'Cut'),
             ('C2', 'Labels y for each uploaded batch, client -> server',
-             'Alg.3 l.3-4: server receives (z_f, y)',
+             'Alg.3 l.3-4: server receives (z_f, y); N*R*floor(K/h)',
              ('cut.labels_up',), _uploads_every_h, 'Cut'),
             ('C3', 'Gradient at the cut, server -> client',
              'Alg.3 l.11-12: true grads used only on the server -> never sent',
              ('cut.grad_down',), _never, 'Cut'),
             ('W1', 'Client model x_c upload (for FedAvg)',
-             'Alg.2 l.6: every round',
+             'Alg.2 l.6: every round; N*R',
              ('weights.client_up',), _per_client_per_round, 'Weights'),
-            ('W2', 'Averaged client model x_c download',
-             'Alg.2 l.7-8: every round',
-             ('weights.client_down',), _per_client_per_round, 'Weights'),
+            ('W2', 'Client model x_c download (initial + averaged)',
+             'Alg.2 l.4 (x_c^0) + l.8 (after every round); N*(R+1)',
+             ('weights.client_down',), _initial_plus_per_round, 'Weights'),
             ('W3', 'Aux model x_a upload',
              'Alg.2: aux models are never averaged -> never sent up',
              ('weights.aux_up',), _never, 'Weights'),
             ('W4', 'Aligned aux model x_a download, server -> client i',
-             'Alg.1 l.3-4, Fig.1: once every l rounds',
+             'Alg.1 l.3-4, Fig.1: start of every round t = 0 mod l; N*ceil(R/l)',
              ('weights.aux_down',), _aux_down_every_l, 'Weights'),
             ('W5', f'{SERVER_FEDAVG_NAME} (per-client x_s copies)',
              'p.8: "a single server-side model is maintained" -> none',
@@ -219,7 +226,10 @@ def render(bd):
     )
     out.append('')
     out.append('### Communication')
-    out.append('| # | What is sent | Paper | Column | Count | Expected | MiB / transfer | MiB | |')
+    out.append('✓ = the run\'s count equals the count derived from the paper\'s pseudocode '
+               '(formula and line in the Paper column).')
+    out.append('')
+    out.append('| # | What is sent | Paper | Column | Count | Paper count | MiB / transfer | MiB | |')
     out.append('|---|---|---|---|---:|---:|---:|---:|---|')
     for r in bd['comm_rows']:
         exp = '' if r['expected_count'] is None else r['expected_count']

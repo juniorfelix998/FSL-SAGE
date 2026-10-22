@@ -1,12 +1,21 @@
 # CSE-FSL vs FSL-SAGE: MNIST IID, 10 clients, 3 rounds
 
+> **Superseded.** These results were produced with the **original** CSE-FSL and
+> FSL-SAGE code, before it was changed to follow each paper's pseudocode. The
+> differences (4 uploads per round instead of 5; FSL-SAGE alignment at the round
+> boundary, initial x_c⁰ broadcast, first-order client gradient) are listed in
+> [`docs/CSE_FSL_FSL_SAGE_BREAKDOWN.md`](../../CSE_FSL_FSL_SAGE_BREAKDOWN.md#paper-vs-original-code-changed-after-review).
+> Current results: [`../mnist-iid-n10-r11/`](../mnist-iid-n10-r11/). This page is
+> kept as a record; statements a review found wrong are corrected inline.
+
 Both methods ran under identical conditions: Colab Tesla T4, ResNet-18,
 middle cut, MNIST (32×32, 3-channel), IID, seed 200, batch 256, h = 5 (FSL-SAGE
 l = 10). Per-method details are in [CSE_FSL.md](CSE_FSL.md) and
 [FSL_SAGE.md](FSL_SAGE.md). How each line is defined is in
 [../../CSE_FSL_FSL_SAGE_BREAKDOWN.md](../../CSE_FSL_FSL_SAGE_BREAKDOWN.md).
 
-Every transfer count matched the count each paper's algorithm predicts (all ✓).
+Every transfer count matched the original code's schedule (all ✓). That only shows the code
+followed its own rule; the papers' pseudocode gives 4 uploads per round, not 5.
 Units are MiB, which is what the benchmark table calls "MB".
 
 ## Summary
@@ -19,9 +28,9 @@ Units are MiB, which is what the benchmark table calls "MB".
 | **Comm: Total** | **938.84** | **537.37** | **FSL-SAGE −401.47 (−43%)** |
 | Cut share of total | 32% | 56% | |
 | Client memory | 148.80 | 133.76 | FSL-SAGE −15.04 (client never trains the aux) |
-| Held-across-cut | 0.00 | 94.01 | FSL-SAGE stalls on alignment |
+| Held-across-cut | 0.00 | 94.01 | artifact of the original code's alignment order; 0 under the paper |
 | Server memory | 176.26 | 218.60 | FSL-SAGE +42.34 (server trains the aux) |
-| Server memory incl. all clients' state | 176.26 | ≈ 606 | FSL-SAGE keeps an aux model + buffer per client |
+| Server memory incl. all clients' state | 176.26 | ≈ 606 (lower bound; ≈ 664 at steady state) | FSL-SAGE keeps an aux model + buffer per client |
 | System peak (live) | 106.28 | 123.30 | FSL-SAGE +17.02 |
 | Test accuracy (round 2) | 98.80% | 98.71% | −0.09 pt (same after 3 rounds) |
 | Latency (s) | 98.26 | 116.23 | FSL-SAGE +17.97 s (+18%) |
@@ -86,13 +95,11 @@ that is 32,118 MiB vs 1,606 MiB of aux traffic.
 
 - **FSL-SAGE's client is lighter by 15 MiB.** It keeps the aux model only to
   run it, so it doesn't need its gradients or Adam state (−24 MiB). Its working
-  memory is 9 MiB higher, because the aux model produces the gradient through
-  a second-order graph (`create_graph=True`).
-- **Held-across-cut (the clearest behavioural difference):**
-  - CSE-FSL never waits for the server.
-  - FSL-SAGE waits on alignment iterations: its client keeps 94 MiB of
-    activations alive until the newly aligned aux model arrives.
-  - With R = 3 this happens once (round 0), but the column reports the maximum.
+  memory is 9 MiB higher; the cause was not isolated (not measured).
+- **Held-across-cut:** CSE-FSL 0; FSL-SAGE 94.01. **Correction:** the 94.01
+  is an artifact of the original code aligning in the middle of iteration 0,
+  not a property of FSL-SAGE. Under the paper (Alg.1 l.3–4) the aligned aux
+  model arrives at the start of a round and Held = 0.
 
 ### Server
 
@@ -108,12 +115,13 @@ that is 32,118 MiB vs 1,606 MiB of aux traffic.
 | **Total server memory, all 10 clients** | **176.26** | **≈ 606** |
 
 - Both keep **one** server model (160.22 MiB).
-- FSL-SAGE's server also holds the aux model it is aligning (32.09), plus
-  ~10 MiB more working memory for the stored z_f buffer and the alignment
-  pass.
+- FSL-SAGE's server also holds the aux model it is aligning (32.09). Its
+  ~10 MiB of extra working memory comes from the 256-sample round-0 alignment
+  only; the full 1,000-sample alignment (round 10) is not in this run.
 - FSL-SAGE's protocol also keeps, **per client**, an alignment buffer and the
   other clients' aux models with their Adam state. These scale with N: 387 MiB
-  at 10 clients, so a real server would need ≈ 606 MiB. They are listed
+  at 10 clients, so a real server would need ≈ 606 MiB here — a lower bound:
+  the buffers line is a round-0 snapshot (≈ 664 MiB at steady state). They are listed
   separately so the Server total (table value) stays a per-device peak.
 
 ### System peak
