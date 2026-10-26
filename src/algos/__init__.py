@@ -182,8 +182,10 @@ class FLAlgorithm(ABC):
             'client_relay', n_handovers * calculate_load(model)
         )
 
-    def charge_weights_scalars(self, nbytes):
-        self.ledger.charge_weights('scalars', nbytes)
+    def charge_weights_zo(self, kind, nbytes):
+        '''HO-SFL dimension-free aggregation traffic; kind is one of
+        zo_seeds_down, zo_scalars_up, zo_scalars_down, zo_sync_down.'''
+        self.ledger.charge_weights(kind, nbytes)
 
     # -- time + memory phases --------------------------------------------
     # A single bracket records BOTH elapsed time and peak retained-activation
@@ -278,6 +280,7 @@ class FLAlgorithm(ABC):
             'iters_per_epoch': [len(c.train_loader) for c in self.clients],
             'h': self.cfg.get('server_update_interval'),
             'l': self.cfg.get('align_interval'),
+            'P': self.cfg.get('zo_p'),
         }
 
     def server_side_extra_memory(self):

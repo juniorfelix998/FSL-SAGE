@@ -1,36 +1,58 @@
 # ------------------------------------------------------------------------------
-# Ported from HKU-WILL-Lab/HO-SFL's HO_SFL_CV/src/runner/ho_sfl_runner.py — this
-# IS the paper's own proposed method (arXiv:2603.14773, "HO-SFL: Hybrid-Order
-# Split Federated Learning with Backprop-Free Clients and Dimension-Free
-# Aggregation"), not a third-party reimplementation.
+# HO-SFL (Hybrid-Order Split Federated Learning), arXiv:2603.14773. Ported from
+# the authors' HKU-WILL-Lab/HO-SFL, HO_SFL_CV/src/runner/ho_sfl_runner.py, and
+# run against the paper's pseudocode (Alg. 1 main loop, Alg. 2 ZOScalar,
+# Alg. 3 ClientSync).
 #
-# Two mechanics carried over faithfully from the reference, both load-bearing:
-#   - The client model is a SINGLE shared instance across all clients (no
-#     per-client weight divergence, hence nothing to aggregate as a weight
-#     vector) — this *is* the paper's "dimension-free aggregation": only P
-#     scalars + P seeds are combined across clients each round, not a
-#     model-weight vector.
-#   - The server does real backprop (first-order); the client only ever does
-#     forward passes under random parameter perturbations (zeroth-order),
-#     reusing the server's true activation-gradient as a fixed direction to
-#     project each perturbed activation onto. This is the "hybrid-order" part.
+# One HO-SFL ITERATION per client batch (paper Alg.1 with the batch's client as
+# the participating set; the authors' runner does the same per `next(loader)`):
+#   1. ClientSync (Alg.3 L3): the client catches up on iterations it missed
+#      since its last turn by fetching their P seeds + P averaged scalars.
+#   2. Server broadcasts P seeds (Alg.1 L4).
+#   3. Client forward, NO backward; uploads activation z + labels (L10).
+#   4. Server forward + backward + optimizer step on its ONE model (L14-18,
+#      Eq.14), sends the activation gradient lambda back (L19).
+#   5. Client runs P perturbed forwards (Alg.2), projects each onto lambda:
+#      v_p = lambda . (z~_p - z) (Eq.17), uploads the P scalars (L23).
+#   6. Server averages them and broadcasts v_bar (L26); with one participating
+#      client v_bar = v.
+#   7. Client forms g = (1/(P mu)) sum_p v_bar_p u_p (Eq.19) and steps AdamW (L28).
+# No model weights ever cross the network: clients stay identical by replaying
+# the same seeds and scalars, which is why one shared client model stands for
+# all of them here. Byte sizes follow the authors' communicator.py: tensors at
+# numel x element_size, 4 B per seed and per scalar.
 #
-# Known, documented simplifications vs. the reference (see plan discussion):
-#   - Full client participation every round (no sub-round sampling/staleness
-#     bookkeeping) — this harness has no sub-round client-sampling mechanism;
-#     the paper's algorithm reduces exactly to this when sampled == total.
-#   - One real batch per client per round: `client_step` does real work only
-#     at the first (epoch, iter) of the round; every other call that round is
-#     a no-op. A freshly-shuffled DataLoader's first batch is a fresh random
-#     draw each round, closely analogous to the reference's own per-round
-#     `next(loader)`.
+# Differences from the original port (changed after review):
+#   - The port buffered all of a round's batches and made ONE server step and
+#     ONE client step per round (11 updates in an 11-round run). Now every batch
+#     is a full iteration: one server step and one client step per batch.
+#   - Aggregation traffic was one lump `weights.scalars` charge per round; it is
+#     now charged per item: zo_seeds_down, zo_scalars_up, zo_scalars_down,
+#     zo_sync_down.
+#   - Benchmark settings (same for every method, not the authors' defaults):
+#     batch 256 (authors 32), 10 clients (authors 100), and a round is one
+#     local epoch of every client (authors: one batch per sampled client, run
+#     to a 120k-sample budget). Methods are thus compared at equal samples
+#     processed, as the authors themselves compare them.
+#   - Client sampling. Paper Alg.1 L4 samples a random subset S_t of size K at
+#     the start of each round (authors' code: 10 of 100 clients, one batch
+#     each). Here S_t = {the client whose batch it is}: clients take turns, and
+#     every client trains on all its data every round, as in every other method
+#     of this benchmark (the shared loop has no client sampling). |S_t| = 1 is a
+#     valid case of Alg.1. What sampling implies for communication is kept:
+#     clients that missed iterations catch up via ClientSync (Alg.3, row Z4).
+#   - Benchmark fairness: RANDOM init for every method (use_pretrained=false,
+#     freeze_bn=false), unlike the paper's ImageNet-pretrained ResNet-18. With
+#     random BatchNorm the client trains in train() mode like every other
+#     method (the reference pins it to eval(), which only works with frozen
+#     pretrained BN: from random init the running stats would never move).
+#     Clean and perturbed forwards then normalise with the same batch's
+#     statistics, so v_p stays a true perturbation difference.
 # ------------------------------------------------------------------------------
-import time
 import numpy as np
 import torch
 
 from algos import register_algorithm, FLAlgorithm
-from utils.comm import tensor_bytes
 from models.pretrained import (
     pretrained_resnet18_state_dict, load_pretrained_client,
     load_pretrained_server, freeze_batchnorm_affine
@@ -69,23 +91,15 @@ class HO_SFL(FLAlgorithm):
     def __init__(self, *args, **kwargs):
         super(HO_SFL, self).__init__(*args, **kwargs)
 
-        # ImageNet-pretrained init + frozen BN affine, matching the
-        # reference's conf/base.yaml (`model.use_pretrained: True`,
-        # `model.freeze_bn: True`), applied BEFORE the model is shared out
-        # below so every client sees the same weights.
-        #
-        # This is load-bearing, not cosmetic: the client here is updated ONLY
-        # by a P-direction zeroth-order estimator, whose convergence scales
-        # with d/P. At ~683k client params and P=5 it is untrainable from
-        # scratch in a few hundred rounds -- the reference works because the
-        # client starts near-optimal and the first-order server does the
-        # learning. Compounding that, the client is pinned to .eval() for the
-        # whole run (see special_models_train_mode below, faithful to the
-        # reference), so from a random init its BatchNorm running stats stay at
-        # mean 0 / var 1 forever and the stem never normalises at all. Omitting
-        # this was the dominant cause of this method's near-chance accuracy.
-        self.use_pretrained = self.cfg.get('use_pretrained', True)
-        self.freeze_bn = self.cfg.get('freeze_bn', True)
+        # Initialisation. The paper and the authors' conf/base.yaml start from
+        # an ImageNet-pretrained ResNet-18 with frozen BatchNorm
+        # (use_pretrained / freeze_bn = True). This benchmark starts EVERY
+        # method from the same random init, so both default to False here
+        # (algorithm/ho_sfl.yaml); set them True to reproduce the paper's own
+        # setting. Applied BEFORE the model is shared out below, so every
+        # client sees the same weights either way.
+        self.use_pretrained = self.cfg.get('use_pretrained', False)
+        self.freeze_bn = self.cfg.get('freeze_bn', False)
         if self.use_pretrained:
             full_state = pretrained_resnet18_state_dict()
             load_pretrained_client(self.clients[0].model, full_state)
@@ -109,7 +123,15 @@ class HO_SFL(FLAlgorithm):
 
         self.P = self.cfg.zo_p
         self.mu = self.cfg.zo_mu
-        self._round_buf = []
+        # iteration bookkeeping for ClientSync (Alg.3): global iteration count
+        # and the iteration each client last took part in
+        self._iter = 0
+        self._last_seen = [0] * len(self.clients)
+        # Alg.1 L2: the server keeps every iteration's P seeds + P averaged
+        # scalars so lagging clients can catch up (Alg.3). Only its size
+        # matters here (the shared model never needs replaying), so it is
+        # tracked as a count and reported in server_side_extra_memory().
+        self._history_iters = 0
 
         # The single-shared-client-model premise above IS the paper's
         # dimension-free aggregation, and aggregate() below relies on it by
@@ -138,124 +160,105 @@ class HO_SFL(FLAlgorithm):
         return self.server.model(self.aggregated_client(x))
 
     def special_models_train_mode(self, t):
-        self._round_buf = []
-        self.server.optimizer.zero_grad()
-        self.clients[0].optimizer.zero_grad()
-        # critical: keep the shared client model in eval() so the repeated
-        # zeroth-order probe forward passes in aggregate() don't corrupt
-        # BatchNorm running stats. This overrides the base class's default
-        # train_mode(), which already set every client model to .train() --
-        # this hook runs after that default loop, so it wins.
-        self.clients[0].model.eval()
+        # Pretrained + frozen BN (the paper's setting): keep the client in
+        # eval() so the perturbed forwards never touch BN statistics, exactly
+        # as the reference does. Random init (this benchmark's default): leave
+        # the client in train() like every other method -- see the header.
+        if self.freeze_bn:
+            self.clients[0].model.eval()
 
     def client_step(self, rd_cl_ep_it, x, y):
         t, i, j, k = rd_cl_ep_it
+        client = self.clients[i].model
+        s = 8 if self.use_64bit else 4          # bytes per scalar
+        SEED = 4                                # bytes per seed (int32)
 
-        # MATCHED ROUNDS: this method's reference implementation draws a single
-        # `next(loader)` per round, so this file used to no-op on every batch
-        # except (j,k)==(0,0). That made one round mean 1 optimizer step here
-        # and a full local epoch (24 steps on MNIST) everywhere else, and the
-        # benchmark papered over it with a 24x round multiplier for this method
-        # alone. The benchmark now defines a round as ONE LOCAL EPOCH for every
-        # method, so the zeroth-order update below runs on every batch, exactly
-        # like every first-order method's step does. The ZO update rule itself
-        # is untouched -- only how many batches it is applied to.
+        # 1. ClientSync (Alg.3 L3): seeds + averaged scalars of every missed
+        #    iteration. One shared model stands for all clients here, so the
+        #    state is already current; only the traffic is charged.
+        missed = self._iter - self._last_seen[i]
+        if missed > 0:
+            self.charge_weights_zo('zo_sync_down', missed * self.P * (SEED + s))
 
-        # client forward under no_grad -- a zeroth-order client retains no
-        # autograd activations, so its activation peak is ~0 by construction
+        # 2. Seeds for this iteration (Alg.1 L4)
+        seeds = [int(np.random.randint(0, 1_000_000)) for _ in range(self.P)]
+        self.charge_weights_zo('zo_seeds_down', self.P * SEED)
+
+        # 3. Client forward, no backward (Alg.1 L9-10)
         with self.phase('client', i):
             with torch.no_grad():
-                a_m = self.clients[i].model(x)
-
+                a_m = client(x)
+        # The client keeps its own a_m (step 5 needs it); what reaches the
+        # server is a copy, so the upload is charged -- and held as server
+        # memory -- on that copy, and a_m stays client memory.
         server_input = a_m.clone().detach().requires_grad_(True)
+        self.charge_cut_activation(server_input)
+        self.charge_cut_labels(y)     # loss is computed server-side
+
+        # 4. Server first-order update on its single model (Alg.1 L14-19)
         with self.phase('server', i):
+            self.server.optimizer.zero_grad()
             out = self.server.model(server_input)
             loss = self.criterion(out, y)
-
             with torch.no_grad():
                 train_loss = loss.item()
                 _, predicted = torch.max(out.data, 1)
                 train_correct = predicted.eq(y.view_as(predicted)).sum().item()
-
-            scale = loss.new_tensor(1.0 / len(self.clients))
-            loss.backward(scale)
-
+            loss.backward()
+            self.server.optimizer.step()
         g_a_m = server_input.grad.clone().detach()
-        self.charge_cut_activation(a_m)
-        self.charge_cut_labels(y)     # loss is computed server-side
         self.charge_cut_gradient(g_a_m)
-
-        # This buffer is CLIENT-resident: the zeroth-order probe in aggregate()
-        # replays the client forward locally against the downloaded g_a_m, so
-        # the client must keep x, a_m and g_a_m alive until then.
-        self._round_buf.append((x.detach(), a_m.detach(), g_a_m))
         self.hold('client', x, a_m, g_a_m, i=i)
 
+        # 5. ZOScalar (Alg.2): P perturbed forwards projected onto lambda
+        v = torch.zeros(self.P, device=a_m.device, dtype=a_m.dtype)
+        with self.phase('client', i):
+            for p_idx, seed in enumerate(seeds):
+                _perturb(client, seed, self.mu)
+                with torch.no_grad():
+                    a_tilde = client(x)
+                self.hold('client', a_tilde, i=i)
+                v[p_idx] = torch.sum((a_tilde - a_m) * g_a_m)
+                _perturb(client, seed, -self.mu)
+                del a_tilde
+        self.charge_weights_zo('zo_scalars_up', self.P * s)        # Alg.1 L23
+
+        # 6. Server averages and broadcasts (Alg.1 L26); one participant
+        bar_v = v
+        self.charge_weights_zo('zo_scalars_down', self.P * s)
+
+        # 7. Client update (Alg.1 L27-28, Eq.19): g = (1/(P mu)) sum v_bar_p u_p
+        with self.phase('client', i):
+            self.clients[i].optimizer.zero_grad(set_to_none=False)
+            scale = 1.0 / (self.P * self.mu)
+            for p_idx, seed in enumerate(seeds):
+                _perturb_accumulate_grad(client, seed, bar_v[p_idx].item() * scale)
+            self.clients[i].optimizer.step()
+
+        self._iter += 1
+        self._last_seen[i] = self._iter
+        self._history_iters += 1            # Alg.1 L2 history grows by one entry
         return {
             'acc': train_correct / y.size(dim=0),
             'loss': train_loss,
         }
 
+    def server_side_extra_memory(self):
+        '''Alg.1 L2: history of seeds + averaged scalars for ClientSync, one
+        entry per iteration, kept on the server for the whole run.'''
+        s = 8 if self.use_64bit else 4
+        nbytes = self._history_iters * self.P * (4 + s)
+        return [{
+            'item': f'catch-up history: {self._history_iters} iterations x P '
+                    f'x (4 B seed + {s} B scalar)',
+            'mb': nbytes / 1024 ** 2,
+            'note': 'paper Alg.1 L2 "history buffers for seeds and scalars"',
+        }]
+
     def aggregate(self):
-        ret_dict = {}
-        n = len(self.clients)
-
-        t0 = time.time()
-        for p in self.server.model.parameters():
-            if p.grad is not None:
-                p.grad.div_(n)
-        self.server.optimizer.step()
-        ret_dict['server_optimizer_step_time'] = time.time() - t0
-
-        # nothing buffered this round (shouldn't normally happen) -- still
-        # need to (re)establish aggregated_client for eval_mode()/full_model
-        if len(self._round_buf) == 0:
-            self.aggregated_client = self.clients[0].model
-            return ret_dict
-
-        t0 = time.time()
-        seeds = [int(np.random.randint(0, 1_000_000)) for _ in range(self.P)]
-        seeds_tensor = torch.tensor(seeds, dtype=torch.int32)
-
-        # The probe loop below is CLIENT-side compute even though it lives in
-        # aggregate(): it replays the client's own forward against the already
-        # downloaded g_a_m. It must be bracketed as such, or HO-SFL's client
-        # memory/time would read as "static only" -- a fake result that would
-        # flatter the method.
-        all_v = []
-        with self.phase('client', 0):
-            for (x_buf, a_m, g_a_m) in self._round_buf:
-                v = torch.zeros(self.P, device=self.device)
-                for p_idx, seed in enumerate(seeds):
-                    _perturb(self.clients[0].model, seed, self.mu)
-                    with torch.no_grad():
-                        a_tilde = self.clients[0].model(x_buf)
-                    diff = a_tilde - a_m
-                    v[p_idx] = torch.sum(diff * g_a_m)
-                    _perturb(self.clients[0].model, seed, -self.mu)
-                all_v.append(v)
-
-            bar_v = torch.stack(all_v).mean(dim=0)
-            scale = 1.0 / (self.P * self.mu)
-            for p_idx, seed in enumerate(seeds):
-                _perturb_accumulate_grad(
-                    self.clients[0].model, seed, bar_v[p_idx].item() * scale
-                )
-            self.clients[0].optimizer.step()
-        ret_dict['zo_probe_compute_time'] = time.time() - t0
-
-        # dimension-free aggregation: only P scalars (per client, uplink) and
-        # P scalars + P seeds (broadcast back to every client, downlink) are
-        # exchanged -- never a full client-model weight vector. This is the
-        # number that should come out far smaller than every other method's
-        # weight-transfer cost.
-        n_buffered = len(self._round_buf)
-        self.charge_weights_scalars(
-            (tensor_bytes(v) + tensor_bytes(bar_v) + tensor_bytes(seeds_tensor))
-            * n_buffered
-        )
-
+        # Nothing to aggregate: every update already happened per iteration in
+        # client_step, and no model weights are exchanged (dimension-free).
         self.aggregated_client = self.clients[0].model
-        return ret_dict
+        return {}
 
 # ------------------------------------------------------------------------------

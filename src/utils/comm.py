@@ -8,8 +8,9 @@
 # is the single place a transfer gets priced, and it additionally records WHICH
 # KIND of traffic each byte was, so the headline ranking is inspectable:
 #   * CSE-FSL / FSL-SAGE should show cut.grad_down == 0 (no gradient crosses back)
-#   * HO-SFL should show near-zero weights.* against a nonzero cut.grad_down
-#     (dimension-free aggregation: P scalars + P seeds, never a weight vector)
+#   * HO-SFL should show full-tensor cut traffic (activation up, gradient down
+#     every batch) but near-zero weights.*: its aggregation is dimension-free,
+#     P seeds + P scalars per iteration, never a weight vector
 #   * the zeroth-order methods' cost should sit almost entirely in cut.act_up
 #   * vanilla SL should show weights.client_relay only -- it never aggregates,
 #     but it does MOVE one model from client to client, which is not the same
@@ -35,7 +36,12 @@ WEIGHT_CATEGORIES = (
     'client_relay',  # sequential-SL handover: client i -> client i+1, ONE way
     'aux_up', 'aux_down',
     'server_up', 'server_down',
-    'scalars',       # HO-SFL's dimension-free aggregation (scalars + seeds)
+    # HO-SFL's dimension-free aggregation (paper Alg.1/3): no weight vector,
+    # only P seeds + P scalars per iteration, itemised so each can be counted
+    'zo_seeds_down',    # P seeds broadcast per iteration (Alg.1 L4)
+    'zo_scalars_up',    # P projection scalars per iteration (Alg.1 L23)
+    'zo_scalars_down',  # P averaged scalars broadcast per iteration (Alg.1 L26)
+    'zo_sync_down',     # catch-up seeds + scalars for missed iterations (Alg.3 L3)
 )
 
 

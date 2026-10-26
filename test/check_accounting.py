@@ -511,22 +511,37 @@ def test_comm_closed_form():
     check_eq("HOSL charges no weight traffic (non-federated)",
              res.comm_load_weights[-1], 0)
 
-    # ---- HO-SFL: dimension-free aggregation ---------------------------
+    # ---- HO-SFL: one iteration per batch, dimension-free aggregation ----
+    P = 3
     cfg, res = build_run('ho_sfl', M, N, B, R, extra_algo={
         'optimizer': 'adamw', 'lr': 1e-3, 'betas': [0.9, 0.999],
-        'weight_decay': 1e-4, 'zo_p': 3, 'zo_mu': 1e-3,
-        # the tiny stand-in model is not a ResNet-18, so the pretrained loader
-        # (which a real run does use -- see src/models/pretrained.py) is off here
+        'weight_decay': 1e-4, 'zo_p': P, 'zo_mu': 1e-3,
+        # benchmark default: same random init as every method
         'use_pretrained': False, 'freeze_bn': False,
     })
     bd = res.comm_breakdown
-    # matched rounds: every batch of the local epoch, like every other method
-    check_eq("HO-SFL cut.act_up (every batch, matched rounds)",
+    K = len(bs_list)
+    iters = R * M * K                     # one HO-SFL iteration per batch
+    # paper Alg.1 L10 / L19: activation up, labels up, gradient down, EVERY batch
+    check_eq("HO-SFL cut.act_up (every batch, Alg.1 L10)",
              last(bd, 'cut.act_up'), R * M * sum(act_bytes(b) for b in bs_list))
-    check("HO-SFL weight traffic is scalars only, never a weight vector",
-          last(bd, 'weights.scalars') == res.comm_load_weights[-1]
-          and res.comm_load_weights[-1] > 0,
-          f"scalars={last(bd, 'weights.scalars')} total={res.comm_load_weights[-1]}")
+    check_eq("HO-SFL cut.labels_up (every batch)",
+             last(bd, 'cut.labels_up'), R * M * sum(label_bytes(b) for b in bs_list))
+    check_eq("HO-SFL cut.grad_down = full activation gradient every batch (Alg.1 L19)",
+             last(bd, 'cut.grad_down'), R * M * sum(act_bytes(b) for b in bs_list))
+    # Alg.1 L4 / L23 / L26: P seeds down, P scalars up, P averaged scalars down
+    for key in ('zo_seeds_down', 'zo_scalars_up', 'zo_scalars_down'):
+        check_eq(f"HO-SFL weights.{key} = iterations x P x 4 B",
+                 last(bd, f'weights.{key}'), iters * P * 4)
+    # Alg.3 L3: catch-up = missed iterations x P x (4 B seed + 4 B scalar).
+    # Clients train in turn: round 0 client i missed i*K; later rounds each
+    # client missed the other (M-1) clients' K iterations.
+    missed = K * sum(range(M)) + (R - 1) * M * (M - 1) * K
+    check_eq("HO-SFL weights.zo_sync_down (Alg.3 catch-up)",
+             last(bd, 'weights.zo_sync_down'), missed * P * 8)
+    check_eq("HO-SFL sends no model weights (dimension-free)",
+             last(bd, 'weights.client_up') + last(bd, 'weights.client_down'), 0)
+    check_paper_rows("HO-SFL", res)
     # Dimension-free aggregation: HO-SFL sends (scalar, seed) pairs per update
     # rather than a weight vector, so its aggregation traffic scales with the
     # NUMBER OF UPDATES and not with the model's parameter count. The margin over

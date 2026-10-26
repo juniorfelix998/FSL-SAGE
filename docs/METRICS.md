@@ -98,7 +98,7 @@ completely different reasons:
 |---|---|---|
 | DSL-Aux, HOSL | **0** | Every client owns an independently constructed model that is never shared, averaged, or handed on. Nothing crosses the wire. Physically zero. |
 | Vanilla-SL | **the relay** | Never aggregates either -- but it *relays* one client-side model from each client to the next. Movement without aggregation still costs bytes. |
-| HO-SFL | **0.04** | Also shares one model, but prices its synchronization as the paper's dimension-free scalar + seed exchange rather than as a model transfer. |
+| HO-SFL | **≈ 0** | Also shares one model, but prices its synchronization as the paper's dimension-free scalar + seed exchange rather than as a model transfer: per iteration P seeds down, P scalars up, P averaged scalars down (4 B each), plus catch-up for missed iterations. (0.04 was the old port's figure, from one lump charge per round.) |
 
 **Vanilla-SL's relay used to be charged zero, and that was a bug.**
 `src/algos/vanilla_sl.py` aliases a single `nn.Module` across every client and
@@ -152,8 +152,9 @@ def tensor_bytes(t):
 
 Weight categories are `client_up/down`, `aux_up/down`, `server_up/down`,
 `client_relay` (the sequential-SL handover -- one way, no aggregator involved),
-plus `scalars` for HO-SFL's dimension-free aggregation (scalars + seeds, never a
-weight vector).
+plus HO-SFL's dimension-free aggregation, itemised as `zo_seeds_down`,
+`zo_scalars_up`, `zo_scalars_down` and `zo_sync_down` (paper Alg.1 L4/L23/L26 and
+Alg.3 catch-up; never a weight vector).
 
 ### Granularity
 Cut traffic is charged **per batch, per client**, inside `client_step`. Weight
@@ -239,7 +240,7 @@ Subtract it and the picture changes completely:
 | FSL-SAGE | 47.42 | 0.00 | 47.42 |
 | LocFedMix-SL | 32.22 | 0.00 | 32.22 |
 | Vanilla-SL | 15.68 | 0.00 | 15.68 |
-| HO-SFL | 0.04 | 0.00 | 0.04 |
+| HO-SFL | 0.04 (old port) | 0.00 | 0.04 |
 | DSL-Aux, HOSL | 0.00 | 0.00 | 0.00 |
 
 **The four apparently-expensive methods collapse to ≈31.4 MB — the same as
@@ -268,7 +269,7 @@ A row that violates its signature is a bug, not a finding.
 | Han-et-al (LGL-SL) | **0** | > 0 | local losses both sides |
 | FedSplitX | **0** | > 0 | collaborative local loss both sides, M=3 auxiliary heads |
 | HOSL | **0** | **0** | zeroth-order, shares nothing; **2Q+1 `act_up` and 2Q `scalar_down` per batch** |
-| HO-SFL | > 0 | > 0, `scalars` only | client needs the cut gradient for its ZO probe |
+| HO-SFL | > 0 | > 0, `zo_*` only | client needs the cut gradient for its ZO probe |
 | MU-SplitFed | **0** | > 0 | 3× `act_up` (fixed + two probes), 1 `scalar_down` |
 | LocFedMix-SL | > 0 | > 0 | server-side Mixup; the *regularizer* is local, the cut gradient is real |
 

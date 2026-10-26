@@ -14,7 +14,9 @@ weight_decay  : 0.0001
 # catastrophic cancellation, so the estimator was reading mostly rounding noise.
 zo_p          : 5
 zo_mu         : 1e-3
-# matches the reference's conf/base.yaml -- see src/models/pretrained.py for why
-# a pretrained client is load-bearing for a zeroth-order method, not optional.
-use_pretrained: true
-freeze_bn     : true
+# Benchmark fairness: every method starts from the SAME random init, so HO-SFL
+# does not get the paper's ImageNet-pretrained ResNet-18 + frozen BN (the only
+# deliberate deviation from the paper; see src/algos/ho_sfl.py header). Set both
+# to true to reproduce the paper's own setting.
+use_pretrained: false
+freeze_bn     : false

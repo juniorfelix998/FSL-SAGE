@@ -14,7 +14,7 @@
 # Units are MiB (1024**2 bytes), the same unit as the benchmark table's "MB"
 # columns.
 #
-# Only CSE-FSL and FSL-SAGE have paper-labelled rows so far; any other method
+# CSE-FSL, FSL-SAGE and HO-SFL have paper-labelled rows; any other method
 # falls back to the raw ledger categories.
 # ------------------------------------------------------------------------------
 import math
@@ -60,6 +60,20 @@ def _aux_down_every_l(s):
 
 def _never(s):
     return 0
+
+
+def _every_batch(s):
+    '''HO-SFL: one iteration per client batch -> N*R*K (K batches per round).'''
+    return sum(e * it for e, it in zip(s['epochs'], s['iters_per_epoch'])) * s['rounds']
+
+
+def _sync_events(s):
+    '''HO-SFL ClientSync (Alg.3): a client catches up whenever it missed other
+    clients' iterations since its last turn. Clients train one after another,
+    so every client's first batch of a round needs one -- except client 0 in
+    round 0, which has missed nothing: N*R - 1 (0 with a single client).'''
+    n = s['num_clients']
+    return 0 if n < 2 else n * s['rounds'] - 1
 
 
 # -- paper-labelled rows ---------------------------------------------------------
@@ -121,6 +135,41 @@ PAPER_COMPONENTS = {
              ('weights.aux_down',), _aux_down_every_l, 'Weights'),
             ('W5', f'{SERVER_FEDAVG_NAME} (per-client x_s copies)',
              'p.8: "a single server-side model is maintained" -> none',
+             ('weights.server_up', 'weights.server_down'), _never, 'Weights'),
+        ],
+    },
+    'ho_sfl': {
+        'paper': 'HO-SFL, arXiv:2603.14773',
+        'rows': [
+            ('C1', 'Smashed activations z, client -> server',
+             'Alg.1 L10: every iteration (= every batch); N*R*K',
+             ('cut.act_up',), _every_batch, 'Cut'),
+            ('C2', 'Labels y with each activation, client -> server',
+             'Alg.1 L10, p.4: "transmits z and label y"; N*R*K',
+             ('cut.labels_up',), _every_batch, 'Cut'),
+            ('C3', 'Activation gradient lambda, server -> client',
+             'Alg.1 L19, Eq.(13): every iteration; N*R*K',
+             ('cut.grad_down',), _every_batch, 'Cut'),
+            ('W1', 'Client model x_c upload',
+             'p.5-6, Table 4: dimension-free -> never',
+             ('weights.client_up',), _never, 'Weights'),
+            ('W2', 'Client model x_c download',
+             'p.5-6, Table 4: dimension-free -> never',
+             ('weights.client_down',), _never, 'Weights'),
+            ('Z1', 'P projection scalars, client -> server',
+             'Alg.1 L23, Eq.(17): every iteration, P x 4 B; N*R*K',
+             ('weights.zo_scalars_up',), _every_batch, 'Weights'),
+            ('Z2', 'P seeds, server -> client',
+             'Alg.1 L4: every iteration, P x 4 B; N*R*K',
+             ('weights.zo_seeds_down',), _every_batch, 'Weights'),
+            ('Z3', 'P averaged scalars, server -> client',
+             'Alg.1 L26, Eq.(18): every iteration, P x 4 B; N*R*K',
+             ('weights.zo_scalars_down',), _every_batch, 'Weights'),
+            ('Z4', 'Catch-up seeds + scalars for missed iterations',
+             'Alg.3 L3: at each client\'s first batch of a round; N*R - 1',
+             ('weights.zo_sync_down',), _sync_events, 'Weights'),
+            ('W5', f'{SERVER_FEDAVG_NAME} (per-client x_s copies)',
+             'Eq.(14), Alg.1 L18: one server model -> none',
              ('weights.server_up', 'weights.server_down'), _never, 'Weights'),
         ],
     },
@@ -222,7 +271,7 @@ def render(bd):
     out.append(
         f"N = {s['num_clients']} clients, R = {s['rounds']} rounds, "
         f"local iters/round = {[e * it for e, it in zip(s['epochs'], s['iters_per_epoch'])]}, "
-        f"h = {s.get('h')}, l = {s.get('l')}.  Units: MiB (= table 'MB')."
+        f"h = {s.get('h')}, l = {s.get('l')}, P = {s.get('P')}.  Units: MiB (= table 'MB')."
     )
     out.append('')
     out.append('### Communication')

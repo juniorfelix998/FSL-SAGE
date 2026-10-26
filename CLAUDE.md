@@ -15,7 +15,7 @@ Code-available (USE their code, port into this harness, DO NOT reproduce their p
 numbers — just run them in our setting):
 - CSE-FSL, FSL-SAGE, SplitFedv1, SplitFedv2  — already in the FSL-SAGE harness (this repo)
 - MU-SplitFed  — standalone repo: https://github.com/Johnny-Zip/MU-SplitFed  (needs porting in)
-- HO-SFL       — standalone repo: https://github.com/HKU-WILL-Lab/HO-SFL  (needs porting in)
+- HO-SFL       — standalone repo: https://github.com/HKU-WILL-Lab/HO-SFL  (ported: src/algos/ho_sfl.py)
 
 No-code (implement from paper, AI-assisted, MUST reproduce the paper's reported numbers
 before entering the benchmark; label these clearly as reimplementations):
@@ -23,8 +23,10 @@ before entering the benchmark; label these clearly as reimplementations):
   losses), LocFedMix-SL, FedSplitX, HOSL (non-federated hybrid-order)
 
 ## The four metrics (log these uniformly for EVERY method)
-1. Communication — CUT: activation + gradient bytes across the cut (a scalar-only method
-   like HO-SFL is charged only its scalar bytes, not a full tensor)
+1. Communication — CUT: activation + gradient bytes across the cut (a method that sends
+   only scalars across the cut, like HOSL's loss differences, is charged only those
+   bytes; HO-SFL's cut is full tensors -- activation up, gradient down -- and only its
+   aggregation is scalars, counted under WEIGHTS)
 2. Communication — WEIGHTS: model-weight / aggregation traffic (≈0 for non-federated methods)
 3. Communication — TOTAL: sum of cut + weights (the value we rank on)
    [The existing repo likely logs ONE combined comm number — splitting it into cut vs
