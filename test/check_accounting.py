@@ -542,6 +542,41 @@ def test_comm_closed_form():
     check_eq("HO-SFL sends no model weights (dimension-free)",
              last(bd, 'weights.client_up') + last(bd, 'weights.client_down'), 0)
     check_paper_rows("HO-SFL", res)
+
+    # ---- HO-SFL with client sampling: K = 2 of 3 clients per iteration ----
+    M3, KS = 3, 2
+    cfg, res = build_run('ho_sfl', M3, N, B, R, extra_algo={
+        'optimizer': 'adamw', 'lr': 1e-3, 'betas': [0.9, 0.999],
+        'weight_decay': 1e-4, 'zo_p': P, 'zo_mu': 1e-3,
+        'use_pretrained': False, 'freeze_bn': False, 'sampled_clients': KS,
+    })
+    bd = res.comm_breakdown
+    groups = res.breakdown['schedule']['groups']
+    # fair sampling: every client uses each of its batches once per round
+    from collections import Counter
+    used = Counter(m for S in groups for m in S)
+    check("HO-SFL(K=2) every client uses all its batches every round",
+          all(used[m] == R * K for m in range(M3)) and all(len(S) <= KS for S in groups),
+          f"used={dict(used)}")
+    check_eq("HO-SFL(K=2) cut.act_up (every batch of every client)",
+             last(bd, 'cut.act_up'), R * M3 * sum(act_bytes(b) for b in bs_list))
+    check_eq("HO-SFL(K=2) cut.grad_down (every batch of every client)",
+             last(bd, 'cut.grad_down'), R * M3 * sum(act_bytes(b) for b in bs_list))
+    for key in ('zo_seeds_down', 'zo_scalars_up', 'zo_scalars_down'):
+        check_eq(f"HO-SFL(K=2) weights.{key} = client-batches x P x 4 B",
+                 last(bd, f'weights.{key}'), R * M3 * K * P * 4)
+    # Alg.3: replay the recorded sampling sequence independently
+    last_seen, it, missed = {}, 0, 0
+    for S in groups:
+        missed += sum(it - last_seen.get(m, 0) for m in S)
+        it += 1
+        for m in S:
+            last_seen[m] = it
+    check_eq("HO-SFL(K=2) weights.zo_sync_down = replayed missed iterations x P x 8 B",
+             last(bd, 'weights.zo_sync_down'), missed * P * 8)
+    check("HO-SFL(K=2) one server/client update per group (fewer than batches)",
+          len(groups) < R * M3 * K, f"groups={len(groups)}")
+    check_paper_rows("HO-SFL(K=2)", res)
     # Dimension-free aggregation: HO-SFL sends (scalar, seed) pairs per update
     # rather than a weight vector, so its aggregation traffic scales with the
     # NUMBER OF UPDATES and not with the model's parameter count. The margin over

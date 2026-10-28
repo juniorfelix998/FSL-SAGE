@@ -20,3 +20,8 @@ zo_mu         : 1e-3
 # to true to reproduce the paper's own setting.
 use_pretrained: false
 freeze_bn     : false
+# Paper Alg.1 L4: clients sampled per iteration, |S_t|. 3 of our 10 clients,
+# as in the paper's language experiments (3 of 10). Run with
+# model.client.batch_size=107 so one update sees ~321 images, close to the
+# paper's 10 clients x 32 = 320. Set to 1 for one client per iteration.
+sampled_clients: 3

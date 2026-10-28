@@ -238,6 +238,17 @@ class FLAlgorithm(ABC):
         (cse_fsl / fsl_sage upload on the h-th batch of a window).'''
         return j == 0 and k < self.mem_probe_batches
 
+    def group_size(self):
+        '''How many clients take part in one iteration. 1 (default) = the
+        usual per-client loop; > 1 = the round runs as grouped iterations via
+        group_step() (see _run_grouped_round).'''
+        return 1
+
+    def group_step(self, batch):
+        '''One iteration over several clients' batches. `batch` is a list of
+        ((t, i, j, k), x, y). Returns {client i: metrics dict}.'''
+        raise NotImplementedError
+
     def begin_round(self, t):
         '''Round-boundary work, before any client trains in round t (e.g.
         FSL-SAGE's alignment, Alg. 1 l.3-4). No-op for most methods.'''
@@ -281,6 +292,10 @@ class FLAlgorithm(ABC):
             'h': self.cfg.get('server_update_interval'),
             'l': self.cfg.get('align_interval'),
             'P': self.cfg.get('zo_p'),
+            'K': self.group_size(),
+            # clients sampled in each grouped iteration, in order (None for
+            # the per-client loop); lets the breakdown replay Alg.3 catch-ups
+            'groups': getattr(self, 'group_log', None),
         }
 
     def server_side_extra_memory(self):
@@ -719,41 +734,49 @@ def _run_fl_algorithm(
             # rebuilds `aggregated_client` every round
             alg.register_meter_params()
             alg.begin_round(t)
+            # Methods whose iteration needs SEVERAL clients' batches at once
+            # (HO-SFL with sampled_clients > 1) run the round as grouped
+            # iterations; every other method keeps the per-client loop below.
+            grouped = _run_grouped_round(alg, clients, t, torch_device, cfg) \
+                if alg.group_size() > 1 else None
             with tqdm(
                 range(cfg.num_clients), unit="cl", desc="Client", leave=False,
                 colour='blue'
             ) as pbar:
                 for i in pbar:
-                    tr_mets = {}
-                    for j in tqdm(
-                        range(clients[i].epochs), unit="ep", desc="Local epoch",
-                        leave=False
-                    ):
-                        with tqdm(
-                            clients[i].train_loader, unit="batch",
-                            desc="Local batch", leave=False
-                        ) as pbar_local:
-                            for k, (x, y) in enumerate(pbar_local):
-                                x = x.to(torch_device).double() \
-                                    if cfg.use_64bit else x.to(torch_device).float()
-                                y = y.to(torch_device).long()
+                    if grouped is not None:
+                        tr_mets = grouped[i]
+                    else:
+                        tr_mets = {}
+                        for j in tqdm(
+                            range(clients[i].epochs), unit="ep", desc="Local epoch",
+                            leave=False
+                        ):
+                            with tqdm(
+                                clients[i].train_loader, unit="batch",
+                                desc="Local batch", leave=False
+                            ) as pbar_local:
+                                for k, (x, y) in enumerate(pbar_local):
+                                    x = x.to(torch_device).double() \
+                                        if cfg.use_64bit else x.to(torch_device).float()
+                                    y = y.to(torch_device).long()
 
-                                alg.begin_step((t, i, j, k), x, y)
-                                tr_metrics = alg.client_step(
-                                    (t, i, j, k), x, y
-                                )
-                                tr_metrics.update(alg.end_step())
-                                pbar_local.set_postfix(**tr_metrics)
-                                if j == 0 and k == 0:
-                                    tr_mets = {
-                                        k: [v] for k, v in tr_metrics.items()
-                                    }
-                                else:
-                                    # setdefault: a metric may first appear
-                                    # mid-round (e.g. a server loss on the
-                                    # h-th batch only)
-                                    [tr_mets.setdefault(k, []).append(v)
-                                     for k, v in tr_metrics.items()]
+                                    alg.begin_step((t, i, j, k), x, y)
+                                    tr_metrics = alg.client_step(
+                                        (t, i, j, k), x, y
+                                    )
+                                    tr_metrics.update(alg.end_step())
+                                    pbar_local.set_postfix(**tr_metrics)
+                                    if j == 0 and k == 0:
+                                        tr_mets = {
+                                            k: [v] for k, v in tr_metrics.items()
+                                        }
+                                    else:
+                                        # setdefault: a metric may first appear
+                                        # mid-round (e.g. a server loss on the
+                                        # h-th batch only)
+                                        [tr_mets.setdefault(k, []).append(v)
+                                         for k, v in tr_metrics.items()]
 
                     # compute mean of metrics
                     tr_mets = {k: np.mean(v) if 'model_compute_time' not in k
@@ -863,6 +886,46 @@ def _run_fl_algorithm(
         aggregation_metrics, comm_load_cut, comm_load_weights, comm_load,
         avg_compute_times, comm_breakdown, memory_metrics, breakdown
     )
+
+# ------------------------------------------------------------------------------
+def _run_grouped_round(alg, clients, t, torch_device, cfg):
+    '''One round as grouped iterations, with FAIR sampling: every client still
+    uses each of its batches exactly once per round (same data as every other
+    method), and each iteration takes one batch from each of up to K clients
+    drawn at random among the clients that still have batches left this round.
+    Returns {client i: {metric: [values per batch]}} for the usual per-client
+    bookkeeping in the main loop.'''
+    k_size = alg.group_size()
+    n = len(clients)
+    its = [iter(c.train_loader) for c in clients]
+    per_epoch = [len(c.train_loader) for c in clients]
+    remaining = [c.epochs * per_epoch[i] for i, c in enumerate(clients)]
+    used = [0] * n
+    tr_mets = [{} for _ in range(n)]
+    with tqdm(total=sum(remaining), unit="batch", desc="Grouped batches",
+              leave=False) as pbar:
+        while any(remaining):
+            avail = [i for i in range(n) if remaining[i] > 0]
+            chosen = sorted(int(c) for c in np.random.choice(
+                avail, size=min(k_size, len(avail)), replace=False))
+            batch = []
+            for i in chosen:
+                try:
+                    x, y = next(its[i])
+                except StopIteration:              # next local epoch
+                    its[i] = iter(clients[i].train_loader)
+                    x, y = next(its[i])
+                x = x.to(torch_device).double() if cfg.use_64bit \
+                    else x.to(torch_device).float()
+                y = y.to(torch_device).long()
+                j, k = divmod(used[i], per_epoch[i])
+                batch.append(((t, i, j, k), x, y))
+                used[i] += 1
+                remaining[i] -= 1
+            for i, mets in alg.group_step(batch).items():
+                [tr_mets[i].setdefault(key, []).append(v) for key, v in mets.items()]
+            pbar.update(len(chosen))
+    return tr_mets
 
 # ------------------------------------------------------------------------------
 def run_fl_algorithm(

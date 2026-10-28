@@ -63,15 +63,27 @@ def _never(s):
 
 
 def _every_batch(s):
-    '''HO-SFL: one iteration per client batch -> N*R*K (K batches per round).'''
+    '''HO-SFL: one transfer per client batch -> N x R x batches per round.'''
     return sum(e * it for e, it in zip(s['epochs'], s['iters_per_epoch'])) * s['rounds']
 
 
 def _sync_events(s):
-    '''HO-SFL ClientSync (Alg.3): a client catches up whenever it missed other
-    clients' iterations since its last turn. Clients train one after another,
-    so every client's first batch of a round needs one -- except client 0 in
-    round 0, which has missed nothing: N*R - 1 (0 with a single client).'''
+    '''HO-SFL ClientSync (Alg.3): a sampled client catches up whenever other
+    iterations ran since its last turn.
+      - one client per iteration (K = 1, clients take turns): every client's
+        first batch of a round needs one, except client 0 in round 0:
+        N*R - 1 (0 with a single client);
+      - K > 1 (random sampling): replay the recorded sampling sequence
+        `groups` with Alg.3's rule (missed = iterations since last turn).'''
+    groups = s.get('groups')
+    if groups:
+        last, it, events = {}, 0, 0
+        for S in groups:
+            events += sum(1 for m in S if it - last.get(m, 0) > 0)
+            it += 1
+            for m in S:
+                last[m] = it
+        return events
     n = s['num_clients']
     return 0 if n < 2 else n * s['rounds'] - 1
 
@@ -142,13 +154,13 @@ PAPER_COMPONENTS = {
         'paper': 'HO-SFL, arXiv:2603.14773',
         'rows': [
             ('C1', 'Smashed activations z, client -> server',
-             'Alg.1 L10: every iteration (= every batch); N*R*K',
+             'Alg.1 L10: every client batch; N x R x batches per round',
              ('cut.act_up',), _every_batch, 'Cut'),
             ('C2', 'Labels y with each activation, client -> server',
-             'Alg.1 L10, p.4: "transmits z and label y"; N*R*K',
+             'Alg.1 L10, p.4: "transmits z and label y"; N x R x batches per round',
              ('cut.labels_up',), _every_batch, 'Cut'),
             ('C3', 'Activation gradient lambda, server -> client',
-             'Alg.1 L19, Eq.(13): every iteration; N*R*K',
+             'Alg.1 L19, Eq.(13): every client batch; N x R x batches per round',
              ('cut.grad_down',), _every_batch, 'Cut'),
             ('W1', 'Client model x_c upload',
              'p.5-6, Table 4: dimension-free -> never',
@@ -157,16 +169,16 @@ PAPER_COMPONENTS = {
              'p.5-6, Table 4: dimension-free -> never',
              ('weights.client_down',), _never, 'Weights'),
             ('Z1', 'P projection scalars, client -> server',
-             'Alg.1 L23, Eq.(17): every iteration, P x 4 B; N*R*K',
+             'Alg.1 L23, Eq.(17): every client batch, P x 4 B; N x R x batches per round',
              ('weights.zo_scalars_up',), _every_batch, 'Weights'),
             ('Z2', 'P seeds, server -> client',
-             'Alg.1 L4: every iteration, P x 4 B; N*R*K',
+             'Alg.1 L4: every client batch, P x 4 B; N x R x batches per round',
              ('weights.zo_seeds_down',), _every_batch, 'Weights'),
             ('Z3', 'P averaged scalars, server -> client',
-             'Alg.1 L26, Eq.(18): every iteration, P x 4 B; N*R*K',
+             'Alg.1 L26, Eq.(18): every client batch, P x 4 B; N x R x batches per round',
              ('weights.zo_scalars_down',), _every_batch, 'Weights'),
             ('Z4', 'Catch-up seeds + scalars for missed iterations',
-             'Alg.3 L3: at each client\'s first batch of a round; N*R - 1',
+             'Alg.3 L3: whenever a sampled client missed iterations; replayed from the sampling sequence (K = 1: N*R - 1)',
              ('weights.zo_sync_down',), _sync_events, 'Weights'),
             ('W5', f'{SERVER_FEDAVG_NAME} (per-client x_s copies)',
              'Eq.(14), Alg.1 L18: one server model -> none',
@@ -271,7 +283,7 @@ def render(bd):
     out.append(
         f"N = {s['num_clients']} clients, R = {s['rounds']} rounds, "
         f"local iters/round = {[e * it for e, it in zip(s['epochs'], s['iters_per_epoch'])]}, "
-        f"h = {s.get('h')}, l = {s.get('l')}, P = {s.get('P')}.  Units: MiB (= table 'MB')."
+        f"h = {s.get('h')}, l = {s.get('l')}, P = {s.get('P')}, K = {s.get('K')}.  Units: MiB (= table 'MB')."
     )
     out.append('')
     out.append('### Communication')

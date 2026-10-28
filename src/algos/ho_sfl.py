@@ -34,13 +34,17 @@
 #     local epoch of every client (authors: one batch per sampled client, run
 #     to a 120k-sample budget). Methods are thus compared at equal samples
 #     processed, as the authors themselves compare them.
-#   - Client sampling. Paper Alg.1 L4 samples a random subset S_t of size K at
-#     the start of each round (authors' code: 10 of 100 clients, one batch
-#     each). Here S_t = {the client whose batch it is}: clients take turns, and
-#     every client trains on all its data every round, as in every other method
-#     of this benchmark (the shared loop has no client sampling). |S_t| = 1 is a
-#     valid case of Alg.1. What sampling implies for communication is kept:
-#     clients that missed iterations catch up via ClientSync (Alg.3, row Z4).
+#   - Client sampling (`sampled_clients`, K). Paper Alg.1 L4 samples a random
+#     subset S_t of K clients per iteration (authors' code: 10 of 100; the
+#     paper's language tasks: 3 of 10). Here, with K > 1, each iteration takes
+#     one batch from each of K clients drawn at random among the clients that
+#     still have batches left this round (fair sampling: every client still
+#     uses all its data every round, like every other method). The server steps
+#     on the gradient averaged over S_t and the K clients' scalars are averaged
+#     (group_step). K = 1 runs one client per iteration (client_step), the
+#     earlier behaviour. Benchmark run: K = 3 with batch 107, so one update
+#     sees ~321 images, the paper's 10 x 32 = 320; a second run at batch 256
+#     gives memory comparable with the other methods.
 #   - Benchmark fairness: RANDOM init for every method (use_pretrained=false,
 #     freeze_bn=false), unlike the paper's ImageNet-pretrained ResNet-18. With
 #     random BatchNorm the client trains in train() mode like every other
@@ -49,6 +53,7 @@
 #     Clean and perturbed forwards then normalise with the same batch's
 #     statistics, so v_p stays a true perturbation difference.
 # ------------------------------------------------------------------------------
+import time
 import numpy as np
 import torch
 
@@ -132,6 +137,11 @@ class HO_SFL(FLAlgorithm):
         # matters here (the shared model never needs replaying), so it is
         # tracked as a count and reported in server_side_extra_memory().
         self._history_iters = 0
+        # Alg.1 L4: clients sampled per iteration (|S_t|). 1 = one client per
+        # iteration via client_step (the earlier behaviour); > 1 = grouped
+        # iterations via group_step, with fair sampling in the shared loop.
+        self.K = int(self.cfg.get('sampled_clients', 1))
+        self.group_log = [] if self.K > 1 else None
 
         # The single-shared-client-model premise above IS the paper's
         # dimension-free aggregation, and aggregate() below relies on it by
@@ -242,6 +252,121 @@ class HO_SFL(FLAlgorithm):
             'acc': train_correct / y.size(dim=0),
             'loss': train_loss,
         }
+
+    def group_size(self):
+        return self.K
+
+    def group_step(self, batch):
+        '''One HO-SFL iteration (paper Alg.1) over the sampled set S_t: one
+        batch from each of the K sampled clients. Same steps as client_step,
+        but the server takes ONE step on the gradient averaged over S_t (Eq.14)
+        and the scalars are averaged over S_t (Eq.18) -- the cross-client
+        averaging of the paper. Returns {client: metrics}.'''
+        S = [ix[1] for ix, _, _ in batch]
+        n_s = len(S)
+        client = self.clients[S[0]].model          # the one shared client model
+        s = 8 if self.use_64bit else 4             # bytes per scalar
+        SEED = 4                                   # bytes per seed (int32)
+        mets = {i: {'client_model_compute_time': 0.0,
+                    'server_model_compute_time': 0.0} for i in S}
+
+        # memory probe: as in begin_step, but for every client in the group
+        self.meter.enabled = bool(self.cfg.get('measure_memory', True)) and \
+            any(self.should_probe_memory(*ix) for ix, _, _ in batch)
+        for (_, i, _, _), x, y in batch:
+            self.hold('client', x, y, i=i)
+
+        def timed(i, side, fn):
+            t0 = time.time()
+            with self.phase(side, i):
+                out = fn()
+            mets[i][f'{side}_model_compute_time'] += time.time() - t0
+            return out
+
+        # 1. ClientSync (Alg.3 L3) for every sampled client
+        for i in S:
+            missed = self._iter - self._last_seen[i]
+            if missed > 0:
+                self.charge_weights_zo('zo_sync_down', missed * self.P * (SEED + s))
+
+        # 2. Seeds (Alg.1 L4), sent to each sampled client
+        seeds = [int(np.random.randint(0, 1_000_000)) for _ in range(self.P)]
+        for i in S:
+            self.charge_weights_zo('zo_seeds_down', self.P * SEED)
+
+        # 3. Each sampled client: forward only, upload activation + labels
+        a, srv_in = {}, {}
+        for (_, i, _, _), x, y in batch:
+            def fwd():
+                with torch.no_grad():
+                    return client(x)
+            a[i] = timed(i, 'client', fwd)
+            srv_in[i] = a[i].clone().detach().requires_grad_(True)
+            self.charge_cut_activation(srv_in[i])
+            self.charge_cut_labels(y)
+
+        # 4. Server: gradient averaged over S_t, ONE step (Alg.1 L14-18, Eq.14)
+        self.server.optimizer.zero_grad()
+        g = {}
+        for (_, i, _, _), x, y in batch:
+            def srv():
+                out = self.server.model(srv_in[i])
+                loss = self.criterion(out, y)
+                with torch.no_grad():
+                    mets[i]['loss'] = loss.item()
+                    mets[i]['acc'] = out.argmax(1).eq(y).sum().item() / y.size(0)
+                loss.backward(loss.new_tensor(1.0 / n_s))
+            timed(i, 'server', srv)
+            g[i] = srv_in[i].grad.clone().detach()
+            self.charge_cut_gradient(g[i])                       # Alg.1 L19
+            self.hold('client', a[i], g[i], i=i)
+        t0 = time.time()
+        with self.phase('server', S[0]):
+            self.server.optimizer.step()
+        for i in S:                         # the shared step, split evenly
+            mets[i]['server_model_compute_time'] += (time.time() - t0) / n_s
+
+        # 5. ZOScalar (Alg.2) for each sampled client, same seeds, same model
+        v = {}
+        for (_, i, _, _), x, y in batch:
+            def zo():
+                vi = torch.zeros(self.P, device=a[i].device, dtype=a[i].dtype)
+                for p_idx, seed in enumerate(seeds):
+                    _perturb(client, seed, self.mu)
+                    with torch.no_grad():
+                        a_tilde = client(x)
+                    self.hold('client', a_tilde, i=i)
+                    vi[p_idx] = torch.sum((a_tilde - a[i]) * g[i])
+                    _perturb(client, seed, -self.mu)
+                    del a_tilde
+                return vi
+            v[i] = timed(i, 'client', zo)
+            self.charge_weights_zo('zo_scalars_up', self.P * s)      # Alg.1 L23
+
+        # 6. Average over S_t and broadcast to each sampled client (L26, Eq.18)
+        bar_v = torch.stack([v[i] for i in S]).mean(dim=0)
+        for i in S:
+            self.charge_weights_zo('zo_scalars_down', self.P * s)
+
+        # 7. One client update from the averaged scalars (L27-28, Eq.19)
+        t0 = time.time()
+        with self.phase('client', S[0]):
+            self.clients[S[0]].optimizer.zero_grad(set_to_none=False)
+            scale = 1.0 / (self.P * self.mu)
+            for p_idx, seed in enumerate(seeds):
+                _perturb_accumulate_grad(client, seed, bar_v[p_idx].item() * scale)
+            self.clients[S[0]].optimizer.step()
+        for i in S:                         # the shared update, split evenly
+            mets[i]['client_model_compute_time'] += (time.time() - t0) / n_s
+
+        self._iter += 1
+        for i in S:
+            self._last_seen[i] = self._iter
+        self._history_iters += 1
+        self.group_log.append(S)
+        self.meter.end_step()
+        self._phase_times = {}
+        return mets
 
     def server_side_extra_memory(self):
         '''Alg.1 L2: history of seeds + averaged scalars for ClientSync, one
