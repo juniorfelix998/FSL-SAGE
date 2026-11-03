@@ -112,9 +112,9 @@ class FLAlgorithm(ABC):
         # Probing only the first few batches of each round keeps the
         # saved-tensor hooks' ~4% overhead amortized to well under 1%, and is
         # sufficient because every method's heaviest step is at or near the
-        # round's first iteration: cse_fsl's server update fires at
-        # `local_iter % q == 0`, fsl_sage's alignment at `local_iter == 0`, and
-        # ho_sfl/mu_splitfed only do real work at (j, k) == (0, 0) at all.
+        # round's first iterations: cse_fsl / fsl_sage also probe their first
+        # upload batch (should_probe_memory), fsl_sage's alignment is probed in
+        # begin_round, and ho_sfl / mu_splitfed do the same work on every batch.
         self.mem_probe_batches = int(cfg.get('mem_probe_batches', 2))
         self._cur_client = 0
         self._phase_times = {}
@@ -293,6 +293,7 @@ class FLAlgorithm(ABC):
             'l': self.cfg.get('align_interval'),
             'P': self.cfg.get('zo_p'),
             'K': self.group_size(),
+            'tau': self.cfg.get('tau'),
             # clients sampled in each grouped iteration, in order (None for
             # the per-client loop); lets the breakdown replay Alg.3 catch-ups
             'groups': getattr(self, 'group_log', None),

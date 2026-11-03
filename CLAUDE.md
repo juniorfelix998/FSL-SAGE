@@ -14,7 +14,9 @@ the fair, common measurement layer — not new algorithms.
 Code-available (USE their code, port into this harness, DO NOT reproduce their published
 numbers — just run them in our setting):
 - CSE-FSL, FSL-SAGE, SplitFedv1, SplitFedv2  — already in the FSL-SAGE harness (this repo)
-- MU-SplitFed  — standalone repo: https://github.com/Johnny-Zip/MU-SplitFed  (needs porting in)
+- MU-SplitFed  — standalone repo: https://github.com/Johnny-Zip/MU-SplitFed  (LLM-only and not runnable as
+  published; ported via HKU-WILL-Lab/HO-SFL's vision reimplementation, checked against the
+  paper: src/algos/mu_splitfed.py)
 - HO-SFL       — standalone repo: https://github.com/HKU-WILL-Lab/HO-SFL  (ported: src/algos/ho_sfl.py)
 
 No-code (implement from paper, AI-assisted, MUST reproduce the paper's reported numbers

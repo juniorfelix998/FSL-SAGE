@@ -1,77 +1,66 @@
 # ------------------------------------------------------------------------------
-# Ported from HKU-WILL-Lab/HO-SFL's HO_SFL_CV/src/runner/mu_splitfed_runner.py
-# (+ its src/models/registry.py and src/models/split_wrapper.py, which build
-# the pretrained/frozen-BN backbone this runner trains), verified directly
-# against the actual repo source and its conf/mu_splitfed.yaml.
+# MU-SplitFed (Liang et al., "Towards Straggler-Resilient Split Federated
+# Learning: An Unbalanced Update Approach", NeurIPS 2025, arXiv:2510.21155),
+# run against the paper's Algorithm 1 and adapted to vision.
 #
-# IMPORTANT PROVENANCE NOTE: this is a THIRD-PARTY CV/ResNet18 reimplementation
-# of MU-SplitFed written by the HO-SFL authors as their own baseline comparison
-# -- it is NOT the original Johnny-Zip/MU-SplitFed authors' code. The original
-# repo is LLM/OPT-only (no image-classification path at all) and is
-# non-functional as published (imports a `cezo_fl` package that was never
-# committed to that repository), so there is no way to run "their own code" on
-# MNIST/CIFAR. This must be labeled as a reimplementation everywhere this
-# method appears (table footnotes, plots, etc.), matching the paper's own
-# convention for its "reimplemented, AI-assisted" rows.
+# PROVENANCE. The authors' code (Johnny-Zip/MU-SplitFed) is LLM/OPT-only,
+# single-client, has no aggregation, and does not run as published (it imports
+# a `cezo_fl` package that is not in the repository). The vision baseline here
+# is therefore ported from the third-party ResNet-18 reimplementation in
+# HKU-WILL-Lab/HO-SFL (HO_SFL_CV/src/runner/mu_splitfed_runner.py), and checked
+# step by step against the paper. Label it a reimplementation wherever it is
+# reported.
 #
-# IMPORTANT EXPECTATION-SETTING, per the HO-SFL paper itself (arXiv:2603.14773,
-# Figure 3): the paper's OWN reported validation accuracy for MU-SplitFed on
-# CIFAR-10 stays FLAT near chance level (~10-15%) for the entire run (160k
-# processed samples), on both IID and Non-IID splits, while every other method
-# in that figure climbs to 60-80%. This is the paper's own point -- MU-SplitFed
-# is a deliberately weak backprop-free baseline that HO-SFL is shown to
-# dramatically improve on. A near-chance accuracy for this method in this
-# benchmark is the EXPECTED, paper-confirmed result, not a sign of a broken
-# port. Do not tune this method to chase a "good" accuracy number.
+# VISION ADAPTATION. MU-SplitFed itself uses no LoRA and no LLM-specific loss:
+# it is full-parameter zeroth-order (ZO) training. So it maps directly onto
+# this benchmark's ResNet-18 split (client = conv1..layer2, server =
+# layer3..fc, the same middle cut as every method), with cross-entropy loss
+# and the cut activation in place of the LLM hidden state.
 #
-# Both client and server are backprop-free (pure zeroth-order, two-point
-# finite-difference gradient estimation), unlike HO-SFL which keeps real
-# server backprop. Full per-client model weights (both client and server) ARE
-# aggregated every round via a FedAvg-style delta-averaging with a separate
-# global step size `lr_g` vs. local `lr_c`/`lr_s` -- the "unbalanced update"
-# (MU) contribution -- so weight-transfer communication here is comparable in
-# kind to the harness's other FedAvg-style aggregators, unlike HO-SFL's
-# dimension-free scheme.
+# ONE PAPER ROUND (Alg.1) = one iteration here, over the sampled clients S:
+#   L3     each sampled client pulls the global client model x_c (download);
+#          the Split Server starts that client's server copy from x_s (local)
+#   Eq.4   client: clean h, h+ = f(x_c + mu*u), h- = f(x_c - mu*u), forward
+#          only (no backward); sends h, h+, h- and the labels  -> 3 activations
+#   Eq.5   Split Server: tau ZO steps on that client's copy, on the clean h
+#          (two-sided, one random direction each)
+#   Eq.6   server sends ONE scalar back: F(x_s^tau, h+) - F(x_s^tau, h-),
+#          evaluated with the post-tau copy; the client takes one ZO step
+#   L11    each client uploads its model; Eq.7 (as in the paper's proof; the
+#          printed sign is a typo): x <- x + eta_g * mean over S of (x_m - x),
+#          for the client models AND the server copies (eta_g = lr_g = 0.3)
+# No activation gradient ever crosses the cut. Hyperparameters are the paper's
+# Table 6: tau = 2, mu = 0.005, lr_c = 0.005, lr_s = 0.01, lr_g = 0.3, one
+# perturbation (P = 1).
 #
-# Matches the reference's own recipe (its conf/mu_splitfed.yaml sets
-# `use_pretrained: True`, `freeze_bn: True`) -- both are ported here as
-# `use_pretrained`/`freeze_bn` config fields:
-#   - `use_pretrained`: loads ImageNet-pretrained torchvision ResNet18 weights
-#     into the client/server split at this harness's existing middle-cut
-#     boundary (conv1/bn1/layer1/layer2 | layer3/layer4/fc), matching the
-#     reference's registry.get_model()+split_wrapper.split_model() split
-#     point (split_point=6, the same boundary). The server's `fc` is left at
-#     this harness's own random init (pretrained fc is 1000-way ImageNet,
-#     this benchmark's is num_classes-way).
-#   - `freeze_bn`: sets `requires_grad=False` on every BatchNorm2d's affine
-#     `weight`/`bias`, matching the reference's src/models/registry.py. This
-#     does NOT put BatchNorm in eval mode or freeze its running mean/var --
-#     verified directly against the reference runner, which calls a blanket
-#     `.train()` on the whole model every round, re-enabling ordinary
-#     train-mode running-stat updates regardless of this flag. The only
-#     lasting effect is that BatchNorm's affine params are invisible to the
-#     ZO perturbation loop (`_perturb`/`_perturb_accumulate_grad` already skip
-#     any `requires_grad=False` param below), so they stay pinned at their
-#     pretrained values while running stats keep adapting normally. (An
-#     earlier version of this file forced BatchNorm into permanent .eval()
-#     mode, assuming that's what "freeze" meant -- that's wrong and caused
-#     the loss to explode to NaN on a from-scratch model with no calibrated
-#     running stats to fall back on; this version matches the reference
-#     exactly instead.)
+# Differences from the original port (changed after review):
+#   - Aggregation after EVERY iteration, as in Alg.1 (was: once per local
+#     epoch, i.e. 24 client steps between aggregations).
+#   - Client sampling (`sampled_clients`, default 5 of 10 = the paper's 50%
+#     partial participation, p.8). Each iteration takes one batch from each of
+#     K clients drawn at random among the clients with batches left this round
+#     (fair sampling: every client still uses all its data every round, like
+#     every other method). K = 1 runs one client per iteration (client_step),
+#     still aggregating every iteration.
+#   - Client-model traffic is charged per participation: one download (L3) and
+#     one upload (L11). The server-copy averaging is NOT charged: in the paper
+#     it happens inside the Split Server (no network). (SplitFedv1 is still
+#     charged under the benchmark's older convention.)
+#   - Random init (use_pretrained/freeze_bn = false), the same as every method
+#     in the benchmark; BatchNorm trains in train mode (as in the reference).
 #
-# SCHEDULE, vs. the reference. The reference draws ONE batch per client per
-# round (`next(iter(loader))`) and caps the run at 120k processed samples, i.e.
-# ~375 zeroth-order steps per model. This harness defines a round as one local
-# epoch for every method, so MU-SplitFed takes a step on every batch. That is
-# the benchmark's fairness rule, but it means we run a MORE aggressive schedule
-# of an update rule that is already divergent under its own published
-# hyperparameters -- worth stating wherever this row is reported.
+# Deliberate differences from the paper:
+#   - The random direction u is Gaussian (both codebases); the paper's theory
+#     draws it uniformly from a sphere.
+#   - Batches of size 1 are skipped (BatchNorm in train mode cannot run them),
+#     as in the reference; no such batch occurs at batch 32 or 256 on MNIST.
+#   - Benchmark settings: 10 clients, one round = one pass over every client's
+#     data. The main run uses batch 32 (5 x 32 = 160 images per update, as in
+#     the paper); a batch-256 run gives memory comparable with other methods.
 #
-# Uses a single zeroth-order perturbation direction per gradient estimate (no
-# averaging), exactly matching the reference -- an earlier version of this
-# file added multi-direction averaging as a from-scratch stabilization
-# attempt; that's a real deviation from the reference and has been reverted
-# for a faithful, fair comparison.
+# Expected accuracy: the HO-SFL paper (arXiv:2603.14773, Fig.3) reports this
+# reimplementation near chance (~10-15%) on CIFAR-10. Report what it gets; do
+# not tune it.
 # ------------------------------------------------------------------------------
 import time
 import copy
@@ -79,6 +68,7 @@ import numpy as np
 import torch
 
 from algos import register_algorithm, FLAlgorithm
+from utils.memory import module_static_bytes
 from models.pretrained import (
     pretrained_resnet18_state_dict, load_pretrained_client,
     load_pretrained_server, freeze_batchnorm_affine
@@ -129,31 +119,32 @@ class MU_SplitFed(FLAlgorithm):
         self.tau = self.cfg.tau
         self.mu = self.cfg.zo_mu
         self.eta_g = self.cfg.lr_g
-        self.use_pretrained = self.cfg.use_pretrained
-        self.freeze_bn = self.cfg.freeze_bn
+        self.use_pretrained = self.cfg.get('use_pretrained', False)
+        self.freeze_bn = self.cfg.get('freeze_bn', False)
 
-        # matches the reference's own registry.get_model(): pretrained
-        # backbone loaded (and BN affine frozen) BEFORE the servers/aggregated
-        # deep copies below, so every copy inherits the same weights/frozen
-        # flags without re-doing this per copy.
+        # Initialization: random by default (benchmark fairness); the vision
+        # reference's pretrained + frozen-BN setting is available via config.
         if self.use_pretrained:
             full_state = pretrained_resnet18_state_dict()
             for c in self.clients:
                 load_pretrained_client(c.model, full_state)
             load_pretrained_server(self.server.model, full_state)
-
         if self.freeze_bn:
             for c in self.clients:
                 freeze_batchnorm_affine(c.model)
             freeze_batchnorm_affine(self.server.model)
 
+        # every client starts from the same global client model x_c
+        for c in self.clients[1:]:
+            c.model.load_state_dict(self.clients[0].model.state_dict())
+
+        # The Split Server keeps one server-model copy per client (paper p.3);
+        # each is re-started from the global x_s when its client is sampled.
         self.servers = [copy.deepcopy(self.server) for _ in self.clients]
 
-        # Both sides are zeroth-order: the update is applied in place by
-        # _zo_update, so no `.grad` is ever allocated. The SGD objects are still
-        # constructed because the shared loop reads their `param_groups` to log
-        # the learning rate -- they carry no state of their own (plain SGD, no
-        # momentum or weight decay), so they cost nothing in the memory report.
+        # Both sides are zeroth-order and updated in place by _zo_update, so no
+        # `.grad` is ever allocated. The SGD objects exist only because the
+        # shared loop reads their learning rate (plain SGD: no state).
         self.lr_c = float(self.cfg.lr_c)
         self.lr_s = float(self.cfg.lr_s)
         for c in self.clients:
@@ -163,29 +154,40 @@ class MU_SplitFed(FLAlgorithm):
             srv.optimizer = torch.optim.SGD(srv.model.parameters(), lr=self.lr_s)
             srv.lr_scheduler = None
 
+        # the global models x_c and x_s (Fed Server / Split Server)
         self.aggregated_client = copy.deepcopy(self.clients[0].model)
         self.aggregated_server = copy.deepcopy(self.server.model)
+
+        # Alg.1: clients sampled per iteration (paper: 50% of 10 = 5)
+        self.K = int(self.cfg.get('sampled_clients', 1))
+        self.group_log = []
+        self._agg_time = 0.0
 
     def full_model(self, x):
         return self.aggregated_server(self.aggregated_client(x))
 
-    # the server host holds one replica per client
+    # -- memory partition ---------------------------------------------------
+    # Per-device server value: the global x_s plus ONE client's server copy
+    # being trained. The other K-1 sampled clients' copies, alive during the
+    # same iteration, are listed separately (server_side_extra_memory).
     def server_side_modules(self):
-        return [s.model for s in self.servers]
+        return [self.aggregated_server, self.servers[0].model]
 
     def server_side_optimizers(self):
-        return [s.optimizer for s in self.servers]
+        return [self.servers[0].optimizer]
+
+    def server_side_extra_memory(self):
+        params, grads = module_static_bytes(self.servers[0].model)
+        others = max(self.K - 1, 0)
+        return [{
+            'item': f'server copies of the other {others} sampled clients (params)',
+            'mb': others * (params + grads) / 1024 ** 2,
+            'note': 'paper p.3: one server-model copy per client, kept by the Split Server during an iteration',
+        }]
 
     def special_models_train_mode(self, t):
-        # Deliberately does NOT force the client/server into eval() around the
-        # zeroth-order probe loop, unlike ho_sfl. Each batch runs 2*tau + 2
-        # perturbed server forwards and 2 perturbed client forwards in train
-        # mode, so BatchNorm running stats are updated with perturbed weights.
-        # That looks like a bug, and was investigated as one -- but the
-        # reference (HKU-WILL-Lab/HO-SFL's mu_splitfed_runner.py) calls a
-        # blanket .train() on the whole model every round and behaves
-        # identically, so this is FAITHFUL. Do not "fix" it without also
-        # changing the reference comparison.
+        # BatchNorm stays in train mode during every perturbed forward, as in
+        # the reference runner (a blanket .train() every round).
         if t > 0:
             self.aggregated_server.train()
 
@@ -193,6 +195,7 @@ class MU_SplitFed(FLAlgorithm):
         self.aggregated_server.eval()
 
     def _aggregate_weights(self, global_state, state_dicts):
+        '''Eq.7 (as used in the paper's proof): x + eta_g * mean(x_m - x).'''
         num_clients = len(state_dicts)
         new_state = {}
         for key in global_state.keys():
@@ -212,124 +215,124 @@ class MU_SplitFed(FLAlgorithm):
             new_state[key] = new_param.to(global_state[key].dtype)
         return new_state
 
+    # -- one paper round (Alg.1) over the sampled clients ---------------------
+    def group_size(self):
+        return self.K
+
     def client_step(self, rd_cl_ep_it, x, y):
-        t, i, j, k = rd_cl_ep_it
+        # K = 1: one client per iteration, still aggregating every iteration
+        i = rd_cl_ep_it[1]
+        return self.group_step([(rd_cl_ep_it, x, y)]).get(i, {})
 
-        # The reference skips single-sample batches (its L138-139). BatchNorm in
-        # train mode raises on a batch of 1, which a skewed non-IID shard can
-        # produce as its final batch.
-        if x.size(0) == 1:
-            return {}
+    def group_step(self, batch):
+        '''One MU-SplitFed round (paper Alg.1) over the sampled clients in
+        `batch` (a list of ((t, i, j, k), x, y)). Returns {client: metrics}.'''
+        mets = {}
+        self.meter.enabled = bool(self.cfg.get('measure_memory', True)) and \
+            any(self.should_probe_memory(*ix) for ix, _, _ in batch)
+        g_client = self.aggregated_client.state_dict()
+        g_server = self.aggregated_server.state_dict()
+        S = []
 
-        # MATCHED ROUNDS: this method's reference implementation draws a single
-        # `next(loader)` per round, so this file used to no-op on every batch
-        # except (j,k)==(0,0). That made one round mean 1 optimizer step here
-        # and a full local epoch (24 steps on MNIST) everywhere else, and the
-        # benchmark papered over it with a 24x round multiplier for this method
-        # alone. The benchmark now defines a round as ONE LOCAL EPOCH for every
-        # method, so the zeroth-order update below runs on every batch, exactly
-        # like every first-order method's step does. The ZO update rule itself
-        # is untouched -- only how many batches it is applied to.
+        def timed(i, side, fn):
+            t0 = time.time()
+            with self.phase(side, i):
+                out = fn()
+            key = f'{side}_model_compute_time'
+            mets[i][key] = mets[i].get(key, 0.0) + time.time() - t0
+            return out
 
-        # client forward under no_grad -- a zeroth-order client retains no
-        # autograd activations, so its activation peak is ~0 by construction
-        with self.phase('client', i):
-            with torch.no_grad():
-                h_fixed = self.clients[i].model(x)
-        self.charge_cut_activation(h_fixed)
-        self.charge_cut_labels(y)     # every loss below is computed server-side
+        for (t, i, j, k), x, y in batch:
+            # BatchNorm in train mode cannot run a batch of one (reference
+            # L138-139); skipped batches send nothing and take no part.
+            if x.size(0) == 1:
+                continue
+            S.append(i)
+            mets[i] = {'client_model_compute_time': 0.0,
+                       'server_model_compute_time': 0.0}
+            client = self.clients[i].model
+            server = self.servers[i].model
+            self.hold('client', x, y, i=i)
 
-        # tau local server-only zeroth-order steps, reusing h_fixed -- no
-        # further client communication needed for these.
-        with self.phase('server', i):
-            for _ in range(self.tau):
-                s_seed = int(np.random.randint(0, 1_000_000))
+            # L3: pull the global client model (download); the Split Server
+            # starts this client's server copy from x_s (local, not charged)
+            client.load_state_dict(g_client)
+            server.load_state_dict(g_server)
+            self.charge_weights_model(self.aggregated_client, 'client', 'down')
 
-                _perturb(self.servers[i].model, s_seed, self.mu)
+            # Eq.4: clean h, forward only
+            def fwd():
                 with torch.no_grad():
-                    out_p = self.servers[i].model(h_fixed)
-                    loss_p = self.criterion(out_p, y)
+                    return client(x)
+            h_fixed = timed(i, 'client', fwd)
+            self.charge_cut_activation(h_fixed)
+            self.charge_cut_labels(y)     # every loss is computed server-side
 
-                _perturb(self.servers[i].model, s_seed, -2 * self.mu)
+            # Eq.5: tau ZO steps on this client's server copy, on the clean h
+            def server_steps():
+                for _ in range(self.tau):
+                    s_seed = int(np.random.randint(0, 1_000_000))
+                    _perturb(server, s_seed, self.mu)
+                    with torch.no_grad():
+                        loss_p = self.criterion(server(h_fixed), y)
+                    _perturb(server, s_seed, -2 * self.mu)
+                    with torch.no_grad():
+                        loss_n = self.criterion(server(h_fixed), y)
+                    _perturb(server, s_seed, self.mu)            # restore
+                    scalar_s = (loss_p.item() - loss_n.item()) / (2 * self.mu)
+                    _zo_update(server, s_seed, self.lr_s * scalar_s)
+            timed(i, 'server', server_steps)
+
+            # Eq.4: perturbed forwards h+ and h- (each sent as computed)
+            c_seed = int(np.random.randint(0, 1_000_000))
+            _perturb(client, c_seed, self.mu)
+            h_pos = timed(i, 'client', fwd)
+            self.charge_cut_activation(h_pos)
+            _perturb(client, c_seed, -2 * self.mu)
+            h_neg = timed(i, 'client', fwd)
+            self.charge_cut_activation(h_neg)
+            _perturb(client, c_seed, self.mu)                    # restore
+
+            # Eq.6: one scalar from the post-tau server copy
+            def evaluate_pm():
                 with torch.no_grad():
-                    out_n = self.servers[i].model(h_fixed)
-                    loss_n = self.criterion(out_n, y)
+                    out_p = server(h_pos)
+                    out_n = server(h_neg)
+                    return out_p, self.criterion(out_p, y), self.criterion(out_n, y)
+            out_c_p, loss_c_p, loss_c_n = timed(i, 'server', evaluate_pm)
+            scalar_c = (loss_c_p.item() - loss_c_n.item()) / (2 * self.mu)
+            self.charge_cut_scalar(1, direction='down')
 
-                _perturb(self.servers[i].model, s_seed, self.mu)  # restore
+            # client ZO step, then upload for aggregation (L10-11)
+            timed(i, 'client', lambda: _zo_update(client, c_seed, self.lr_c * scalar_c))
+            self.charge_weights_model(client, 'client', 'up')
 
-                scalar_s = (loss_p.item() - loss_n.item()) / (2 * self.mu)
-                _zo_update(self.servers[i].model, s_seed, self.lr_s * scalar_s)
-
-        # client-side zeroth-order step: two more client forwards, each a
-        # fresh activation upload. The perturbed forwards are the CLIENT's
-        # compute and the evaluations against the server are the SERVER's --
-        # bracketed separately so neither is charged the other's time.
-        c_seed = int(np.random.randint(0, 1_000_000))
-
-        _perturb(self.clients[i].model, c_seed, self.mu)
-        with self.phase('client', i):
             with torch.no_grad():
-                h_pos = self.clients[i].model(x)
-        self.charge_cut_activation(h_pos)
+                correct = out_c_p.argmax(1).eq(y).sum().item()
+            mets[i]['acc'] = correct / y.size(0)
+            mets[i]['loss'] = (loss_c_p.item() + loss_c_n.item()) / 2.0
 
-        _perturb(self.clients[i].model, c_seed, -2 * self.mu)
-        with self.phase('client', i):
-            with torch.no_grad():
-                h_neg = self.clients[i].model(x)
-        self.charge_cut_activation(h_neg)
-
-        _perturb(self.clients[i].model, c_seed, self.mu)  # restore
-
-        with self.phase('server', i):
-            with torch.no_grad():
-                out_c_p = self.servers[i].model(h_pos)
-                loss_c_p = self.criterion(out_c_p, y)
-                out_c_n = self.servers[i].model(h_neg)
-                loss_c_n = self.criterion(out_c_n, y)
-
-        scalar_c = (loss_c_p.item() - loss_c_n.item()) / (2 * self.mu)
-        # one scalar sent back so the client can replay its own update --
-        # drives this client's own update this round, same role as HO-SFL's
-        # g_a_m, so it's classified as cut traffic, not an aggregation event.
-        self.charge_cut_scalar(1, direction='down')
-
-        with self.phase('client', i):
-            _zo_update(self.clients[i].model, c_seed, self.lr_c * scalar_c)
-
-        with torch.no_grad():
-            _, predicted = torch.max(out_c_p.data, 1)
-            train_correct = predicted.eq(y.view_as(predicted)).sum().item()
-
-        return {
-            'acc': train_correct / y.size(dim=0),
-            'loss': (loss_c_p.item() + loss_c_n.item()) / 2.0,
-        }
+        # Eq.7: aggregate the client models and the server copies over S. The
+        # server copies are averaged inside the Split Server: not charged.
+        if S:
+            t0 = time.time()
+            self.aggregated_client.load_state_dict(self._aggregate_weights(
+                g_client, [self.clients[i].model.state_dict() for i in S]))
+            self.aggregated_server.load_state_dict(self._aggregate_weights(
+                g_server, [self.servers[i].model.state_dict() for i in S]))
+            self._agg_time += time.time() - t0
+            self.group_log.append(S)
+        self.meter.end_step()
+        self._phase_times = {}
+        return mets
 
     def aggregate(self):
-        t0 = time.time()
-
-        agg_client = self._aggregate_weights(
-            self.aggregated_client.state_dict(),
-            [c.model.state_dict() for c in self.clients]
-        )
-        agg_server = self._aggregate_weights(
-            self.aggregated_server.state_dict(),
-            [s.model.state_dict() for s in self.servers]
-        )
-        self.aggregated_client.load_state_dict(agg_client)
-        self.aggregated_server.load_state_dict(agg_server)
-
-        # write the freshly-aggregated global weights back into every
-        # client/server copy now, so round t+1 already starts synced --
-        # avoids a double-count of download bytes a literal port (which
-        # reloads at the top of each client's turn instead) would introduce.
+        # Everything was aggregated per iteration in group_step (Eq.7); keep
+        # every client's copy in sync with the final global model for eval.
         for c in self.clients:
-            c.model.load_state_dict(agg_client)
-            self.charge_weights_roundtrip(self.aggregated_client, 'client')
-        for s in self.servers:
-            s.model.load_state_dict(agg_server)
-            self.charge_weights_roundtrip(self.aggregated_server, 'server')
-
-        return {'client_agg_compute_time': time.time() - t0}
+            c.model.load_state_dict(self.aggregated_client.state_dict())
+        out = {'client_agg_compute_time': self._agg_time}
+        self._agg_time = 0.0
+        return out
 
 # ------------------------------------------------------------------------------

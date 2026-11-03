@@ -577,6 +577,35 @@ def test_comm_closed_form():
     check("HO-SFL(K=2) one server/client update per group (fewer than batches)",
           len(groups) < R * M3 * K, f"groups={len(groups)}")
     check_paper_rows("HO-SFL(K=2)", res)
+
+    # ---- MU-SplitFed: paper Alg.1, K = 2 of 3 clients, aggregate every step --
+    cfg_mu, res_mu = build_run('mu_splitfed', M3, N, B, R, extra_algo={
+        'tau': 2, 'zo_mu': 5e-3, 'lr_c': 5e-3, 'lr_s': 1e-2, 'lr_g': 0.3,
+        'use_pretrained': False, 'freeze_bn': False, 'sampled_clients': KS,
+    })
+    bd_mu = res_mu.comm_breakdown
+    groups_mu = res_mu.breakdown['schedule']['groups']
+    used_mu = Counter(m for S in groups_mu for m in S)
+    batches = R * M3 * K                      # one participation per client batch
+    check("MU-SplitFed every client uses all its batches every round",
+          all(used_mu[m] == R * K for m in range(M3)) and all(len(S) <= KS for S in groups_mu),
+          f"used={dict(used_mu)}")
+    check_eq("MU-SplitFed cut.act_up = 3 activations (h, h+, h-) per client batch (Eq.4)",
+             last(bd_mu, 'cut.act_up'), 3 * R * M3 * sum(act_bytes(b) for b in bs_list))
+    check_eq("MU-SplitFed cut.labels_up (every client batch)",
+             last(bd_mu, 'cut.labels_up'), R * M3 * sum(label_bytes(b) for b in bs_list))
+    check_eq("MU-SplitFed cut.scalar_down = one 4 B scalar per client batch (Eq.6)",
+             last(bd_mu, 'cut.scalar_down'), batches * 4)
+    check_eq("MU-SplitFed cut.grad_down is ZERO (zeroth-order)", last(bd_mu, 'cut.grad_down'), 0)
+    check_eq("MU-SplitFed client up = one model per client batch (Alg.1 L11)",
+             last(bd_mu, 'weights.client_up'), batches * client_model_bytes())
+    check_eq("MU-SplitFed client down = one pull per client batch (Alg.1 L3)",
+             last(bd_mu, 'weights.client_down'), batches * client_model_bytes())
+    check_eq("MU-SplitFed server copies averaged locally: no server traffic",
+             last(bd_mu, 'weights.server_up') + last(bd_mu, 'weights.server_down'), 0)
+    check("MU-SplitFed aggregates every iteration (one per group)",
+          len(groups_mu) < batches, f"groups={len(groups_mu)} batches={batches}")
+    check_paper_rows("MU-SplitFed", res_mu)
     # Dimension-free aggregation: HO-SFL sends (scalar, seed) pairs per update
     # rather than a weight vector, so its aggregation traffic scales with the
     # NUMBER OF UPDATES and not with the model's parameter count. The margin over

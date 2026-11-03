@@ -47,8 +47,9 @@ def module_static_bytes(*modules):
 
     Buffers count: BatchNorm running stats are real device memory. Gradients
     count too, and must be *measured* rather than assumed zero for zeroth-order
-    methods -- `_perturb_accumulate_grad` in ho_sfl/hosl/mu_splitfed allocates a
-    real `.grad` for every perturbed parameter.
+    methods -- `_perturb_accumulate_grad` in ho_sfl/hosl allocates a real
+    `.grad` for every perturbed parameter (mu_splitfed updates in place and
+    allocates none).
     """
     param_size = 0
     grad_size = 0

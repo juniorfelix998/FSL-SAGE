@@ -6,11 +6,15 @@ zo_mu   : 0.005
 lr_c    : 0.005
 lr_s    : 0.01
 lr_g    : 0.3
-# matches the reference's own conf/mu_splitfed.yaml (HKU-WILL-Lab/HO-SFL):
-# use_pretrained loads an ImageNet-pretrained ResNet18 backbone at init;
-# freeze_bn freezes BatchNorm's affine weight/bias (requires_grad=False) so
-# the ZO perturbation loop skips them, while running mean/var still adapt
-# normally in train mode -- see src/algos/mu_splitfed.py's header comment for
-# the full explanation and why this does NOT mean BatchNorm runs in eval mode.
-use_pretrained : true
-freeze_bn      : true
+# tau, zo_mu, lr_c, lr_s, lr_g: the paper's Table 6 (also the vision
+# reference's conf/mu_splitfed.yaml).
+#
+# Benchmark fairness: every method starts from the SAME random init, so the
+# vision reference's ImageNet-pretrained ResNet-18 + frozen BN is off. Set both
+# to true to reproduce the reference's setting.
+use_pretrained : false
+freeze_bn      : false
+# Paper Alg.1 / p.8: 50% of the clients take part in each round (5 of 10).
+# Run with model.client.batch_size=32 so one update sees 5 x 32 = 160 images,
+# as in the paper; batch 256 gives memory comparable with the other methods.
+sampled_clients: 5

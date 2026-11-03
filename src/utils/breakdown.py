@@ -14,7 +14,7 @@
 # Units are MiB (1024**2 bytes), the same unit as the benchmark table's "MB"
 # columns.
 #
-# CSE-FSL, FSL-SAGE and HO-SFL have paper-labelled rows; any other method
+# CSE-FSL, FSL-SAGE, HO-SFL and MU-SplitFed have paper-labelled rows; any other method
 # falls back to the raw ledger categories.
 # ------------------------------------------------------------------------------
 import math
@@ -147,6 +147,32 @@ PAPER_COMPONENTS = {
              ('weights.aux_down',), _aux_down_every_l, 'Weights'),
             ('W5', f'{SERVER_FEDAVG_NAME} (per-client x_s copies)',
              'p.8: "a single server-side model is maintained" -> none',
+             ('weights.server_up', 'weights.server_down'), _never, 'Weights'),
+        ],
+    },
+    'mu_splitfed': {
+        'paper': 'MU-SplitFed, Liang et al., arXiv:2510.21155 (vision reimplementation)',
+        'rows': [
+            ('C1', 'Activations h, h+, h-, client -> server',
+             'Eq.(4), Alg.1 L5: 3 per client batch (clean + two perturbed); 3 x N x R x batches per round',
+             ('cut.act_up',), lambda s: 3 * _every_batch(s), 'Cut'),
+            ('C2', 'Labels y with each client batch, client -> server',
+             'p.3: the Split Server holds the label and computes the loss; N x R x batches per round',
+             ('cut.labels_up',), _every_batch, 'Cut'),
+            ('C3', 'Gradient at the cut, server -> client',
+             'zeroth-order on both sides: never sent',
+             ('cut.grad_down',), _never, 'Cut'),
+            ('C4', 'Loss-difference scalar delta, server -> client',
+             'Eq.(6), Alg.1 L9: one per client batch; N x R x batches per round',
+             ('cut.scalar_down',), _every_batch, 'Cut'),
+            ('W1', 'Client model x_c upload (for aggregation)',
+             'Alg.1 L11, Eq.(7): after every client batch; N x R x batches per round',
+             ('weights.client_up',), _every_batch, 'Weights'),
+            ('W2', 'Global client model x_c download (pull)',
+             'Alg.1 L3: before every client batch; N x R x batches per round',
+             ('weights.client_down',), _every_batch, 'Weights'),
+            ('W5', f'{SERVER_FEDAVG_NAME} (per-client x_s copies)',
+             'Eq.(7), Fig.1: averaged inside the Split Server -> no network traffic',
              ('weights.server_up', 'weights.server_down'), _never, 'Weights'),
         ],
     },
@@ -283,7 +309,7 @@ def render(bd):
     out.append(
         f"N = {s['num_clients']} clients, R = {s['rounds']} rounds, "
         f"local iters/round = {[e * it for e, it in zip(s['epochs'], s['iters_per_epoch'])]}, "
-        f"h = {s.get('h')}, l = {s.get('l')}, P = {s.get('P')}, K = {s.get('K')}.  Units: MiB (= table 'MB')."
+        f"h = {s.get('h')}, l = {s.get('l')}, P = {s.get('P')}, K = {s.get('K')}, tau = {s.get('tau')}.  Units: MiB (= table 'MB')."
     )
     out.append('')
     out.append('### Communication')

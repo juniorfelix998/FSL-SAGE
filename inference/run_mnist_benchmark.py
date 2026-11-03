@@ -63,8 +63,9 @@ def parse_args():
     p.add_argument('--comm_threshold_mb', type=float, default=None,
                     help="raise the communication budget that early-stops a "
                          "run (config.yaml default 204800 = 200 GiB). "
-                         "MU-SplitFed at 10 clients burns ~890 MB/round and "
-                         "would otherwise truncate silently at ~230 rounds")
+                         "MU-SplitFed at 10 clients, batch 32, sends ~11 GiB per "
+                         "round (a model up and down every step) and would "
+                         "otherwise truncate silently at ~18 rounds")
     p.add_argument('--measure_memory', default=None,
                     choices=['true', 'false'],
                     help="per-side memory instrumentation (default on). "

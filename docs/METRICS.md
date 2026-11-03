@@ -179,7 +179,9 @@ include **buffers** — BatchNorm running stats are real bytes on the wire
    despite being local-loss methods: their servers compute their own
    cross-entropy, so the labels really do cross.
 2. **Server-side aggregation is charged a full model round-trip** in every
-   multi-server method — SplitFedv1, FedSplitX, Han-et-al, MU-SplitFed. The
+   multi-server method — SplitFedv1, FedSplitX, Han-et-al (and MU-SplitFed in its
+   old port; it now follows its paper, where the Split Server averages its copies
+   locally, so it is not charged). The
    reference implementations charge this as *zero*, on the grounds that
    per-client server replicas live on one host, so averaging them is a memory
    copy rather than network traffic. This harness charges it because the
@@ -233,7 +235,7 @@ Subtract it and the picture changes completely:
 |---|---|---|---|
 | SplitFedv1 | 512.30 | 480.94 | **31.36** |
 | SplitFedv2 | 31.36 | 0.00 | **31.36** |
-| MU-SplitFed | 512.30 | 480.94 | **31.36** |
+| MU-SplitFed (old port) | 512.30 | 480.94 | **31.36** |
 | Han-et-al | 513.23 | 480.94 | **32.29** |
 | FedSplitX | 512.50 | 481.06 | **31.44** |
 | CSE-FSL | 127.71 | 0.00 | 127.71 |
@@ -270,7 +272,7 @@ A row that violates its signature is a bug, not a finding.
 | FedSplitX | **0** | > 0 | collaborative local loss both sides, M=3 auxiliary heads |
 | HOSL | **0** | **0** | zeroth-order, shares nothing; **2Q+1 `act_up` and 2Q `scalar_down` per batch** |
 | HO-SFL | > 0 | > 0, `zo_*` only | client needs the cut gradient for its ZO probe |
-| MU-SplitFed | **0** | > 0 | 3× `act_up` (fixed + two probes), 1 `scalar_down` |
+| MU-SplitFed | **0** | > 0, `client_up/down` only (one each per client batch) | 3× `act_up` (h, h+, h−), 1 `labels_up`, 1 `scalar_down` per client batch |
 | LocFedMix-SL | > 0 | > 0 | server-side Mixup; the *regularizer* is local, the cut gradient is real |
 
 HO-SFL and MU-SplitFed were cross-checked line-for-line against the authors' own
@@ -655,7 +657,7 @@ reimplementations, all now checked against their papers.
 | CSE-FSL | Mu & Shen, TMC 2025 | ✔ | authors' method, in-harness | — |
 | FSL-SAGE | Nair et al., ICML 2025 | ✔ | this repo's own method | — |
 | HO-SFL | Chen et al., ICML 2026 | ✔ | authors' `communicator.py`, category-for-category | client carries AdamW state (its reference's own optimizer) |
-| MU-SplitFed | Liang et al., NeurIPS 2025 | 3rd-party | `HKU-WILL-Lab/HO-SFL` runner, line-for-line; every hyperparameter matches | runs ~47 ZO steps/round vs the reference's 1 (our matched-rounds rule) |
+| MU-SplitFed | Liang et al., NeurIPS 2025 | 3rd-party | `HKU-WILL-Lab/HO-SFL` vision runner, checked step by step against the paper's Alg.1 (aggregation every step, 5 of 10 clients sampled) | random init; fair sampling so every client uses all its data each round |
 | **DSL-Aux** | arXiv:2601.19261 | — | Alg. 1, §III-B, §III-C, §IV-A | not validated against the paper's reported accuracy |
 | **FedSplitX** | arXiv:2310.14579 | — | §2.1–2.2 Fig. 1: auxiliary net at every partition point, collaborative loss, ensemble inference (§3) | client heterogeneity not exercised — one shared cut means `heteroavg` degenerates to FedAvg |
 | **Han-et-al** | Han et al., FL-ICML 2021 | — | §3 Eq. 1–5: two local losses, no cut gradient; auxiliary now ~0.18% of model, inside the paper's stated 0.1–0.6% | **server-side replicas + server FedAvg are this harness's own extrapolation**, not in the paper |
