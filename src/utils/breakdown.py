@@ -14,7 +14,7 @@
 # Units are MiB (1024**2 bytes), the same unit as the benchmark table's "MB"
 # columns.
 #
-# CSE-FSL, FSL-SAGE, HO-SFL and MU-SplitFed have paper-labelled rows; any other method
+# CSE-FSL, FSL-SAGE, HO-SFL, MU-SplitFed and FedSplitX have paper-labelled rows; any other method
 # falls back to the raw ledger categories.
 # ------------------------------------------------------------------------------
 import math
@@ -56,6 +56,12 @@ def _initial_plus_per_round(s):
 def _aux_down_every_l(s):
     '''FSL-SAGE: aligned aux model sent to each client in rounds t % l == 0.'''
     return s['num_clients'] * math.ceil(s['rounds'] / s['l'])
+
+
+def _sampled_per_round(s):
+    '''FedSplitX Alg.1 L3: S sampled clients per round, one transfer each:
+    S x R.'''
+    return s['S'] * s['rounds']
 
 
 def _never(s):
@@ -148,6 +154,36 @@ PAPER_COMPONENTS = {
             ('W5', f'{SERVER_FEDAVG_NAME} (per-client x_s copies)',
              'p.8: "a single server-side model is maintained" -> none',
              ('weights.server_up', 'weights.server_down'), _never, 'Weights'),
+        ],
+    },
+    'fedsplitx': {
+        'paper': 'FedSplitX, Shin et al., arXiv:2310.14579 (reimplementation, no public code)',
+        'rows': [
+            ('C1', 'Smashed data of ALL the client\'s images, one upload, client -> server',
+             'Alg.1 L7 / L18 GetSmashedData: once per sampled client per round; S x R',
+             ('cut.act_up',), _sampled_per_round, 'Cut'),
+            ('C2', 'Labels of all the client\'s images, with the smashed data',
+             'Alg.1 L18: "send s^c_k and y_k to the server"; S x R',
+             ('cut.labels_up',), _sampled_per_round, 'Cut'),
+            ('C3', 'Gradient at the cut, server -> client',
+             'p.4, Fig.1: clients train on their own aux losses -> never sent',
+             ('cut.grad_down',), _never, 'Cut'),
+            ('W1', 'Client model w^c upload (for heteroavg)',
+             'Alg.1 L12: once per sampled client per round; S x R',
+             ('weights.client_up',), _sampled_per_round, 'Weights'),
+            ('W2', 'Global client model w^c download',
+             'Alg.1 L5 (printed w^s[:d_k], a typo for w^c): start of every round; S x R',
+             ('weights.client_down',), _sampled_per_round, 'Weights'),
+            ('W3', 'Client aux networks a_[1..d_k] upload',
+             'NOT SPECIFIED: averaged with the client model (L12); S x R',
+             ('weights.aux_up',), _sampled_per_round, 'Weights'),
+            ('W4', 'Global client aux networks download',
+             'NOT SPECIFIED: sent with the client model (L5); S x R',
+             ('weights.aux_down',), _sampled_per_round, 'Weights'),
+            ('W5', f'{SERVER_FEDAVG_NAME} (per-client w^s copies)',
+             'Alg.1 L6 (copy down) + L12 (copy up, averaged); charged: 2 x S x R',
+             ('weights.server_up', 'weights.server_down'),
+             lambda s: 2 * _sampled_per_round(s), 'Weights'),
         ],
     },
     'mu_splitfed': {
@@ -309,7 +345,7 @@ def render(bd):
     out.append(
         f"N = {s['num_clients']} clients, R = {s['rounds']} rounds, "
         f"local iters/round = {[e * it for e, it in zip(s['epochs'], s['iters_per_epoch'])]}, "
-        f"h = {s.get('h')}, l = {s.get('l')}, P = {s.get('P')}, K = {s.get('K')}, tau = {s.get('tau')}.  Units: MiB (= table 'MB')."
+        f"h = {s.get('h')}, l = {s.get('l')}, P = {s.get('P')}, K = {s.get('K')}, tau = {s.get('tau')}, S = {s.get('S')} clients trained per round.  Units: MiB (= table 'MB')."
     )
     out.append('')
     out.append('### Communication')

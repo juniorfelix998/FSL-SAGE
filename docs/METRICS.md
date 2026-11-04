@@ -237,7 +237,7 @@ Subtract it and the picture changes completely:
 | SplitFedv2 | 31.36 | 0.00 | **31.36** |
 | MU-SplitFed (old port) | 512.30 | 480.94 | **31.36** |
 | Han-et-al | 513.23 | 480.94 | **32.29** |
-| FedSplitX | 512.50 | 481.06 | **31.44** |
+| FedSplitX (old port) | 512.50 | 481.06 | **31.44** |
 | CSE-FSL | 127.71 | 0.00 | 127.71 |
 | FSL-SAGE | 47.42 | 0.00 | 47.42 |
 | LocFedMix-SL | 32.22 | 0.00 | 32.22 |
@@ -269,7 +269,7 @@ A row that violates its signature is a bug, not a finding.
 | FSL-SAGE | **0** | > 0 | surrogate synthesises the cut gradient; aux charged download-only |
 | DSL-Aux | **0** | **0** | decoupled *and* genuinely shares nothing (see §6) |
 | Han-et-al (LGL-SL) | **0** | > 0 | local losses both sides |
-| FedSplitX | **0** | > 0 | collaborative local loss both sides, M=3 auxiliary heads |
+| FedSplitX | **0** | > 0 | aux losses at the stem, layer1, layer2 (M=3, all on the client at the middle cut); smashed data of all D_k sent once per round |
 | HOSL | **0** | **0** | zeroth-order, shares nothing; **2Q+1 `act_up` and 2Q `scalar_down` per batch** |
 | HO-SFL | > 0 | > 0, `zo_*` only | client needs the cut gradient for its ZO probe |
 | MU-SplitFed | **0** | > 0, `client_up/down` only (one each per client batch) | 3× `act_up` (h, h+, h−), 1 `labels_up`, 1 `scalar_down` per client batch |
@@ -659,7 +659,7 @@ reimplementations, all now checked against their papers.
 | HO-SFL | Chen et al., ICML 2026 | ✔ | authors' `communicator.py`, category-for-category | client carries AdamW state (its reference's own optimizer) |
 | MU-SplitFed | Liang et al., NeurIPS 2025 | 3rd-party | `HKU-WILL-Lab/HO-SFL` vision runner, checked step by step against the paper's Alg.1 (aggregation every step, 5 of 10 clients sampled) | random init; fair sampling so every client uses all its data each round |
 | **DSL-Aux** | arXiv:2601.19261 | — | Alg. 1, §III-B, §III-C, §IV-A | not validated against the paper's reported accuracy |
-| **FedSplitX** | arXiv:2310.14579 | — | §2.1–2.2 Fig. 1: auxiliary net at every partition point, collaborative loss, ensemble inference (§3) | client heterogeneity not exercised — one shared cut means `heteroavg` degenerates to FedAvg |
+| **FedSplitX** | arXiv:2310.14579 | — | Alg. 1 line by line (L3 sampling C = 10%, L5-6 download, L7/L18 one bulk upload of all D_k, L13-16 aux losses, L9-11 server, L12 heteroavg), App. A.1 partition points, ensemble inference (§3) | all clients at one depth level (the middle cut = level 3), so `heteroavg` is a plain average; aux head, lr, ensemble rule not given in the paper (see `src/algos/fedsplitx.py`) |
 | **Han-et-al** | Han et al., FL-ICML 2021 | — | §3 Eq. 1–5: two local losses, no cut gradient; auxiliary now ~0.18% of model, inside the paper's stated 0.1–0.6% | **server-side replicas + server FedAvg are this harness's own extrapolation**, not in the paper |
 | **HOSL** | arXiv:2601.10940 | — | Def. 3 / Eq. 6–7 two-sided estimator, Alg. 1 three phases, App. VII-A (ε=1e-3, Q=10, SGD no momentum), Eq. 15/18 no grad or activation storage | not validated against the paper's reported accuracy (its experiments are OPT/GLUE, not vision) |
 | **LocFedMix-SL** | Oh et al., WWW 2022 | — | Eq. 4 real cut gradient, Eq. 5–7 smashed-data mixup detached from the lower segment, Eq. 8 split update, Eq. 9–10 aggregation | decoder architecture is a stand-in (paper specifies only that h maps smashed → reconstruction); `T_c = 1`, the paper's own best-accuracy endpoint on its Fig. 6 trade-off |

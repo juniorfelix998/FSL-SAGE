@@ -1,3 +1,12 @@
 defaults:
   - base_algorithm
 name: fedsplitx
+# Alg.1 L3 / p.5: a fraction C of the clients trains each round (paper: 10%).
+# With 10 clients that is ONE client per round, S = max(1, round(C * N)).
+client_fraction: 0.1
+# p.5: SGD. The learning rate, momentum and weight decay are NOT SPECIFIED in
+# the paper: lr 0.01, plain SGD (no momentum, no weight decay), no schedule.
+lr          : 0.01
+momentum    : 0.0
+weight_decay: 0.0
+# Batch: the benchmark's 256 (model.client.batch_size); the paper uses 64.

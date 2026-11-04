@@ -254,6 +254,16 @@ class FLAlgorithm(ABC):
         FSL-SAGE's alignment, Alg. 1 l.3-4). No-op for most methods.'''
         pass
 
+    def participates(self, t, i):
+        '''Whether client i trains in round t. True for every method except
+        those whose paper samples a subset of clients per round (FedSplitX
+        Alg.1 L3); a client that sits out runs no batch and sends nothing.'''
+        return True
+
+    def sampled_per_round(self):
+        '''Clients that train in each round (S); all of them by default.'''
+        return len(self.clients)
+
     def end_step(self):
         self.meter.end_step()
         out, self._phase_times = self._phase_times, {}
@@ -294,6 +304,9 @@ class FLAlgorithm(ABC):
             'P': self.cfg.get('zo_p'),
             'K': self.group_size(),
             'tau': self.cfg.get('tau'),
+            # clients that train in each round (FedSplitX Alg.1 L3 samples a
+            # fraction C of them; every other method: all N)
+            'S': self.sampled_per_round(),
             # clients sampled in each grouped iteration, in order (None for
             # the per-client loop); lets the breakdown replay Alg.3 catch-ups
             'groups': getattr(self, 'group_log', None),
@@ -584,13 +597,13 @@ def __aggregate_metrics_dict(
         else:
             return (inc_k in k)
 
-    agg_metrics_dict = {
-        k: [reduction(v)] for k, v in client_metrics_dict[0].items()
-        if key_condition(k, keys, excl_keys)
-    }
-    for met_dict in client_metrics_dict[1:]:
-        [agg_metrics_dict[k].append(reduction(v)) for k, v in met_dict.items()
-         if key_condition(k, keys, excl_keys)]
+    # setdefault rather than client 0's keys: under per-round client sampling
+    # (FedSplitX) a client may never have trained, so its dict can be empty
+    agg_metrics_dict = {}
+    for met_dict in client_metrics_dict:
+        [agg_metrics_dict.setdefault(k, []).append(reduction(v))
+         for k, v in met_dict.items()
+         if key_condition(k, keys, excl_keys) and len(v)]
 
     return agg_metrics_dict
 
@@ -661,8 +674,7 @@ def log_and_step_lr_per_client(i, alg, alg_name):
     # for auxiliary models. For fsl_sage, the optimization happens within the
     # align() method.
     aux_algorithms = (
-        'cse_fsl', 'fsl_sage', 'dsl_aux', 'han_locloss', 'fedsplitx',
-        'locfedmix_sl',
+        'cse_fsl', 'fsl_sage', 'dsl_aux', 'han_locloss', 'locfedmix_sl',
     )
     if alg_name in aux_algorithms:
         lr_dict['aux_lr'] = take_lr_step(alg.clients[i].auxiliary_model)
@@ -749,6 +761,10 @@ def _run_fl_algorithm(
                 colour='blue'
             ) as pbar:
                 for i in pbar:
+                    # a client the method did not sample this round (FedSplitX
+                    # Alg.1 L3) trains on nothing and logs nothing
+                    if grouped is None and not alg.participates(t, i):
+                        continue
                     if grouped is not None:
                         tr_mets = grouped[i]
                     else:

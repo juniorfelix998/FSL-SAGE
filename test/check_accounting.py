@@ -606,6 +606,35 @@ def test_comm_closed_form():
     check("MU-SplitFed aggregates every iteration (one per group)",
           len(groups_mu) < batches, f"groups={len(groups_mu)} batches={batches}")
     check_paper_rows("MU-SplitFed", res_mu)
+
+    # ---- FedSplitX: paper Alg.1, C = 2/3 -> S = 2 of 3 clients per round ----
+    cfg_fx, res_fx = build_run('fedsplitx', M3, N, B, R, extra_algo={
+        'client_fraction': 2 / 3, 'lr': 0.01, 'momentum': 0.0,
+    })
+    bd_fx = res_fx.comm_breakdown
+    S_fx = 2
+    # the tiny model has no ResNet stages -> one aux head at the cut (M = 1)
+    head_bytes = (CUT_CHANNELS * NUM_CLASSES + NUM_CLASSES) * 4
+    trained = sum(len(m.get('loss', [])) for m in res_fx.train_metrics)
+    check_eq("FedSplitX trains S sampled clients per round (Alg.1 L3)",
+             trained, R * S_fx)
+    check("FedSplitX a sampled client trains on all its batches",
+          all(len(m.get('loss', [])) <= R for m in res_fx.train_metrics))
+    check_eq("FedSplitX cut.act_up = ONE upload of all D_k per sampled client (L7/L18)",
+             last(bd_fx, 'cut.act_up'), R * S_fx * sum(act_bytes(b) for b in bs_list))
+    check_eq("FedSplitX act_up transfer count = S x R",
+             last(bd_fx, 'count.cut.act_up'), R * S_fx)
+    check_eq("FedSplitX cut.labels_up (all D_k, with the upload)",
+             last(bd_fx, 'cut.labels_up'), R * S_fx * sum(label_bytes(b) for b in bs_list))
+    check_eq("FedSplitX cut.grad_down is ZERO", last(bd_fx, 'cut.grad_down'), 0)
+    for d in ('up', 'down'):
+        check_eq(f"FedSplitX weights.client_{d} = S x R client models (L5 / L12)",
+                 last(bd_fx, f'weights.client_{d}'), R * S_fx * client_model_bytes())
+        check_eq(f"FedSplitX weights.aux_{d} = S x R aux heads",
+                 last(bd_fx, f'weights.aux_{d}'), R * S_fx * head_bytes)
+        check_eq(f"FedSplitX weights.server_{d} = S x R server copies (L6 / L12)",
+                 last(bd_fx, f'weights.server_{d}'), R * S_fx * server_model_bytes())
+    check_paper_rows("FedSplitX", res_fx)
     # Dimension-free aggregation: HO-SFL sends (scalar, seed) pairs per update
     # rather than a weight vector, so its aggregation traffic scales with the
     # NUMBER OF UPDATES and not with the model's parameter count. The margin over
@@ -676,7 +705,8 @@ ALGO_EXTRAS = {
     'fsl_sage':         {'server_update_interval': 2, 'align_interval': 1},
     'dsl_aux':          {},   # lambda = 0 per the paper; no weight to tune
     'han_locloss':      {},
-    'fedsplitx':        {},
+    # every client trains (C = 1) so client 0's metrics exist for the checks
+    'fedsplitx':        {'client_fraction': 1.0},
     'locfedmix_sl':     {'mixup_alpha': 1.0, 'mixup_partners': 1,
                           'decoder_lr': 1e-3},
     'hosl':             {'num_pert': 2, 'zo_mu': 1e-3, 'client_lr': 1e-3, 'server_lr': 1e-3},
@@ -809,11 +839,11 @@ def test_all_methods_on_real_model():
                   f"vs client model alone {_client_only_param_mb():.4f} MiB")
 
         if algo == 'fedsplitx':
-            # arXiv:2310.14579 Fig. 1 / Sec. 2.1: an auxiliary network at EVERY
-            # partition point. A 4-stage ResNet has M = 3 of them (after
-            # layer1/2/3; layer4's output is l_{M+1}), split between the sides
-            # by the client's depth-level. Asserting the count is what keeps
-            # this method from collapsing back to the single-head M=1 case that
+            # arXiv:2310.14579 Fig. 1 / Appendix A.1: an auxiliary network at
+            # EVERY partition point -- after the stem, layer1 and layer2 (M =
+            # 3). The shallow cut used here is depth level 2: client a_[1],
+            # a_[2]; server a_[3]. Asserting the count is what keeps this
+            # method from collapsing back to the single-head M=1 case that
             # made it a duplicate of han_locloss.
             tr = res.train_metrics[0]
             n_c, n_s = tr['n_client_aux'][0], tr['n_server_aux'][0]

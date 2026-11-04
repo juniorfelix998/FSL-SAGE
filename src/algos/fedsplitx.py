@@ -1,345 +1,438 @@
 # ------------------------------------------------------------------------------
 # FedSplitX: Federated Split Learning for Computationally-Constrained
 # Heterogeneous Clients (Shin, Ahn, Kang, Kang -- arXiv:2310.14579).
-# AI-ASSISTED NO-CODE REIMPLEMENTATION per CLAUDE.md's rule for methods without
-# a released implementation; not validated against the paper's own reported
-# CIFAR-10/CIFAR-100 numbers.
 #
-# WHAT DEFINES THIS METHOD (Sec. 2.1-2.2, Fig. 1): the model is cut at M
-# PARTITION POINTS, and an auxiliary network a_[i] hangs off EVERY one of them.
-# A client at depth-level d_k holds a_[1:d_k] on its side; the server holds
-# a_[d_k+1:M] plus the model's own output head. Both sides then train on a
-# COLLABORATIVE LOSS -- a SUM of losses over all the intermediate logits they
-# own, not a single loss at the cut:
+# PROVENANCE. The authors released no code, so this is an AI-ASSISTED
+# REIMPLEMENTATION written from the paper alone (Algorithm 1 p.3, Sec. 2.1-2.3,
+# Sec. 3, Appendix A.1). Label it a reimplementation wherever it is reported.
+# Every place the paper leaves a choice open is marked NOT SPECIFIED below,
+# with the choice made here.
 #
-#   client (Sec. 2.2): F^c_k = 1/|D_k| * sum_j sum_{i=1..d_k} l_c(l^k_{i,j}, y_j)
-#                      with l^k_i = a_[i]( f^c_k[:i](w^c; x) )
-#   server (Sec. 2.2): F^s_k = 1/|D_k| * sum_j sum_{i=d_k+1..M+1} l_s(l^k_i, y_j)
-#                      with l^k_{M+1} = f^k(w^s; s^c_k), the real output
+# THE MODEL (Sec. 2.1, Fig. 1, Appendix A.1). The network is cut at M partition
+# points; an auxiliary network a_[i] sits at every one of them. For ResNet-18
+# the paper's partition points are after the stem (conv1+bn+relu+maxpool),
+# after layer1 and after layer2 (M = 3); a client at depth level d_k holds the
+# layers up to point d_k plus a_[1..d_k], the server the rest plus a_[d_k+1..M]
+# and the model output. The benchmark's middle cut (client = stem..layer2) is
+# depth level 3 (Table 3: 689.4K client params; ours 683,072 + BN buffers), so
+#   client: stem, layer1, layer2 + a_[1] (stem), a_[2] (layer1), a_[3] (layer2)
+#   server: layer3, layer4, fc   -- no auxiliary network, only the output
+# cut=shallow is depth level 2 (client a_[1], a_[2]; server a_[3] after
+# layer2). cut=deep is not a paper partition point: the client keeps a_[1..3]
+# and the extra layer3 has no head. A backbone without these submodules (the
+# test model) falls back to one head at the cut (M = 1).
 #
-# No gradient ever crosses the cut: "clients can compute local-loss and perform
-# backward propagation using a_[m] without waiting for gradients from the
-# server" (Sec. 2.2). Inference uses the ENSEMBLE of all auxiliary networks
-# (Sec. 3), not the final head alone.
+# ALGORITHM 1, line by line, and where it is below:
+#   L3    P_t <- random set of clients, a fraction C        begin_round()
+#   L5    client downloads the global client-side model     client_step, 1st batch
+#         (printed as w^s[:d_k]; a typo for w^c)            -> client_down, aux_down
+#   L6    server copy w^s_k <- w^s[d_k:] for that client     -> server_down
+#   L7    s^c_k, y_k <- GetSmashedData(w^c_k, D_k)           client_step, 1st batch
+#   L18     forward ALL of D_k through the DOWNLOADED model,  -> ONE act_up + ONE
+#           send the smashed data and labels to the server       labels_up per round
+#   L8    Client_Update (L13-16): E epochs; loss             client_step, every batch
+#         sum_{i=1..d_k} CE(a_i(f[:i](x)), y), no weights;
+#         updates the client model and a_[1..d_k]
+#   L9-11 server trains w^s_k for E epochs on s^c_k with     client_step, every batch
+#         sum_{i=d_k+1..M+1} CE (output only at level 3)
+#   L12   heteroavg: each parameter is averaged over the      aggregate()
+#         clients that hold it (plain mean); the same for    -> client_up, aux_up,
+#         the server-side models                                 server_up
+# No gradient ever crosses the cut (p.4, B.2, Fig. 1). Inference (Sec. 3): the
+# ensemble of every auxiliary network and the model output; the paper reports
+# the client-side accuracy as well, logged here each round.
 #
-# HOW IT MAPS ONTO THIS HARNESS. CLAUDE.md's protocol runs every method at ONE
-# shared cut, so every client here sits at the SAME depth-level -- FedSplitX's
-# client HETEROGENEITY (clients clustered by compute into M depth-levels) is the
-# one part of the paper deliberately not exercised, and `heteroavg` (Sec. 2.3)
-# correspondingly degenerates to plain FedAvg because there is no depth-level
-# subset to exclude. Everything else IS exercised, because the partition points
-# are a property of the architecture, not of the client population: for a
-# 4-stage ResNet the partition points are the stage boundaries, so M = 3
-# (after layer1, layer2, layer3), with layer4's output supplying l_{M+1}. The
-# harness's `cut` then selects the depth-level shared by all clients:
+# NOT SPECIFIED in the paper, and the choice made here:
+#   - auxiliary network architecture: global average pool + one Linear layer
+#     (GAPLinearHead); 2,590 params in total at the middle cut
+#   - how the auxiliary networks are aggregated: averaged with the client
+#     model; their transfers are charged on separate rows (aux_up/aux_down)
+#   - loss: cross-entropy (the harness's NLLLoss on log-probabilities)
+#   - ensemble rule: mean of the heads' probabilities
+#   - learning rate / momentum / weight decay: SGD lr 0.01, no momentum, no
+#     weight decay (the paper only says SGD); no LR schedule
+#   - BatchNorm during GetSmashedData: batch statistics (train mode, as in
+#     Client_Update), with the running statistics restored afterwards, so
+#     Client_Update starts from exactly the downloaded model
+#   - which clients are averaged: the sampled clients P_t only
+#   - how the server walks its uploaded data: one step per client batch, on
+#     the matching slice of the upload, E = 1
 #
-#   cut=shallow (client_layers=1): client holds a_[1];        server a_[2], a_[3]
-#   cut=middle  (client_layers=2): client holds a_[1], a_[2]; server a_[3]
-#   cut=deep    (client_layers=3): client holds a_[1..3];     server none
-#
-# An EARLIER REVISION of this file was a byte-for-byte copy of han_locloss.py:
-# it used a single auxiliary head at the cut, which is the M=1 degenerate case
-# and is genuinely indistinguishable from Han et al. That produced two identical
-# rows in the benchmark. The multi-partition collaborative loss above is what
-# actually separates the two methods, and test/check_accounting.py now refuses
-# to let any two algorithms share a client_step implementation.
-#
-# Auxiliary network architecture: the paper does not specify one, so this uses
-# the standard lightweight auxiliary classifier -- global average pool to a
-# vector, then a single linear layer to the class logits. Kept deliberately
-# small, since the paper's premise is that auxiliary networks are cheap enough
-# to sit on a compute-constrained client.
+# Benchmark settings (decisions recorded with the user):
+#   - every client at the benchmark's middle cut (depth level 3), so heteroavg
+#     is a plain average; the paper's heterogeneous depth levels are not used
+#   - client_fraction C = 0.1 as in the paper (p.5): with 10 clients, ONE
+#     client trains per round, so FedSplitX sees 1/10 of the data per round
+#     compared with the methods that train every client
+#   - batch 256 (the batch every method uses; the paper uses 64)
+#   - the server-copy averaging (L12) is charged as Server-model FedAvg, one
+#     upload (L12) and one download (L6) of x_s per sampled client per round
+#   - random init, the same as every method
 # ------------------------------------------------------------------------------
 import time
 import copy
+import logging
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from tqdm import tqdm
 
-from algos import register_algorithm, aggregate_models, FLAlgorithm
-from models import config_optimizer
+from algos import register_algorithm, FLAlgorithm
+from utils.memory import module_static_bytes
+from utils.utils import calculate_load
 from models.aux_models.simple_conv import GAPLinearHead as _AuxHead
 
-_STAGE_NAMES = ('layer1', 'layer2', 'layer3', 'layer4')
+# Appendix A.1: ResNet-18 partition points, in order (stem output = maxpool)
+_PARTITION_POINTS = ('maxpool', 'layer1', 'layer2')
 
 
-# One FedSplitX auxiliary network a_[i] per partition point. Shared with
-# han_locloss so there is a single definition of "the paper-sized auxiliary
-# head" in the harness rather than one per method.
-
-
-def _stage_modules(model):
-    '''The architecture's partition points, in order.
-
-    Returns the NAMES of the ResNet stage submodules present on this side of
-    the cut -- names, not module objects, because every client holds its own
-    copy of the model and a hook must be attached to the copy actually being
-    forwarded. Empty for a backbone with no stage structure, in which case the
-    caller falls back to the cut itself as the single partition point (the
-    paper's M=1 case).
-    '''
-    return [n for n in _STAGE_NAMES
+def _taps(model):
+    '''Names of the paper's partition points present in this model. Names,
+    not module objects: each client forwards its own copy, so the hook has to
+    go on the copy actually being run.'''
+    return [n for n in _PARTITION_POINTS
             if isinstance(getattr(model, n, None), nn.Module)]
+
+
+def _forward_taps(model, tap_names, x):
+    '''Forward `model`, capturing the output of each tapped submodule.'''
+    feats = []
+    handles = [getattr(model, n).register_forward_hook(
+                   lambda _m, _i, o: feats.append(o))
+               for n in tap_names]
+    try:
+        out = model(x)
+    finally:
+        for h in handles:
+            h.remove()
+    return feats, out
+
+
+def _mean_into(target, models):
+    '''L12 heteroavg with every client at one depth level: the plain
+    (unweighted) mean of the given models, written into `target`. Integer
+    buffers (BatchNorm's num_batches_tracked) are taken from the first.'''
+    states = [m.state_dict() for m in models]
+    new = {}
+    for key, v in states[0].items():
+        if torch.is_floating_point(v):
+            new[key] = sum(s[key] for s in states) / len(states)
+        else:
+            new[key] = v.clone()
+    target.load_state_dict(new)
+
+
+def _ensemble(logps):
+    '''Mean of the heads' probabilities, returned as a log-probability (the
+    harness's criterion is NLLLoss): log(mean_i exp(logp_i)).'''
+    stacked = torch.stack(logps, dim=0)
+    return torch.logsumexp(stacked, dim=0) - np.log(stacked.shape[0])
 
 
 # ------------------------------------------------------------------------------
 @register_algorithm("fedsplitx")
 class FedSplitX(FLAlgorithm):
-    aggregated_auxiliary: torch.nn.Module
     aggregated_server: torch.nn.Module
 
     def __init__(self, *args, **kwargs):
         super(FedSplitX, self).__init__(*args, **kwargs)
+        n = len(self.clients)
+
+        # L3: fraction C of the clients per round (paper p.5: C = 10%)
+        self.C = float(self.cfg.get('client_fraction', 0.1))
+        self.S = max(1, int(round(self.C * n)))
+        self.sampled = list(range(n))
+
+        # every client starts from the same client model; one server copy per
+        # client (L6), re-extracted from the global w^s whenever it is sampled
+        for c in self.clients[1:]:
+            c.model.load_state_dict(self.clients[0].model.state_dict())
         self.servers = [copy.deepcopy(self.server) for _ in self.clients]
-        self.__build_partition_heads()
-        self.aggregated_auxiliary = self.client_aux[0]
-        self.aggregated_server = self.servers[0].model
-        self.aggregated_server_aux = self.server_aux[0]
 
-    # -- Sec. 2.1: an auxiliary network at every partition point -----------
-    def __build_partition_heads(self):
-        client_model = self.clients[0].model
-        server_model = self.servers[0].model
+        self._client_taps = _taps(self.clients[0].model)
+        self._server_taps = _taps(self.server.model)
+        self.__build_heads()
 
-        # partition points owned by each side. The client's stages each end at
-        # a partition point (the last one IS the cut); on the server every stage
-        # but the final one does, since the final stage feeds the real output.
-        self._client_taps = _stage_modules(client_model)
-        server_stages = _stage_modules(server_model)
-        self._server_taps = server_stages[:-1] if server_stages else []
+        # the global models the Fed server keeps between rounds
+        self.aggregated_client = copy.deepcopy(self.clients[0].model)
+        self.aggregated_aux = copy.deepcopy(self.client_aux[0])
+        self.aggregated_server = copy.deepcopy(self.server.model)
+        self.aggregated_server_aux = copy.deepcopy(self.server_aux[0])
 
-        sample = next(iter(self.test_loader))[0][:1].to(self.device)
-        c_feats, s_feats, was = self.__probe(client_model, server_model, sample)
+        # SGD (p.5); lr / momentum / weight decay NOT SPECIFIED -> config
+        sgd = lambda params: torch.optim.SGD(
+            params, lr=float(self.cfg.get('lr', 0.01)),
+            momentum=float(self.cfg.get('momentum', 0.0)),
+            weight_decay=float(self.cfg.get('weight_decay', 0.0)))
+        for c, heads in zip(self.clients, self.client_aux):
+            c.optimizer = sgd(c.model.parameters())
+            c.lr_scheduler = None
+        self.client_aux_optims = [sgd(h.parameters()) for h in self.client_aux]
+        for s, heads in zip(self.servers, self.server_aux):
+            s.optimizer = sgd(s.model.parameters())
+            s.lr_scheduler = None
+        self.server_aux_optims = [sgd(h.parameters()) if len(h) else None
+                                  for h in self.server_aux]
 
-        num_classes = int(self._probe_out.shape[1])
-        c_dims = [self.__feat_dim(f) for f in c_feats]
-        s_dims = [self.__feat_dim(f) for f in s_feats]
+        # per sampled client: the round's uploaded smashed data (L7/L18)
+        self._upload = {}
 
-        self.client_aux, self.server_aux = [], []
-        for c in self.clients:
-            heads = nn.ModuleList([_AuxHead(d, num_classes) for d in c_dims])
-            self.client_aux.append(heads.to(self.device))
-        for _ in self.servers:
-            heads = nn.ModuleList([_AuxHead(d, num_classes) for d in s_dims])
-            self.server_aux.append(heads.to(self.device))
-
-        # every client starts from the same auxiliary networks
-        for heads in self.client_aux[1:]:
-            heads.load_state_dict(self.client_aux[0].state_dict())
-        for heads in self.server_aux[1:]:
-            heads.load_state_dict(self.server_aux[0].state_dict())
-
-        self.client_aux_optims = [
-            config_optimizer(h.parameters(), c.optimizer_options)
-            for h, c in zip(self.client_aux, self.clients)
-        ] if c_dims else []
-        self.server_aux_optims = [
-            config_optimizer(h.parameters(), s.optimizer_options)
-            for h, s in zip(self.server_aux, self.servers)
-        ] if s_dims else []
-
-    def __probe(self, client_model, server_model, sample):
-        '''One eval-mode forward to learn each partition point's width.'''
+    # -- Sec. 2.1 / Appendix A.1: an auxiliary network at each point ---------
+    def __build_heads(self):
+        client_model, server_model = self.clients[0].model, self.server.model
+        sample = next(iter(self.test_loader))[0][:2].to(self.device)
         was = (client_model.training, server_model.training)
         client_model.eval(); server_model.eval()
-        try:
+        with torch.no_grad():
+            c_feats, z = _forward_taps(client_model, self._client_taps, sample)
+            if not self._client_taps:
+                c_feats = [z]                 # M = 1: one head at the cut
+            s_feats, out = _forward_taps(server_model, self._server_taps, z)
+        client_model.train(was[0]); server_model.train(was[1])
+
+        num_classes = int(out.shape[1])
+        dim = lambda f: int(f.shape[1]) if f.dim() == 4 else int(f.flatten(1).shape[1])
+        c_dims, s_dims = [dim(f) for f in c_feats], [dim(f) for f in s_feats]
+
+        first = nn.ModuleList([_AuxHead(d, num_classes) for d in c_dims]).to(self.device)
+        self.client_aux = [first] + [copy.deepcopy(first) for _ in self.clients[1:]]
+        first = nn.ModuleList([_AuxHead(d, num_classes) for d in s_dims]).to(self.device)
+        self.server_aux = [first] + [copy.deepcopy(first) for _ in self.clients[1:]]
+
+    @staticmethod
+    def __server_side_bytes(model, heads):
+        '''One transfer of a server-side model w^s_k: its layers plus its aux
+        networks a_[d_k+1..M] (none at the middle cut).'''
+        return calculate_load(model) + calculate_load(heads)
+
+    # -- L3: sample P_t ---------------------------------------------------------
+    def begin_round(self, t):
+        self.sampled = sorted(int(i) for i in np.random.choice(
+            len(self.clients), size=self.S, replace=False))
+
+    def participates(self, t, i):
+        return i in self.sampled
+
+    def sampled_per_round(self):
+        return self.S
+
+    # -- L7 / L18: GetSmashedData -----------------------------------------------
+    def __get_smashed_data(self, i):
+        '''Forward ALL of client i's data through the model it just
+        downloaded, before Client_Update, and send it in one upload.'''
+        model = self.clients[i].model
+        bn_state = {k: v.clone() for k, v in model.state_dict().items()}
+        smashed, labels = [], []
+        with torch.no_grad():
+            for x, y in self.clients[i].train_loader:
+                x = x.to(self.device).double() if self.use_64bit \
+                    else x.to(self.device).float()
+                smashed.append(model(x))
+                labels.append(y.to(self.device).long())
+        # BatchNorm used batch statistics above; put the running statistics
+        # back so Client_Update starts from exactly the downloaded model
+        model.load_state_dict(bn_state)
+        s, y = torch.cat(smashed), torch.cat(labels)
+        offsets = np.cumsum([0] + [t.shape[0] for t in labels]).tolist()
+        return s, y, offsets
+
+    def client_step(self, rd_cl_ep_it, x, y):
+        t, i, j, k = rd_cl_ep_it
+        client, server = self.clients[i].model, self.servers[i].model
+        mets = {}
+
+        if j == 0 and k == 0:
+            # L5: download the global client-side model (+ its aux networks)
+            client.load_state_dict(self.aggregated_client.state_dict())
+            self.client_aux[i].load_state_dict(self.aggregated_aux.state_dict())
+            self.charge_weights_model(self.aggregated_client, 'client', 'down')
+            self.charge_weights_model(self.aggregated_aux, 'aux', 'down')
+            # L6: the server copy for this client, from the global w^s
+            server.load_state_dict(self.aggregated_server.state_dict())
+            self.server_aux[i].load_state_dict(self.aggregated_server_aux.state_dict())
+            self.ledger.charge_weights('server_down', self.__server_side_bytes(
+                self.aggregated_server, self.aggregated_server_aux))
+            # L7 / L18: smashed data + labels of all of D_k, one upload
+            with self.phase('client', i):
+                s, ys, offsets = self.__get_smashed_data(i)
+            self.charge_cut_activation(s)
+            self.charge_cut_labels(ys)
+            self._upload[i] = (s, ys, offsets)
+
+        # --- L8, Client_Update (L13-16): sum of CE over a_[1..d_k] ----------
+        with self.phase('client', i):
+            self.clients[i].optimizer.zero_grad()
+            self.client_aux_optims[i].zero_grad()
+            c_feats, z = _forward_taps(client, self._client_taps, x)
+            if not self._client_taps:
+                c_feats = [z]
+            logps = [h(f) for h, f in zip(self.client_aux[i], c_feats)]
+            client_loss = sum(self.criterion(lp, y) for lp in logps)
+            client_loss.backward()
+            self.clients[i].optimizer.step()
+            self.client_aux_optims[i].step()
             with torch.no_grad():
-                c_feats, z = self.__forward_taps(client_model, self._client_taps, sample)
-                if not self._client_taps:
-                    c_feats = [z]
-                s_feats, out = self.__forward_taps(server_model, self._server_taps, z)
-                self._probe_out = out
-        finally:
-            client_model.train(was[0]); server_model.train(was[1])
-        return c_feats, s_feats, was
+                client_acc = _ensemble(logps).argmax(1).eq(y).float().mean().item()
+        del z, c_feats, logps
 
-    @staticmethod
-    def __feat_dim(f):
-        return int(f.shape[1]) if f.dim() == 4 else int(f.flatten(1).shape[1])
+        # --- L9-11: server trains its copy on the uploaded smashed data -----
+        s, ys, offsets = self._upload[i]
+        n_chunks = len(offsets) - 1
+        c = k % n_chunks
+        sx, sy = s[offsets[c]:offsets[c + 1]], ys[offsets[c]:offsets[c + 1]]
+        with self.phase('server', i):
+            self.hold('server', s, ys, i=i)       # the round's upload stays resident
+            opt_aux = self.server_aux_optims[i]
+            self.servers[i].optimizer.zero_grad()
+            if opt_aux is not None:
+                opt_aux.zero_grad()
+            s_feats, out = _forward_taps(server, self._server_taps, sx)
+            server_loss = self.criterion(out, sy)
+            for h, f in zip(self.server_aux[i], s_feats):
+                server_loss = server_loss + self.criterion(h(f), sy)
+            server_loss.backward()
+            self.servers[i].optimizer.step()
+            if opt_aux is not None:
+                opt_aux.step()
+            with torch.no_grad():
+                server_acc = out.argmax(1).eq(sy).float().mean().item()
 
-    @staticmethod
-    def __forward_taps(model, tap_names, x):
-        '''Forward `model`, capturing the output of each tapped stage.
+        mets.update({
+            'l_loss': float(client_loss.item()), 'l_acc': client_acc,
+            'g_loss': float(server_loss.item()), 'acc': server_acc,
+            'loss': float(server_loss.item()),
+            'n_client_aux': len(self.client_aux[i]),
+            'n_server_aux': len(self.server_aux[i]),
+        })
+        return mets
 
-        Hooks are attached to THIS model's submodules by name on every call.
-        Caching the module objects instead would silently tap client 0's copy
-        while client i>0 was the one actually running, yielding no features.
-        '''
-        feats = []
-        handles = [getattr(model, n).register_forward_hook(
-                       lambda _m, _i, o: feats.append(o))
-                   for n in tap_names]
-        try:
-            out = model(x)
-        finally:
-            for h in handles:
-                h.remove()
-        return feats, out
+    # -- L12: heteroavg over P_t -----------------------------------------------
+    def aggregate(self):
+        P = self.sampled
+        t0 = time.time()
+        _mean_into(self.aggregated_client, [self.clients[i].model for i in P])
+        _mean_into(self.aggregated_aux, [self.client_aux[i] for i in P])
+        for i in P:
+            self.charge_weights_model(self.clients[i].model, 'client', 'up')
+            self.charge_weights_model(self.client_aux[i], 'aux', 'up')
+        t1 = time.time()
+        _mean_into(self.aggregated_server, [self.servers[i].model for i in P])
+        if len(self.aggregated_server_aux):
+            _mean_into(self.aggregated_server_aux, [self.server_aux[i] for i in P])
+        for i in P:
+            self.ledger.charge_weights('server_up', self.__server_side_bytes(
+                self.servers[i].model, self.server_aux[i]))
+        self._upload = {}                      # the round's uploads are spent
+        return {'client_agg_compute_time': t1 - t0,
+                'server_agg_compute_time': time.time() - t1}
 
-    def full_model(self, x):
-        '''Sec. 3: inference uses the ENSEMBLE of all auxiliary networks.
-
-        Each head emits log-probabilities, so the ensemble is the log of the
-        mean probability -- logsumexp over the heads minus log(n) -- which keeps
-        the result a valid log-prob for the harness's NLLLoss.
-        '''
-        c_feats, z = self.__forward_taps(
-            self.aggregated_client, self._client_taps, x
-        )
+    # -- Sec. 3: inference = ensemble of every head + the output ------------------
+    def __heads_and_output(self, x):
+        c_feats, z = _forward_taps(self.aggregated_client, self._client_taps, x)
         if not self._client_taps:
             c_feats = [z]
-        s_feats, out = self.__forward_taps(
-            self.aggregated_server, self._server_taps, z
-        )
+        s_feats, out = _forward_taps(self.aggregated_server, self._server_taps, z)
+        client_logps = [h(f) for h, f in zip(self.aggregated_aux, c_feats)]
+        server_logps = [h(f) for h, f in zip(self.aggregated_server_aux, s_feats)]
+        return client_logps, server_logps, out
 
-        logits = [h(f) for h, f in zip(self.aggregated_auxiliary, c_feats)]
-        logits += [h(f) for h, f in zip(self.aggregated_server_aux, s_feats)]
-        logits.append(out)
-        stacked = torch.stack(logits, dim=0)
-        return torch.logsumexp(stacked, dim=0) - torch.log(
-            torch.tensor(float(stacked.shape[0]), device=stacked.device)
-        )
+    def full_model(self, x):
+        c, s, out = self.__heads_and_output(x)
+        return _ensemble(c + s + [out])
+
+    def evaluate(self):
+        '''The benchmark accuracy is the full-model ensemble (every head plus
+        the output). The client-side ensemble (a_[1..d_k] only), which the
+        paper also reports, is logged alongside.'''
+        self.eval_mode()
+        correct, client_correct, losses = 0, 0, []
+        with torch.no_grad():
+            for x, y in tqdm(self.test_loader, desc="Test Batch", unit='batch',
+                             leave=False):
+                x = x.to(self.device).double() if self.use_64bit \
+                    else x.to(self.device).float()
+                y = y.to(self.device).long()
+                c, s, out = self.__heads_and_output(x)
+                full = _ensemble(c + s + [out])
+                losses.append(self.criterion(full, y).item())
+                correct += full.argmax(1).eq(y).sum().item()
+                client_correct += _ensemble(c).argmax(1).eq(y).sum().item()
+        n = len(self.test_loader.dataset)
+        self.client_side_acc = client_correct / n
+        logging.info(f' > FedSplitX client-side ensemble acc (a_[1..{len(self.aggregated_aux)}]): '
+                     f'{100. * self.client_side_acc:.2f}%, full-model ensemble acc: '
+                     f'{100. * correct / n:.2f}%, sampled clients: {self.sampled}')
+        return correct / n, sum(losses) / len(losses)
 
     def special_models_train_mode(self, t):
-        if t > 0:
-            self.aggregated_server.train()
-            self.aggregated_auxiliary.train()
-        for h in self.client_aux + self.server_aux:
-            h.train()
+        for m in [self.aggregated_server, self.aggregated_aux,
+                  self.aggregated_server_aux] + [s.model for s in self.servers] \
+                 + self.client_aux + self.server_aux:
+            m.train()
 
     def special_models_eval_mode(self):
-        self.aggregated_server.eval()
-        self.aggregated_auxiliary.eval()
-        self.aggregated_server_aux.eval()
-        for h in self.client_aux + self.server_aux:
-            h.eval()
+        for m in [self.aggregated_server, self.aggregated_aux,
+                  self.aggregated_server_aux] + [s.model for s in self.servers] \
+                 + self.client_aux + self.server_aux:
+            m.eval()
 
-    # the client owns its model plus the a_[1:d_k] auxiliary networks; the
-    # server host owns one model replica and a_[d_k+1:M] per client
+    # -- memory partition ---------------------------------------------------------
+    # Client: its model + a_[1..d_k] (SGD without momentum: no optimizer state).
+    # Server per device: the global x_s + the copy being trained for one client
+    # (+ their aux networks when the server holds any); the round's upload is
+    # held as server working memory. Copies for the other sampled clients are
+    # listed separately.
     def client_side_modules(self, i):
         return [self.clients[i].model, self.client_aux[i]]
 
     def client_side_optimizers(self, i):
-        opt = [self.clients[i].optimizer]
-        if self.client_aux_optims:
-            opt.append(self.client_aux_optims[i])
-        return opt
+        return [self.clients[i].optimizer, self.client_aux_optims[i]]
+
+    def _trained_copy(self):
+        '''Index of a server copy that has actually been trained (a sampled
+        client), so its gradients are allocated and counted.'''
+        return self.sampled[0]
 
     def server_side_modules(self):
-        return [s.model for s in self.servers] + list(self.server_aux)
+        c = self._trained_copy()
+        mods = [self.aggregated_server, self.servers[c].model]
+        if len(self.aggregated_server_aux):
+            mods += [self.aggregated_server_aux, self.server_aux[c]]
+        return mods
 
     def server_side_optimizers(self):
-        return [s.optimizer for s in self.servers] + list(self.server_aux_optims)
+        c = self._trained_copy()
+        return [o for o in (self.servers[c].optimizer, self.server_aux_optims[c])
+                if o is not None]
 
-    # -- Algorithm 1 -------------------------------------------------------
-    def client_step(self, rd_cl_ep_it, x, y):
-        t, i, j, k = rd_cl_ep_it
+    def server_side_extra_memory(self):
+        others = self.S - 1
+        if others <= 0:
+            return []
+        params, grads = module_static_bytes(self.servers[0].model, self.server_aux[0])
+        return [{
+            'item': f'server copies of the other {others} sampled clients (params + grads)',
+            'mb': others * (params + grads) / 1024 ** 2,
+            'note': 'Alg.1 L6: one server-side copy per sampled client in a round',
+        }]
 
-        # --- Client_Update (Alg. 1 L13-16): collaborative loss over the
-        # client's own d_k partition points. Purely local -- never waits on
-        # the server, and its graph is released before the server runs.
-        with self.phase('client', i):
-            self.clients[i].optimizer.zero_grad()
-            if self.client_aux_optims:
-                self.client_aux_optims[i].zero_grad()
+    def register_meter_params(self):
+        # every client's and every server copy's parameters, so no parameter
+        # view (Linear saves weight.t()) is ever counted as an activation
+        mods = [self.server.model, self.aggregated_client, self.aggregated_aux,
+                self.aggregated_server, self.aggregated_server_aux]
+        for i in range(len(self.clients)):
+            mods += [self.clients[i].model, self.client_aux[i],
+                     self.servers[i].model, self.server_aux[i]]
+        self.meter.register_params(*mods)
 
-            c_feats, z = self.__forward_taps(
-                self.clients[i].model, self._client_taps, x
-            )
-            if not self._client_taps:
-                c_feats = [z]
-
-            client_loss = 0.0
-            last_logits = None
-            for head, f in zip(self.client_aux[i], c_feats):
-                last_logits = head(f)
-                client_loss = client_loss + self.criterion(last_logits, y)
-
-            client_loss.backward()
-            self.clients[i].optimizer.step()
-            if self.client_aux_optims:
-                self.client_aux_optims[i].step()
-
-            with torch.no_grad():
-                _, predicted = torch.max(last_logits.data, 1)
-                client_correct = predicted.eq(y.view_as(predicted)).sum().item()
-
-        # --- Alg. 1 L7-8: upload smashed data. One way -- no gradient returns.
-        smashed_data = z.detach()
-        self.charge_cut_activation(smashed_data)
-        self.charge_cut_labels(y)     # the server evaluates its own losses
-
-        # --- Alg. 1 L9-11: server's collaborative loss over a_[d_k+1:M] plus
-        # the model's own output l_{M+1}.
-        with self.phase('server', i):
-            self.servers[i].optimizer.zero_grad()
-            if self.server_aux_optims:
-                self.server_aux_optims[i].zero_grad()
-
-            s_feats, server_out = self.__forward_taps(
-                self.servers[i].model, self._server_taps, smashed_data
-            )
-            server_loss = self.criterion(server_out, y)
-            for head, f in zip(self.server_aux[i], s_feats):
-                server_loss = server_loss + self.criterion(head(f), y)
-
-            server_loss.backward()
-            self.servers[i].optimizer.step()
-            if self.server_aux_optims:
-                self.server_aux_optims[i].step()
-
-            with torch.no_grad():
-                _, predicted = torch.max(server_out.data, 1)
-                server_correct = predicted.eq(y.view_as(predicted)).sum().item()
-
-        return {
-            'l_loss': float(client_loss.item()),
-            'l_acc': client_correct / y.size(dim=0),
-            'g_loss': float(server_loss.item()),
-            'acc': server_correct / y.size(dim=0),
-            'loss': float(server_loss.item()),
-            'n_client_aux': len(self.client_aux[i]),
-            'n_server_aux': len(self.server_aux[i]),
-        }
-
-    def aggregate(self):
-        # heteroavg (Sec. 2.3) degenerates to plain FedAvg here: every client
-        # shares one depth-level under this harness's single-cut protocol, so
-        # there is no parameter subset to exclude from an average.
-        ret_dict = self.aggregate_clients()
-
-        t0 = time.time()
-        self.aggregated_auxiliary = aggregate_models(
-            list(self.client_aux), self.agg_factor, self.device
-        )
-        agg_aux_weights = self.aggregated_auxiliary.state_dict()
-        for heads in self.client_aux:
-            heads.load_state_dict(agg_aux_weights)
-            self.charge_weights_roundtrip(self.aggregated_auxiliary, 'aux')
-        ret_dict['auxiliary_agg_compute_time'] = time.time() - t0
-
-        t0 = time.time()
-        self.aggregated_server = aggregate_models(
-            [s.model for s in self.servers], self.agg_factor, self.device
-        )
-        agg_server_weights = self.aggregated_server.state_dict()
-        for s in self.servers:
-            s.model.load_state_dict(agg_server_weights)
-            self.charge_weights_roundtrip(self.aggregated_server, 'server')
-
-        # the server-side auxiliary networks are averaged on the main server
-        # alongside the server models ("the main server averages the parameters
-        # of the server-side models in the same way", Sec. 2.3)
-        self.aggregated_server_aux = aggregate_models(
-            list(self.server_aux), self.agg_factor, self.device
-        )
-        if len(self.aggregated_server_aux) > 0:
-            agg_saux_weights = self.aggregated_server_aux.state_dict()
-            for heads in self.server_aux:
-                heads.load_state_dict(agg_saux_weights)
-                self.charge_weights_roundtrip(self.aggregated_server_aux, 'server')
-        ret_dict['server_agg_compute_time'] = time.time() - t0
-
-        return ret_dict
+    def _module_label(self, m, i=None):
+        if m is self.aggregated_server_aux:
+            return 'global server-side aux networks'
+        if any(m is h for h in self.server_aux):
+            return 'server-side aux networks of the copy being trained'
+        if i is not None and m is self.client_aux[i]:
+            return f'client aux networks a_[1..{len(m)}] (GAP + Linear)'
+        return super()._module_label(m, i)
 
 # ------------------------------------------------------------------------------
