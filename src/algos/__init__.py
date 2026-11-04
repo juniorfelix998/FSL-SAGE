@@ -308,6 +308,10 @@ class FLAlgorithm(ABC):
     def _module_label(self, m, i=None):
         if m is self.server.model:
             return 'server model x_s'
+        if m is getattr(self, 'aggregated_server', None):
+            return 'global server model x_s'
+        if any(m is s.model for s in getattr(self, 'servers', [])):
+            return 'server copy being trained'
         if i is not None:
             if m is self.clients[i].model:
                 return 'client model x_c'

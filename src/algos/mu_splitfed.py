@@ -55,8 +55,9 @@
 #   - Batches of size 1 are skipped (BatchNorm in train mode cannot run them),
 #     as in the reference; no such batch occurs at batch 32 or 256 on MNIST.
 #   - Benchmark settings: 10 clients, one round = one pass over every client's
-#     data. The main run uses batch 32 (5 x 32 = 160 images per update, as in
-#     the paper); a batch-256 run gives memory comparable with other methods.
+#     data. The reported run uses batch 256 (the batch every method uses).
+#     The paper's batch 32 (5 x 32 = 160 images per update) diverges here
+#     (loss -> NaN) from random init on MNIST.
 #
 # Expected accuracy: the HO-SFL paper (arXiv:2603.14773, Fig.3) reports this
 # reimplementation near chance (~10-15%) on CIFAR-10. Report what it gets; do

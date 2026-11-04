@@ -15,6 +15,6 @@ lr_g    : 0.3
 use_pretrained : false
 freeze_bn      : false
 # Paper Alg.1 / p.8: 50% of the clients take part in each round (5 of 10).
-# Run with model.client.batch_size=32 so one update sees 5 x 32 = 160 images,
-# as in the paper; batch 256 gives memory comparable with the other methods.
+# Reported run: batch 256, the batch every method uses. Batch 32 (5 x 32 = 160
+# images per update, as in the paper) diverges on MNIST from random init.
 sampled_clients: 5
