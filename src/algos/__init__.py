@@ -412,7 +412,7 @@ class FLAlgorithm(ABC):
             params_only=True
         ) if per_client else []
         client_components.append({
-            'item': 'working-memory peak (autograd activations + input batch)',
+            'item': 'working-memory peak (autograd activations + forward working set + input batch)',
             'mb': (worst['total'] - worst['params'] - worst['grads']
                    - worst['optim']) / MB,
             'of_which_activations_mb': worst['act'] / MB,
@@ -421,7 +421,7 @@ class FLAlgorithm(ABC):
             self.server_side_modules(), self.server_side_optimizers()
         )
         server_components.append({
-            'item': 'working-memory peak (autograd activations + uploaded batch)',
+            'item': 'working-memory peak (autograd activations + forward working set + uploaded batch)',
             'mb': sresident / MB,
             'of_which_activations_mb': sact / MB,
         })

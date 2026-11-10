@@ -52,6 +52,18 @@
 #     pretrained BN: from random init the running stats would never move).
 #     Clean and perturbed forwards then normalise with the same batch's
 #     statistics, so v_p stays a true perturbation difference.
+#   - BN running statistics: in train() mode every forward also updates the
+#     running mean/var used at test time. Only the clean forward of a batch may
+#     do so (as in every other method); the P perturbed forwards' updates are
+#     undone by restoring the buffers after ZOScalar (_keep_running_stats).
+#     Without this, each batch moved the statistics P+1 times, P of them from
+#     perturbed weights.
+#   - Cut gradient with K > 1: the server step uses the gradient AVERAGED over
+#     S_t (Eq.14), but lambda_m is each client's OWN dl/dz_m (Eq.13). The
+#     earlier code backpropagated loss/K and sent that, so lambda (and the
+#     client update, after Eq.18 averages again) was 1/K of the paper's. Now
+#     each client's loss is backpropagated unscaled and only the server's
+#     parameter gradient is divided by K.
 # ------------------------------------------------------------------------------
 import time
 import numpy as np
@@ -88,6 +100,30 @@ def _perturb_accumulate_grad(model, seed, scalar_weight):
                 param.grad = torch.zeros_like(param)
             param.grad.add_(u, alpha=scalar_weight)
     torch.set_rng_state(rng_state)
+
+# ------------------------------------------------------------------------------
+class _keep_running_stats:
+    '''Snapshot a model's buffers (BatchNorm running mean/var and batch count)
+    on entry and restore them on exit, so the forwards inside leave no trace in
+    the statistics used at test time. The snapshot is real client memory, so it
+    is declared held. No-op in eval() mode, where no forward updates them.'''
+
+    def __init__(self, algo, model, i):
+        self.algo, self.model, self.i = algo, model, i
+
+    def __enter__(self):
+        self.saved = [b.detach().clone() for b in self.model.buffers()] \
+            if self.model.training else None
+        if self.saved:
+            self.algo.hold('client', *self.saved, i=self.i)
+
+    def __exit__(self, *exc):
+        if self.saved:
+            with torch.no_grad():
+                for b, v in zip(self.model.buffers(), self.saved):
+                    b.copy_(v)
+        self.saved = None
+        return False
 
 # ------------------------------------------------------------------------------
 @register_algorithm("ho_sfl")
@@ -222,7 +258,7 @@ class HO_SFL(FLAlgorithm):
 
         # 5. ZOScalar (Alg.2): P perturbed forwards projected onto lambda
         v = torch.zeros(self.P, device=a_m.device, dtype=a_m.dtype)
-        with self.phase('client', i):
+        with self.phase('client', i), _keep_running_stats(self, client, i):
             for p_idx, seed in enumerate(seeds):
                 _perturb(client, seed, self.mu)
                 with torch.no_grad():
@@ -305,7 +341,10 @@ class HO_SFL(FLAlgorithm):
             self.charge_cut_activation(srv_in[i])
             self.charge_cut_labels(y)
 
-        # 4. Server: gradient averaged over S_t, ONE step (Alg.1 L14-18, Eq.14)
+        # 4. Server: gradient averaged over S_t, ONE step (Alg.1 L14-18, Eq.14).
+        #    Each client's loss is backpropagated UNSCALED, so srv_in[i].grad
+        #    is that client's own lambda_m = dl/dz_m (Eq.13); only the summed
+        #    server parameter gradient is divided by |S_t| before the step.
         self.server.optimizer.zero_grad()
         g = {}
         for (_, i, _, _), x, y in batch:
@@ -315,30 +354,37 @@ class HO_SFL(FLAlgorithm):
                 with torch.no_grad():
                     mets[i]['loss'] = loss.item()
                     mets[i]['acc'] = out.argmax(1).eq(y).sum().item() / y.size(0)
-                loss.backward(loss.new_tensor(1.0 / n_s))
+                loss.backward()
             timed(i, 'server', srv)
             g[i] = srv_in[i].grad.clone().detach()
             self.charge_cut_gradient(g[i])                       # Alg.1 L19
             self.hold('client', a[i], g[i], i=i)
         t0 = time.time()
         with self.phase('server', S[0]):
+            with torch.no_grad():
+                for p in self.server.model.parameters():
+                    if p.grad is not None:
+                        p.grad.div_(n_s)
             self.server.optimizer.step()
         for i in S:                         # the shared step, split evenly
             mets[i]['server_model_compute_time'] += (time.time() - t0) / n_s
 
-        # 5. ZOScalar (Alg.2) for each sampled client, same seeds, same model
+        # 5. ZOScalar (Alg.2) for each sampled client, same seeds, same model.
+        #    Each client restores the BN running stats after its perturbed
+        #    forwards: only the clean forwards of step 3 may update them.
         v = {}
         for (_, i, _, _), x, y in batch:
             def zo():
                 vi = torch.zeros(self.P, device=a[i].device, dtype=a[i].dtype)
-                for p_idx, seed in enumerate(seeds):
-                    _perturb(client, seed, self.mu)
-                    with torch.no_grad():
-                        a_tilde = client(x)
-                    self.hold('client', a_tilde, i=i)
-                    vi[p_idx] = torch.sum((a_tilde - a[i]) * g[i])
-                    _perturb(client, seed, -self.mu)
-                    del a_tilde
+                with _keep_running_stats(self, client, i):
+                    for p_idx, seed in enumerate(seeds):
+                        _perturb(client, seed, self.mu)
+                        with torch.no_grad():
+                            a_tilde = client(x)
+                        self.hold('client', a_tilde, i=i)
+                        vi[p_idx] = torch.sum((a_tilde - a[i]) * g[i])
+                        _perturb(client, seed, -self.mu)
+                        del a_tilde
                 return vi
             v[i] = timed(i, 'client', zo)
             self.charge_weights_zo('zo_scalars_up', self.P * s)      # Alg.1 L23

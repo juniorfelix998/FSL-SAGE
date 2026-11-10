@@ -80,7 +80,11 @@ def test_memory_meter():
     # storage as the relu output (inplace-free but shared), so it counts once.
     expected = 4 * 3 * 32 * 32 * 4 + 4 * 8 * 32 * 32 * 4
     check_eq("exact activation bytes on 2-conv toy",
-             meter.peak[('client', 0)], expected)
+             meter.peak_saved[('client', 0)], expected)
+    # peak also counts the transient forward outputs: conv2's output (`out`)
+    # is alive on top of the saved bytes at the end of the forward
+    check_eq("peak = saved + transient forward outputs on 2-conv toy",
+             meter.peak[('client', 0)], expected + 4 * 8 * 32 * 32 * 4)
 
     # -- release after backward ------------------------------------------
     # Exact release: freeing the graph drops every saved slot, so nothing is
@@ -90,9 +94,17 @@ def test_memory_meter():
     # would report a decoupled method as holding bytes across the cut).
     out.sum().backward()
     check_eq("all saved bytes released after backward, despite live locals",
+             meter.live_bytes(('client', 0), saved_only=True), 0)
+    # ...but `out` is still a live local, so its storage is still memory: it
+    # moves back to TRANSIENT rather than vanishing (x was never a forward
+    # output and is not held, so it is not counted)
+    check_eq("a still-live forward output stays counted after backward",
+             meter.live_bytes(('client', 0)), 4 * 8 * 32 * 32 * 4)
+    del out
+    check_eq("freeing the last forward output releases its bytes",
              meter.live_bytes(('client', 0)), 0)
     check("live locals are still usable after release accounting",
-          x.shape == (4, 3, 32, 32) and out.requires_grad)
+          x.shape == (4, 3, 32, 32))
 
     # -- zero under no_grad: the whole ZO discrimination rests on this ----
     meter2 = MemoryMeter()
@@ -100,8 +112,14 @@ def test_memory_meter():
     with meter2.phase(('client', 0)):
         with torch.no_grad():
             m(x)
-    check_eq("peak is exactly 0 under torch.no_grad()",
-             meter2.peak.get(('client', 0), 0), 0)
+    check_eq("saved peak is exactly 0 under torch.no_grad()",
+             meter2.peak_saved.get(('client', 0), 0), 0)
+    # ...but a no_grad forward still needs its working set: conv1's output and
+    # relu's output are alive together (relu is not in-place here)
+    check_eq("no_grad forward working set counted as transient",
+             meter2.peak.get(('client', 0), 0), 2 * 4 * 8 * 32 * 32 * 4)
+    check_eq("transient bytes released once the forward's outputs are freed",
+             meter2.live_bytes(('client', 0)), 0)
 
     # -- parameter views must not be double counted ----------------------
     # nn.Linear saves weight.t(), a non-leaf sharing the parameter's storage.
@@ -112,7 +130,17 @@ def test_memory_meter():
     with meter3.phase(('client', 0)):
         lin(xv).sum()
     check_eq("Linear's weight.t() contributes no activation bytes",
-             meter3.peak.get(('client', 0), 0), 2 * 16 * 4)
+             meter3.peak_saved.get(('client', 0), 0), 2 * 16 * 4)
+    check_eq("Linear's output is the only transient on top",
+             meter3.peak.get(('client', 0), 0), 2 * 16 * 4 + 2 * 4 * 4)
+
+    # -- tensors made OUTSIDE a module forward are not transient ---------
+    meter3b = MemoryMeter()
+    with meter3b.phase(('client', 0)):
+        with torch.no_grad():
+            torch.randn(64, 64) * 2
+    check_eq("non-module ops (optimizer, arithmetic) are not counted",
+             meter3b.peak.get(('client', 0), 0), 0)
 
     # -- a reshape shares storage and must count once --------------------
     meter4 = MemoryMeter()
@@ -1126,6 +1154,83 @@ def test_held_across_cut_reflects_the_algorithm():
 
 
 # ==============================================================================
+# HO-SFL: one grouped iteration against the paper's equations
+# ==============================================================================
+class _BNClient(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Conv2d(IN_CH, CUT_CHANNELS, 3, padding=1),
+                                 nn.BatchNorm2d(CUT_CHANNELS), nn.ReLU(),
+                                 nn.AdaptiveAvgPool2d(CUT_HW))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def test_ho_sfl_iteration():
+    print("\n[9] HO-SFL grouped iteration vs paper Eq.13/14 + BN running stats")
+    import copy
+    torch.manual_seed(0)
+    K, B, P = 2, 4, 3
+    cfg = make_cfg('ho_sfl', K, 1, B, {
+        'optimizer': 'sgd', 'lr': 0.1, 'momentum': 0.0,
+        'zo_p': P, 'zo_mu': 1e-3, 'use_pretrained': False,
+        'freeze_bn': False, 'sampled_clients': K,
+        'measure_memory': True, 'mem_probe_batches': 10 ** 9,
+    })
+    opt_cfg = OmegaConf.create({'optimizer': {'name': 'sgd',
+                                              'options': {'lr': 0.01}}})
+    server = Server(TinyServer(), opt_cfg, device='cpu')
+    batch, clients = [], []
+    for i in range(K):
+        xs = torch.randn(B, IN_CH, IMG, IMG) + i      # different batch stats
+        ys = torch.randint(0, NUM_CLASSES, (B,))
+        loader = DataLoader(TensorDataset(xs, ys), batch_size=B)
+        clients.append(Client(i, loader, _BNClient(), OmegaConf.create({
+            'epoch': 1, 'batch_size': B, **opt_cfg}), device='cpu'))
+        batch.append(((0, i, 0, 0), xs, ys))
+    alg = ALGORITHM_REGISTRY['ho_sfl'](cfg.algorithm, server, clients, None,
+                                       [1.0 / K] * K, device='cpu')
+    alg.register_meter_params()
+    client = clients[0].model
+    client.train(); server.model.train()
+
+    # references, from copies taken before the iteration
+    ref_c, ref_s = copy.deepcopy(client), copy.deepcopy(server.model)
+    lam_ref, gs_ref = [], None
+    for _, x, y in batch:
+        z = ref_c(x).detach().requires_grad_(True)  # clean forward: BN update
+        ref_s.zero_grad()
+        server.criterion(ref_s(z), y).backward()
+        lam_ref.append(z.grad.clone())              # Eq.13: own dl/dz_m
+        g = [p.grad.clone() for p in ref_s.parameters()]
+        gs_ref = g if gs_ref is None else [a + b for a, b in zip(gs_ref, g)]
+    gs_ref = [g / K for g in gs_ref]                # Eq.14: mean over S_t
+    bn_ref = [b.clone() for b in ref_c.buffers()]   # clean forwards only
+
+    sent = []
+    orig = alg.charge_cut_gradient
+    alg.charge_cut_gradient = lambda t: (sent.append(t.clone()), orig(t))
+    stepped = {}
+    srv_step = server.optimizer.step
+    def capture_step(*a, **kw):
+        stepped['g'] = [p.grad.clone() for p in server.model.parameters()]
+        return srv_step(*a, **kw)
+    server.optimizer.step = capture_step
+
+    alg.group_step(batch)
+
+    check("HO-SFL lambda_m sent to each client is its own dl/dz (Eq.13)",
+          len(sent) == K and all(torch.allclose(a, b, atol=1e-7)
+                                 for a, b in zip(sent, lam_ref)),
+          f"ratio={[(a.norm() / b.norm()).item() for a, b in zip(sent, lam_ref)]}")
+    check("HO-SFL server steps on the gradient averaged over S_t (Eq.14)",
+          all(torch.allclose(a, b, atol=1e-7)
+              for a, b in zip(stepped['g'], gs_ref)))
+    check("HO-SFL BN running stats reflect only the clean forwards",
+          all(torch.equal(a, b) for a, b in zip(client.buffers(), bn_ref)))
+
+# ==============================================================================
 def main():
     print("=" * 74)
     print("Measurement-layer checks (communication + per-side memory)")
@@ -1138,6 +1243,7 @@ def main():
     test_no_cloned_implementations()
     test_system_peak_memory()
     test_held_across_cut_reflects_the_algorithm()
+    test_ho_sfl_iteration()
 
     print("\n" + "=" * 74)
     if FAILURES:

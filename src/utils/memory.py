@@ -13,7 +13,8 @@
 # WHAT WE REPORT INSTEAD, per side:
 #     peak = static + working
 #   static  = params + buffers + grads + optimizer state  (computed exactly)
-#   working = high-water mark of retained activation / held bytes  (measured)
+#   working = high-water mark of retained activation / held / transient
+#             forward bytes  (measured)
 #
 # The static half is exactly computable for a single device and is where a
 # whole-process measurement is hopeless. The working half cannot be derived
@@ -32,13 +33,29 @@
 #   they hold the client graph AND an auxiliary head's activations at once. They
 #   buy communication savings by spending client memory. Reporting only one
 #   number would hide that trade.
+#
+# TRANSIENT FORWARD BYTES: a forward pass needs memory for the layer outputs
+# alive at the same moment, even under `torch.no_grad()` where autograd saves
+# nothing. Without counting them, a zeroth-order client's working memory was
+# only its input batch plus the tensors it explicitly holds -- for HO-SFL on
+# split ResNet-18 at batch 107 that was 3.8 MiB, while conv1's and bn1's
+# outputs alone are 13.4 MiB live together. The meter now also counts every
+# tensor produced inside a module forward, for as long as its storage lives.
+# Tensors made outside module forwards (backward passes, optimizer steps,
+# ad-hoc arithmetic between models) are still not counted, for every method.
 # ------------------------------------------------------------------------------
+import itertools
 import logging
 import weakref
 from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
+from torch.nn.modules.module import (
+    register_module_forward_hook, register_module_forward_pre_hook
+)
+from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 
 
 # ------------------------------------------------------------------------------
@@ -117,6 +134,39 @@ class _SavedSlot:
 
 
 # ------------------------------------------------------------------------------
+def _release_transient(meter_ref, key, token):
+    '''Finalizer for a storage seen as a forward output: the bytes are freed.'''
+    try:
+        meter = meter_ref()
+        if meter is not None:
+            entry = meter._entries.get(key)
+            if entry is not None and entry[5] == token:
+                meter._drop(key)
+    except Exception:                       # interpreter shutdown
+        pass
+
+
+# ------------------------------------------------------------------------------
+class _ForwardOutputs(TorchDispatchMode):
+    '''Records every tensor an op produces while a module forward is running,
+    as TRANSIENT bytes of the current phase owner. Sits below autograd, so it
+    also sees forwards under `torch.no_grad()`.'''
+
+    def __init__(self, meter):
+        super().__init__()
+        self.meter = meter
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        if self.meter._fwd_depth > 0:
+            for t in tree_leaves(out):
+                if torch.is_tensor(t):
+                    self.meter._account(t, self.meter.owner,
+                                        self.meter.TRANSIENT)
+        return out
+
+
+# ------------------------------------------------------------------------------
 class MemoryMeter:
     """High-water mark of live memory, attributed to whichever phase
     ('client', i) / ('server',) allocated it.
@@ -140,13 +190,21 @@ class MemoryMeter:
         and identical with or without `no_grad`, which destroys the exact
         discrimination the zeroth-order methods need.
 
-    Two kinds of bytes are tracked separately, because they answer different
+    Three kinds of bytes are tracked separately, because they answer different
     questions and conflating them makes the metric names lie:
-      SAVED -- retained by autograd for backward. Zero under `no_grad`, so this
-               is what discriminates a zeroth-order client.
-      HELD  -- explicitly declared long-lived tensors (the input batch, a
-               downloaded cut-gradient, a round buffer). Real memory, but
-               resident whether or not the client backprops.
+      SAVED     -- retained by autograd for backward. Zero under `no_grad`, so
+                   this is what discriminates a zeroth-order client.
+      HELD      -- explicitly declared long-lived tensors (the input batch, a
+                   downloaded cut-gradient, a round buffer). Real memory, but
+                   resident whether or not the client backprops.
+      TRANSIENT -- any other tensor produced inside a module forward, live
+                   until its storage is freed (released by a finalizer on the
+                   storage). The working set of a forward pass; the only
+                   working memory a `no_grad` forward has.
+    A storage is counted once. If one first seen as TRANSIENT is then saved by
+    autograd or declared held, it becomes SAVED / HELD; once autograd drops a
+    SAVED slot whose storage is still alive (e.g. the model output, still a
+    local), it goes back to TRANSIENT.
     `peak` is over their sum (what the device must provide); the
     held-across-the-cut and activation-peak metrics read SAVED alone.
 
@@ -175,11 +233,15 @@ class MemoryMeter:
 
     SAVED = 'saved'
     HELD = 'held'
+    TRANSIENT = 'transient'
 
     def __init__(self, enabled=True):
         self.enabled = enabled
-        # storage_ptr -> [nbytes, owner, kind, weakref_or_None, refcount]
+        # storage_ptr -> [nbytes, owner, kind, weakref_or_None, refcount,
+        #                 token, storage_finalizer_or_None]
         self._entries = {}
+        self._tokens = itertools.count()
+        self._fwd_depth = 0     # >0 while inside a module forward
         self._cur = {}          # (owner, kind) -> live bytes
         self.peak = {}          # owner -> high-water bytes (saved + held)
         self.peak_saved = {}    # owner -> high-water autograd-retained bytes
@@ -243,7 +305,32 @@ class MemoryMeter:
             return
         entry[4] -= 1                       # one fewer slot references it
         if entry[4] <= 0:
-            self._drop(key)
+            fin = entry[6]
+            if fin is not None and fin.alive:
+                # no longer retained by autograd, but the storage is still
+                # alive (a forward output kept as a local): back to TRANSIENT
+                self._move(entry, self.TRANSIENT)
+            else:
+                self._drop(key)
+
+    def _move(self, entry, kind, owner=None):
+        '''Reclassify a live entry, optionally handing it to another owner; the
+        live total is unchanged.'''
+        nbytes, old = entry[0], entry[1]
+        owner = old if owner is None else owner
+        self._cur[(old, entry[2])] = self._cur.get((old, entry[2]), 0) - nbytes
+        self._cur[(owner, kind)] = self._cur.get((owner, kind), 0) + nbytes
+        entry[1], entry[2] = owner, kind
+        self._bump_peaks(owner)
+
+    def _bump_peaks(self, owner):
+        saved = self._cur.get((owner, self.SAVED), 0)
+        total = saved + self._cur.get((owner, self.HELD), 0) \
+            + self._cur.get((owner, self.TRANSIENT), 0)
+        if total > self.peak.get(owner, 0):
+            self.peak[owner] = total
+        if saved > self.peak_saved.get(owner, 0):
+            self.peak_saved[owner] = saved
 
     def _account(self, t, owner, kind):
         if owner is None or t is None or not torch.is_tensor(t):
@@ -259,13 +346,29 @@ class MemoryMeter:
             if kind == self.SAVED and existing[2] == self.SAVED:
                 existing[4] += 1
                 return key
+            if existing[2] == self.TRANSIENT and kind != self.TRANSIENT:
+                # a forward output now saved by autograd or declared held: same
+                # bytes, new kind. Held bytes go to the side declaring them --
+                # an uploaded activation sharing storage with the client's
+                # output is resident on the SERVER from then on (the client
+                # already counted it in its forward peak).
+                existing[3] = weakref.ref(t) if kind == self.HELD else None
+                existing[4] = 1
+                self._move(existing, kind,
+                           owner if kind == self.HELD else None)
+                return key
             return None
 
         nbytes = storage.nbytes()
+        token = next(self._tokens)
+        fin = None
+        if kind == self.TRANSIENT:
+            fin = weakref.finalize(storage, _release_transient,
+                                   weakref.ref(self), key, token)
         self._entries[key] = [
             nbytes, owner, kind,
             weakref.ref(t) if kind == self.HELD else None,
-            1,
+            1, token, fin,
         ]
         self._cur[(owner, kind)] = self._cur.get((owner, kind), 0) + nbytes
 
@@ -273,12 +376,7 @@ class MemoryMeter:
         if self._live_total > self.peak_system:
             self.peak_system = self._live_total
 
-        saved = self._cur.get((owner, self.SAVED), 0)
-        total = saved + self._cur.get((owner, self.HELD), 0)
-        if total > self.peak.get(owner, 0):
-            self.peak[owner] = total
-        if saved > self.peak_saved.get(owner, 0):
-            self.peak_saved[owner] = saved
+        self._bump_peaks(owner)
         return key
 
     # -- autograd hooks --------------------------------------------------
@@ -312,12 +410,37 @@ class MemoryMeter:
         if not self.enabled:
             yield
             return
+        outermost = not self._stack
         self._stack.append(owner)
+        hooks, mode = [], None
         try:
+            if outermost:
+                # module-forward depth, so only tensors made INSIDE a model's
+                # forward are counted as TRANSIENT (not backward / optimizer)
+                self._fwd_depth = 0
+                hooks = [
+                    register_module_forward_pre_hook(self._enter_forward),
+                    register_module_forward_hook(self._exit_forward,
+                                                 always_call=True),
+                ]
+                mode = _ForwardOutputs(self)
+                mode.__enter__()
             with torch.autograd.graph.saved_tensors_hooks(self._pack, self._unpack):
                 yield
         finally:
+            if mode is not None:
+                mode.__exit__(None, None, None)
+            for h in hooks:
+                h.remove()
+            if outermost:
+                self._fwd_depth = 0
             self._stack.pop()
+
+    def _enter_forward(self, module, args):
+        self._fwd_depth += 1
+
+    def _exit_forward(self, module, args, output):
+        self._fwd_depth -= 1
 
     def live_bytes(self, owner, saved_only=False):
         """Live bytes for `owner`. `saved_only=True` counts just the
@@ -329,6 +452,7 @@ class MemoryMeter:
         total = self._cur.get((owner, self.SAVED), 0)
         if not saved_only:
             total += self._cur.get((owner, self.HELD), 0)
+            total += self._cur.get((owner, self.TRANSIENT), 0)
         return max(0, total)
 
     def reset_live(self):
