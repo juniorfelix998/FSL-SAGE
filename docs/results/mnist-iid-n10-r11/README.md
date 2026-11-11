@@ -21,7 +21,8 @@ Units: MiB.
 
 ## Summary
 
-HO-SFL samples 3 of the 10 clients per iteration; it is reported at batch 256.
+HO-SFL is reported with all 10 clients in every iteration (K = 10), at batch 256.
+The 3-of-10 run is in [HO_SFL.md](HO_SFL.md).
 
 MU-SplitFed samples 5 of the 10 clients per step and averages the models after
 every step; it is reported at batch 256.
@@ -31,16 +32,16 @@ batch 256.
 
 | | CSE-FSL | FSL-SAGE | HO-SFL | MU-SplitFed | FedSplitX |
 |---|---:|---:|---:|---:|---:|
-| **Test accuracy** | **99.13%** | **98.96%** | **97.80%** | **20.08%** | **95.85%** |
+| **Test accuracy** | **99.13%** | **98.96%** | **97.93%** | **20.08%** | **95.85%** |
 | Communication: Cut | 880.86 | 880.86 | 10317.54 | 15473.80 | 516.13 |
-| Communication: Weights | 2341.35 | 761.60 | 0.39 | 13797.24 | 939.43 |
-| **Communication: Total** | **3222.21** | **1642.46** | **10317.93** | **29271.03** | **1455.56** |
+| Communication: Weights | 2341.35 | 761.60 | 0.15 | 13797.24 | 939.43 |
+| **Communication: Total** | **3222.21** | **1642.46** | **10317.69** | **29271.03** | **1455.56** |
 | Client memory | 148.80 | 124.74 | **49.44** | **5.62** | **102.53** |
 | Held-across-cut | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
-| Server memory, per device (table value) | 176.26 | 296.98 | 180.27 | 86.16 | 181.17 |
-| **Server memory, total for all 10 clients** | **176.26** | **726.47** | **180.31** | **246.47** | **181.17** |
-| System peak (live) | 106.28 | 106.28 | 59.01 | 21.01 | 144.16 |
-| **Latency** | **338.87 s** | **422.37 s** | **673.42 s** | **548.80 s** | **144.27 s** |
+| Server memory, per device (table value) | 176.26 | 296.98 | 194.27 | 86.16 | 181.17 |
+| **Server memory, total for all 10 clients** | **176.26** | **726.47** | **194.28** | **246.47** | **181.17** |
+| System peak (live) | 106.28 | 106.28 | 122.03 | 21.01 | 144.16 |
+| **Latency** | **338.87 s** | **422.37 s** | **670.71 s** | **548.80 s** | **144.27 s** |
 
 HO-SFL's memory was measured with the updated meter, which also counts a
 forward pass's working set (the layer outputs alive at the same time).
@@ -63,12 +64,12 @@ forward pass's working set (the layer outputs alive at the same time).
 |---|---|
 | **Communication 3–6× higher** | HO-SFL sends activations up for **every** image (5156.25 MiB), where the others upload 1 batch in 5 (880.00). It also sends the full **gradient back** for every image (5156.25); CSE-FSL and FSL-SAGE never send gradients. |
 | **Same per image as the paper** | The paper's Table 4 (CIFAR-10, same ResNet-18 split) gives 2.44 GB for 160,000 images: activation + gradient, 16,400 B per image. We process 660,000 images, so 4.125× that: 10.08 GiB. The paper's HO-SFL beats FSL-SAGE because its clients hold only 500 images each, so model transfers are frequent; here each client trains 6,000 images between transfers. |
-| **Weights under 1 MiB** | HO-SFL never sends model weights: clients stay identical by sharing 5 seeds and 5 numbers per client batch (20 B each way), plus catch-ups (0.39 in total). |
+| **Weights under 1 MiB** | HO-SFL never sends model weights: clients stay identical by sharing 5 seeds and 5 numbers per client batch (20 B each way): 0.15 in total. With all 10 clients in every iteration no client falls behind, so there is no catch-up traffic. |
 | **Client memory 49.44, about a third of theirs** | No aux model, and no backward pass on the client, so it keeps no activations for backprop. Its model + AdamW (10.43) and the forward pass's working set (39.01): conv1 and bn1 outputs alive together (32.00), the input batch (3.00), its activation and the downloaded gradient (4.00). |
-| **Server 180.27** | One server model like CSE-FSL (160.22). The working memory is a little higher (20.05 vs 16.04) because the server holds the 3 sampled clients' uploads until its one averaged step. |
-| **System peak 59.01** | Still below 106.28, because no client keeps activations for backprop. |
-| **Latency 673.42 s, the slowest of the three** | Each client batch needs 6 client forward passes (1 clean + 5 nudged). |
-| **Accuracy 1.2–1.3 pt lower** | The client learns from 5 random directions per update instead of an exact gradient. |
+| **Server 194.27** | One server model like CSE-FSL (160.22). The working memory is higher (34.05 vs 16.04) because the server holds all 10 clients' uploads (10 × 2.00) until its one averaged step. |
+| **System peak 122.03, above theirs (106.28)** | No client keeps activations for backprop, but all 10 clients hold their batch, activation and gradient at the same moment, while the server holds 10 uploads. |
+| **Latency 670.71 s, the slowest of the three** | Each client batch needs 6 client forward passes (1 clean + 5 nudged). |
+| **Accuracy 1.0–1.2 pt lower** | The client learns from 5 random directions per update instead of an exact gradient. |
 
 **MU-SplitFed vs the others** (batch 256)
 
@@ -100,9 +101,9 @@ forward pass's working set (the layer outputs alive at the same time).
 | Client model down | 287.44 (110) | 313.57 (120, incl. initial copy) | 0 | 6898.62 (2,640) | 28.74 (11) |
 | Aux model up | 883.23 (110) | 0 | – | – | 0.11 (11) |
 | Aux model down | 883.23 (110) | 160.59 (20) | – | – | 0.11 (11) |
-| Seeds + scalars + catch-up | – | – | 0.39 | 0.01 (loss-difference numbers) | – |
+| Seeds + scalars + catch-up | – | – | 0.15 (no catch-up) | 0.01 (loss-difference numbers) | – |
 | Server copy down + up (Server-model FedAvg) | 0 | 0 | 0 | 0 | 881.72 (22) |
-| **Total** | **3222.21** | **1642.46** | **10317.93** | **29271.03** | **1455.56** |
+| **Total** | **3222.21** | **1642.46** | **10317.69** | **29271.03** | **1455.56** |
 
 ## Memory, side by side
 
@@ -114,10 +115,10 @@ forward pass's working set (the layer outputs alive at the same time).
 | **Client total** | **148.80** | **124.74** | **49.44** | **5.62** | **102.53** |
 | Server model (params + grads + Adam) | 160.22 | 160.22 | 160.22 | 80.16 (global + copy being trained, params only) | 120.21 (global 40.08 + copy being trained 80.13, SGD) |
 | Aux model being aligned | – | 32.09 | – | – | – |
-| Server working memory | 16.04 | 104.67 | 20.05 | 6.00 | 60.96 (incl. the round's upload 46.88) |
-| **Server, per device (table value)** | **176.26** | **296.98** | **180.27** | **86.16** | **181.17** |
-| + other clients' state / catch-up history | – | 288.79 + 140.69 | 0.03 (catch-up history) | 160.31 (4 other server copies) | – (1 client per round) |
-| **Server, total for all 10 clients** | **176.26** | **726.47** | **180.31** | **246.47** | **181.17** |
+| Server working memory | 16.04 | 104.67 | 34.05 (incl. 10 uploads) | 6.00 | 60.96 (incl. the round's upload 46.88) |
+| **Server, per device (table value)** | **176.26** | **296.98** | **194.27** | **86.16** | **181.17** |
+| + other clients' state / catch-up history | – | 288.79 + 140.69 | 0.01 (seed/scalar history) | 160.31 (4 other server copies) | – (1 client per round) |
+| **Server, total for all 10 clients** | **176.26** | **726.47** | **194.28** | **246.47** | **181.17** |
 
 These results replace the earlier 3-round ones in
 [`../mnist-iid-n10-r3/`](../mnist-iid-n10-r3/), which used the original code
