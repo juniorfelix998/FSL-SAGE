@@ -1,9 +1,13 @@
 defaults:
   - base_algorithm
 name: fedsplitx
-# Alg.1 L3 / p.5: a fraction C of the clients trains each round (paper: 10%).
-# With 10 clients that is ONE client per round, S = max(1, round(C * N)).
-client_fraction: 0.1
+# Alg.1 L3: the fraction C of the clients that trains each round,
+# S = max(1, round(C * N)). Default 1.0 = all 10 of the benchmark's clients,
+# so every client uses its data every round like every other method, and the
+# L12 average really averages. (The paper's C = 0.1 with our 10 clients would
+# be ONE client per round, which averages nothing.) Override like HO-SFL's
+# field: algorithm.client_fraction=0.5 -> 5 clients per round.
+client_fraction: 1.0
 # p.5: SGD. The learning rate, momentum and weight decay are NOT SPECIFIED in
 # the paper: lr 0.01, plain SGD (no momentum, no weight decay), no schedule.
 lr          : 0.01

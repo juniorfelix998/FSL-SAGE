@@ -61,9 +61,11 @@
 # Benchmark settings (decisions recorded with the user):
 #   - every client at the benchmark's middle cut (depth level 3), so heteroavg
 #     is a plain average; the paper's heterogeneous depth levels are not used
-#   - client_fraction C = 0.1 as in the paper (p.5): with 10 clients, ONE
-#     client trains per round, so FedSplitX sees 1/10 of the data per round
-#     compared with the methods that train every client
+#   - client_fraction C = 1.0: ALL 10 clients train every round, so FedSplitX
+#     sees the same data per round as every other method and the L12 average
+#     is over 10 models. (The paper's C = 0.1 with our 10 clients would be ONE
+#     client per round: 1/10 of the data, and an average of a single model.)
+#     Set algorithm.client_fraction=C to sample S = max(1, round(C * N)).
 #   - batch 256 (the batch every method uses; the paper uses 64)
 #   - the server-copy averaging (L12) is charged as Server-model FedAvg, one
 #     upload (L12) and one download (L6) of x_s per sampled client per round
@@ -138,9 +140,10 @@ class FedSplitX(FLAlgorithm):
         super(FedSplitX, self).__init__(*args, **kwargs)
         n = len(self.clients)
 
-        # L3: fraction C of the clients per round (paper p.5: C = 10%)
-        self.C = float(self.cfg.get('client_fraction', 0.1))
-        self.S = max(1, int(round(self.C * n)))
+        # L3: fraction C of the clients per round. Default 1.0 = every client
+        # (benchmark setting); the paper (p.5) uses C = 10% of 50 clients.
+        self.C = float(self.cfg.get('client_fraction', 1.0))
+        self.S = max(1, min(n, int(round(self.C * n))))
         self.sampled = list(range(n))
 
         # every client starts from the same client model; one server copy per
