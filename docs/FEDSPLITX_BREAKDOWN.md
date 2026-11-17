@@ -31,7 +31,7 @@ Client size: Table 3 gives 689.4K parameters at level 3; ours has 683,072. The p
 
 | Paper | What happens | Code | Charged as |
 |---|---|---|---|
-| L3, p.5 "10% of the clients are randomly selected" | P_t: C = 10% of the clients, at random | `begin_round` | – |
+| L3, p.5 "10% of the clients are randomly selected" | P_t: a fraction C of the clients, at random; here C = 1.0 (all 10, see below) | `begin_round` | – |
 | L5 | the client downloads the global client-side model (printed `w^s[:d_k]`, a typo for `w^c`) | `client_step`, first batch of the round | `weights.client_down` (+ `aux_down`) |
 | L6 | the server takes its copy for this client from the global server-side model | same | `weights.server_down` |
 | L7, L17–18 GetSmashedData | the client forwards **all of D_k** through the **downloaded** model and sends the smashed data and labels | one no-grad pass, sent as **one** upload | `cut.act_up` ×1, `cut.labels_up` ×1 |
@@ -61,7 +61,7 @@ Client size: Table 3 gives 689.4K parameters at level 3; ours has 683,072. The p
 | | Paper (p.5) | Here |
 |---|---|---|
 | Clients, depth levels | 50 clients at 3 depth levels (16 / 16 / 18) | 10 clients, all at level 3 (the middle cut, the same as every method) |
-| Clients per round | 10% | 10%, i.e. **1 client per round** |
+| Clients per round | 10% (5 of 50) | **C = 1.0: all 10 clients**, so every client uses all its data every round like every other method and the L12 average is over 10 models. The paper's 10% would be 1 client per round here. |
 | Batch | 64 | 256 (every method's batch) |
 | Rounds | 1000, 1 local epoch | 11, 1 local epoch |
 | Dataset | CIFAR-10/100 | MNIST |
@@ -73,7 +73,7 @@ Client size: Table 3 gives 689.4K parameters at level 3; ours has 683,072. The p
 |---|---|---|
 | Aux positions | after layer1, layer2, layer3 (split client / server) | after the stem, layer1, layer2 (App. A.1); all on the client at the middle cut |
 | Smashed data | one upload per batch, from the model being trained | **one upload of all D_k per round**, from the downloaded model (L7, L18) |
-| Clients per round | all 10 | 10% (L3) |
+| Clients per round | all 10, no sampling step | sampling step of L3 (`client_fraction`); C = 1.0 by default, C = 0.1 for the paper's fraction |
 | Downloads | client FedAvg round trip for every client | L5 / L6 downloads and L12 uploads, sampled clients only |
 | Optimizer | Adam (harness default) | SGD (p.5) |
 | Accuracy | full ensemble only | full ensemble + client-side ensemble logged |

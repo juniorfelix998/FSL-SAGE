@@ -55,9 +55,9 @@ REIMPL_FOOTNOTES = {
         '§',
         "§ AI-assisted no-code reimplementation of FedSplitX (arXiv:2310.14579) "
         "from its Algorithm 1: every client at the shared middle cut (paper "
-        "depth level 3), 10% of clients per round as in the paper, SGD lr 0.01 "
-        "(lr not given in the paper); not validated against the paper's own "
-        "reported numbers."
+        "depth level 3), all 10 clients every round (the paper samples 10% of "
+        "50), SGD lr 0.01 (lr not given in the paper); not validated against "
+        "the paper's own reported numbers."
     ),
     'hosl': (
         '¶',

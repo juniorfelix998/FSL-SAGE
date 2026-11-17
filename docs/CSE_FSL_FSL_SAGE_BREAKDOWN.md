@@ -50,6 +50,16 @@ the client model *after h−1 updates* (x_c^{t,h−1}). That is the h-th batch o
 the window. Eq.(6) confirms each window has h steps, m = 0..h−1. Two of the
 three statements agree, and they are the ones with formulas.
 
+**The journal version's Algorithm 1 gives the same choice.** Its client
+algorithm sets m = 0 (L3), uploads when m mod h == 0 (L8) and only then
+increments m (L16). Read literally that is the first batch of each window,
+plus a 5th upload at batch 21 (550 uploads instead of 440, cut ≈ 1101 MiB
+instead of 880.86). But its own L9 names the uploaded smashed data
+g with the model x_c^{t,h}, i.e. after a full window, which agrees with Eq.(8)
+and Fig.2. **Decision: keep the last batch of each window (4 uploads per
+round)**, which is also the schedule of FSL-SAGE's Algorithm 1 (k = 1..K−1,
+upload at k = 5, 10, 15, 20), so the two methods are compared on equal terms.
+
 **Why A uses k ∈ 1..K:** Alg.1 writes its loop as k = 1..K−1, but the text says
 "K local iterations" and Alg.3 uses k ∈ [K]. The two readings give the same
 count whenever h does not divide K (true for K = 24 and K = 118).

@@ -27,21 +27,20 @@ The 3-of-10 run is in [HO_SFL.md](HO_SFL.md).
 MU-SplitFed samples 5 of the 10 clients per step and averages the models after
 every step; it is reported at batch 256.
 
-FedSplitX trains 10% of the clients per round (1 of 10), as in its paper, at
-batch 256.
+FedSplitX trains all 10 clients every round (C = 1.0), at batch 256.
 
 | | CSE-FSL | FSL-SAGE | HO-SFL | MU-SplitFed | FedSplitX |
 |---|---:|---:|---:|---:|---:|
-| **Test accuracy** | **99.13%** | **98.96%** | **97.93%** | **20.08%** | **95.85%** |
-| Communication: Cut | 880.86 | 880.86 | 10317.54 | 15473.80 | 516.13 |
-| Communication: Weights | 2341.35 | 761.60 | 0.15 | 13797.24 | 939.43 |
-| **Communication: Total** | **3222.21** | **1642.46** | **10317.69** | **29271.03** | **1455.56** |
-| Client memory | 148.80 | 124.74 | **49.44** | **5.62** | **102.53** |
+| **Test accuracy** | **99.13%** | **98.96%** | **97.93%** | **20.08%** | **96.28%** |
+| Communication: Cut | 880.86 | 880.86 | 10317.54 | 15473.80 | 5161.29 |
+| Communication: Weights | 2341.35 | 761.60 | 0.15 | 13797.24 | 9394.27 |
+| **Communication: Total** | **3222.21** | **1642.46** | **10317.69** | **29271.03** | **14555.56** |
+| Client memory | 148.80 | 124.74 | **49.44** | **5.62** | **102.54** |
 | Held-across-cut | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
 | Server memory, per device (table value) | 176.26 | 296.98 | 194.27 | 86.16 | 181.17 |
-| **Server memory, total for all 10 clients** | **176.26** | **726.47** | **194.28** | **246.47** | **181.17** |
-| System peak (live) | 106.28 | 106.28 | 122.03 | 21.01 | 144.16 |
-| **Latency** | **338.87 s** | **422.37 s** | **670.71 s** | **548.80 s** | **144.27 s** |
+| **Server memory, total for all 10 clients** | **176.26** | **726.47** | **194.28** | **246.47** | **1324.60** |
+| System peak (live) | 106.28 | 106.28 | 122.03 | 21.01 | 144.17 |
+| **Latency** | **338.87 s** | **422.37 s** | **670.71 s** | **548.80 s** | **1265.48 s** |
 
 HO-SFL's memory was measured with the updated meter, which also counts a
 forward pass's working set (the layer outputs alive at the same time).
@@ -85,25 +84,25 @@ forward pass's working set (the layer outputs alive at the same time).
 
 | Difference | Reason |
 |---|---|
-| **Communication 1455.56, the lowest** | **Only 1 client per round** (the paper's 10%), and it sends its activations **once per round** for all its 6,000 images (515.63 MiB in total). No gradient comes back. Most of the rest is the server-copy averaging (881.72), which the benchmark charges; without it, 573.84. |
-| **Latency 144.27 s, the fastest** | 11 client-rounds of training in total, against 110 for the methods that train every client every round. |
-| **Accuracy 95.85%, below CSE-FSL / FSL-SAGE** | It sees about 1.1 passes over MNIST in 11 rounds, against 11. The client-side heads alone reach 91.61%. |
-| **Client memory 102.53** | Its model with gradients (5.22, plain SGD: no optimizer state), 3 tiny aux heads (0.02), and the backward pass through the stem, layer1 and layer2 with 3 heads (94.29) plus the batch (3.00). |
-| **Server 181.17** | The global server model (40.08) + the copy being trained with gradients (80.13) + working memory 60.96, of which **46.88 is the whole round's upload**, held until the copy has trained on it. |
+| **Communication 14555.56** | Each client sends its activations **once per round** for all its 6,000 images (5156.25 MiB in total, the same as HO-SFL's uploads) and **no gradient comes back**, so its cut (5161.29) is half of HO-SFL's. **The server-copy averaging is 61% of the total** (8817.21: one 40.08 MiB server copy down and up per client per round), which the benchmark charges; without it, 5738.35. |
+| **Accuracy 96.28%, below CSE-FSL / FSL-SAGE** | Each round averages 10 models that each made 24 plain-SGD steps (lr 0.01) from the same start, so the global model moves about one client's worth per round. The others use Adam. The client-side ensemble (the 3 aux heads only, what a client can predict alone) reaches 91.67%. |
+| **Latency 1265.48 s, the slowest** | Per client batch the server trains on **every** batch (CSE-FSL's server: 1 in 5), and each client runs an extra forward pass over all its data for the upload. |
+| **Client memory 102.54** | Its model with gradients (5.22, plain SGD: no optimizer state), 3 tiny aux heads (0.02), and the backward pass through the stem, layer1 and layer2 with 3 heads (94.29) plus the batch (3.00). |
+| **Server 181.17 per device, 1324.60 for all clients** | The global server model (40.08) + one copy being trained with gradients (80.13) + working memory 60.97, of which **46.88 is that client's whole upload**. With 10 clients in parallel, the server also holds 9 more copies (721.14) and 9 more uploads (422.28). |
 
 ## Communication, side by side
 
 | What is sent | CSE-FSL | FSL-SAGE | HO-SFL | MU-SplitFed | FedSplitX |
 |---|---:|---:|---:|---:|---:|
-| Smashed data + labels | 880.86 (440) | 880.86 (440) | 5161.29 (2,640) | 15473.79 (7,920 + 2,640 labels) | 516.13 (11 + 11 labels, all 6,000 images each) |
+| Smashed data + labels | 880.86 (440) | 880.86 (440) | 5161.29 (2,640) | 15473.79 (7,920 + 2,640 labels) | 5161.29 (110 + 110 labels, all 6,000 images each) |
 | Gradient back to client | 0 | 0 | 5156.25 (2,640) | 0 | 0 |
-| Client model up | 287.44 (110) | 287.44 (110) | 0 | 6898.62 (2,640) | 28.74 (11) |
-| Client model down | 287.44 (110) | 313.57 (120, incl. initial copy) | 0 | 6898.62 (2,640) | 28.74 (11) |
-| Aux model up | 883.23 (110) | 0 | – | – | 0.11 (11) |
-| Aux model down | 883.23 (110) | 160.59 (20) | – | – | 0.11 (11) |
+| Client model up | 287.44 (110) | 287.44 (110) | 0 | 6898.62 (2,640) | 287.44 (110) |
+| Client model down | 287.44 (110) | 313.57 (120, incl. initial copy) | 0 | 6898.62 (2,640) | 287.44 (110) |
+| Aux model up | 883.23 (110) | 0 | – | – | 1.09 (110) |
+| Aux model down | 883.23 (110) | 160.59 (20) | – | – | 1.09 (110) |
 | Seeds + scalars + catch-up | – | – | 0.15 (no catch-up) | 0.01 (loss-difference numbers) | – |
-| Server copy down + up (Server-model FedAvg) | 0 | 0 | 0 | 0 | 881.72 (22) |
-| **Total** | **3222.21** | **1642.46** | **10317.69** | **29271.03** | **1455.56** |
+| Server copy down + up (Server-model FedAvg) | 0 | 0 | 0 | 0 | 8817.21 (220) |
+| **Total** | **3222.21** | **1642.46** | **10317.69** | **29271.03** | **14555.56** |
 
 ## Memory, side by side
 
@@ -111,14 +110,14 @@ forward pass's working set (the layer outputs alive at the same time).
 |---|---:|---:|---:|---:|---:|
 | Client model (params + grads + Adam) | 10.43 | 10.43 | 10.43 | 2.61 (params only) | 5.22 (params + grads, SGD) |
 | Aux model on the client | 32.09 | 8.03 (params only) | – | – | 0.02 (3 small heads) |
-| Client working memory | 106.28 | 106.28 | 39.01 (forward working set, no backprop) | 3.00 | 97.29 |
-| **Client total** | **148.80** | **124.74** | **49.44** | **5.62** | **102.53** |
+| Client working memory | 106.28 | 106.28 | 39.01 (forward working set, no backprop) | 3.00 | 97.30 |
+| **Client total** | **148.80** | **124.74** | **49.44** | **5.62** | **102.54** |
 | Server model (params + grads + Adam) | 160.22 | 160.22 | 160.22 | 80.16 (global + copy being trained, params only) | 120.21 (global 40.08 + copy being trained 80.13, SGD) |
 | Aux model being aligned | – | 32.09 | – | – | – |
-| Server working memory | 16.04 | 104.67 | 34.05 (incl. 10 uploads) | 6.00 | 60.96 (incl. the round's upload 46.88) |
+| Server working memory | 16.04 | 104.67 | 34.05 (incl. 10 uploads) | 6.00 | 60.97 (incl. one client's upload 46.88) |
 | **Server, per device (table value)** | **176.26** | **296.98** | **194.27** | **86.16** | **181.17** |
-| + other clients' state / catch-up history | – | 288.79 + 140.69 | 0.01 (seed/scalar history) | 160.31 (4 other server copies) | – (1 client per round) |
-| **Server, total for all 10 clients** | **176.26** | **726.47** | **194.28** | **246.47** | **181.17** |
+| + other clients' state / catch-up history | – | 288.79 + 140.69 | 0.01 (seed/scalar history) | 160.31 (4 other server copies) | 721.14 (9 other server copies) + 422.28 (9 other uploads) |
+| **Server, total for all 10 clients** | **176.26** | **726.47** | **194.28** | **246.47** | **1324.60** |
 
 These results replace the earlier 3-round ones in
 [`../mnist-iid-n10-r3/`](../mnist-iid-n10-r3/), which used the original code

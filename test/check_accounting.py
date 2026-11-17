@@ -663,6 +663,12 @@ def test_comm_closed_form():
         check_eq(f"FedSplitX weights.server_{d} = S x R server copies (L6 / L12)",
                  last(bd_fx, f'weights.server_{d}'), R * S_fx * server_model_bytes())
     check_paper_rows("FedSplitX", res_fx)
+    extra = {l['item'].split(' (')[0]: l['mb'] for l in res_fx.memory_metrics['server_mem_extra_components']}
+    upload_one = sum(act_bytes(b) + label_bytes(b) for b in bs_list)
+    check("FedSplitX lists the other sampled clients' uploads as server memory",
+          math.isclose(extra.get(f'uploads of the other {S_fx - 1} sampled clients', -1) * 1024 ** 2,
+                       (S_fx - 1) * upload_one, rel_tol=1e-9),
+          f"extra={extra} expected={(S_fx - 1) * upload_one}")
     # Dimension-free aggregation: HO-SFL sends (scalar, seed) pairs per update
     # rather than a weight vector, so its aggregation traffic scales with the
     # NUMBER OF UPDATES and not with the model's parameter count. The margin over

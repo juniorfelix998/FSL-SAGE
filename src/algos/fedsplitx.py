@@ -177,8 +177,10 @@ class FedSplitX(FLAlgorithm):
         self.server_aux_optims = [sgd(h.parameters()) if len(h) else None
                                   for h in self.server_aux]
 
-        # per sampled client: the round's uploaded smashed data (L7/L18)
+        # per sampled client: the round's uploaded smashed data (L7/L18), and
+        # its size in bytes (activations + labels), kept for the memory report
         self._upload = {}
+        self._upload_bytes = {}
 
     # -- Sec. 2.1 / Appendix A.1: an auxiliary network at each point ---------
     def __build_heads(self):
@@ -244,6 +246,14 @@ class FedSplitX(FLAlgorithm):
         client, server = self.clients[i].model, self.servers[i].model
         mets = {}
 
+        # Alg.1 L4 runs the sampled clients in parallel; here they run one
+        # after another. The RESULT is the same: each client starts from the
+        # global models, which only change in aggregate() (L12), and shares no
+        # model, server copy or optimizer state with another client (checked:
+        # running the clients in reverse order gives identical weights).
+        # MEMORY is measured per client: one server copy and one upload at a
+        # time. The other clients' copies and uploads, which a parallel server
+        # holds at the same time, are listed in server_side_extra_memory().
         if j == 0 and k == 0:
             # L5: download the global client-side model (+ its aux networks)
             client.load_state_dict(self.aggregated_client.state_dict())
@@ -261,6 +271,8 @@ class FedSplitX(FLAlgorithm):
             self.charge_cut_activation(s)
             self.charge_cut_labels(ys)
             self._upload[i] = (s, ys, offsets)
+            self._upload_bytes[i] = (s.numel() * s.element_size()
+                                     + ys.numel() * ys.element_size())
 
         # --- L8, Client_Update (L13-16): sum of CE over a_[1..d_k] ----------
         with self.phase('client', i):
@@ -382,9 +394,10 @@ class FedSplitX(FLAlgorithm):
     # -- memory partition ---------------------------------------------------------
     # Client: its model + a_[1..d_k] (SGD without momentum: no optimizer state).
     # Server per device: the global x_s + the copy being trained for one client
-    # (+ their aux networks when the server holds any); the round's upload is
-    # held as server working memory. Copies for the other sampled clients are
-    # listed separately.
+    # (+ their aux networks when the server holds any); that client's upload is
+    # held as server working memory. The other sampled clients' copies and
+    # uploads, held at the same time in Alg.1's parallel round, are listed
+    # separately (server_side_extra_memory).
     def client_side_modules(self, i):
         return [self.clients[i].model, self.client_aux[i]]
 
@@ -413,11 +426,24 @@ class FedSplitX(FLAlgorithm):
         if others <= 0:
             return []
         params, grads = module_static_bytes(self.servers[0].model, self.server_aux[0])
-        return [{
+        lines = [{
             'item': f'server copies of the other {others} sampled clients (params + grads)',
             'mb': others * (params + grads) / 1024 ** 2,
             'note': 'Alg.1 L6: one server-side copy per sampled client in a round',
         }]
+        # their uploads (activations + labels of all their data, L7/L18): the
+        # per-device line already counts one upload, so list the other S - 1
+        sizes = sorted(self._upload_bytes[i] for i in self.sampled
+                       if i in self._upload_bytes)
+        if len(sizes) > 1:
+            lines.append({
+                'item': f'uploads of the other {len(sizes) - 1} sampled clients '
+                        f'(smashed data + labels of all their images)',
+                'mb': (sum(sizes) - sizes[-1]) / 1024 ** 2,
+                'note': 'Alg.1 L7/L18: each sampled client\'s upload is held '
+                        'until its server copy has trained on it',
+            })
+        return lines
 
     def register_meter_params(self):
         # every client's and every server copy's parameters, so no parameter
