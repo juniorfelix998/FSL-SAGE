@@ -40,7 +40,7 @@ FedSplitX trains all 10 clients every round (C = 1.0), at batch 256.
 | Server memory, per device (table value) | 176.26 | 296.98 | 194.27 | 86.16 | 181.17 |
 | **Server memory, total for all 10 clients** | **176.26** | **726.47** | **194.28** | **246.47** | **1324.61** |
 | System peak (live) | 106.28 | 106.28 | 122.03 | 21.01 | 144.17 |
-| **Latency** | **338.87 s** | **422.37 s** | **670.71 s** | **548.80 s** | **1270.18 s** |
+| **Latency** | **338.87 s** | **422.37 s** | **670.71 s** | **548.80 s** | **1253.75 s** |
 
 HO-SFL's memory was measured with the updated meter, which also counts a
 forward pass's working set (the layer outputs alive at the same time).
@@ -86,7 +86,7 @@ forward pass's working set (the layer outputs alive at the same time).
 |---|---|
 | **Communication 5738.34** | Each client sends its activations **once per round** for all its 6,000 images (5156.25 MiB in total, the same as HO-SFL's uploads) and **no gradient comes back**, so its cut (5161.29) is half of HO-SFL's. The rest is the client models and aux heads (577.06). The server copies are made and averaged on the main server (Sec. 2.3), so they are not network traffic and are not charged. |
 | **Accuracy 96.28%, below CSE-FSL / FSL-SAGE** | Each round averages 10 models that each made 24 plain-SGD steps (lr 0.01) from the same start, so the global model moves about one client's worth per round. The others use Adam. The client-side ensemble (the 3 aux heads only, what a client can predict alone) reaches 91.67%. |
-| **Latency 1270.18 s, the slowest** | Per client batch the server trains on **every** batch (CSE-FSL's server: 1 in 5), and each client runs an extra forward pass over all its data for the upload. |
+| **Latency 1253.75 s, the slowest** | Per client batch the server trains on **every** batch (CSE-FSL's server: 1 in 5), and each client runs an extra forward pass over all its data for the upload. |
 | **Client memory 102.54** | Its model with gradients (5.22, plain SGD: no optimizer state), 3 tiny aux heads (0.02), and the backward pass through the stem, layer1 and layer2 with 3 heads (94.29) plus the batch (3.00). |
 | **Server 181.17 per device, 1324.61 for all clients** | The global server model (40.08) + one copy being trained with gradients (80.13) + working memory 60.97, of which **46.88 is that client's whole upload**. With 10 clients in parallel, the server also holds 9 more copies (721.14) and 9 more uploads (422.29). |
 

@@ -23,7 +23,7 @@ python main.py rounds=11 save=False device=cuda algorithm=fedsplitx \
 | Client memory | **102.54 MiB** |
 | Server memory, per device (table value) | **181.17 MiB** |
 | Server memory, total for all clients' state | **1324.61 MiB** |
-| Latency | **1270.18 s** |
+| Latency | **1253.75 s** |
 
 Every breakdown row ✓. Units: MiB = 1024² bytes (the benchmark table's "MB").
 
@@ -101,10 +101,10 @@ Code: `src/algos/fedsplitx.py`: `client_step` (L5–L11) and `aggregate` (L12).
 
 | | Value |
 |---|---:|
-| Latency | **1270.18 s** |
-| Client compute (mean per client over 11 rounds) | 70.55 s |
-| Server compute (mean per client over 11 rounds) | 22.74 s |
-| Averaging, client / server (total) | 0.16 / 0.15 s |
+| Latency | **1253.75 s** |
+| Client compute (mean per client over 11 rounds) | 70.32 s |
+| Server compute (mean per client over 11 rounds) | 21.99 s |
+| Averaging, client / server (total) | 0.16 / 0.11 s |
 
 - **Per client batch**, the client runs a forward + backward pass with 3 aux heads, and the server runs a forward + backward on **every** batch (CSE-FSL's server only on 1 in 5).
 - **Each client also runs one extra forward pass** over all its data for the upload.
