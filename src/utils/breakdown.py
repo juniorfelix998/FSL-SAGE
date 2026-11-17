@@ -23,10 +23,11 @@ MB = 1024 ** 2
 
 SERVER_FEDAVG_NAME = 'Server-model FedAvg'
 SERVER_FEDAVG_HOW = (
-    "part of Weights spent averaging per-client copies of the SERVER-side "
-    "model = weights.server_up + weights.server_down = N clients x R rounds x "
-    "2 (up+down) x |x_s|. Already inside Weights, not extra. 0 for any method "
-    "that keeps a single server model."
+    "network traffic for averaging per-client copies of the SERVER-side model "
+    "(weights.server_up + weights.server_down). Communication counts only what "
+    "crosses a network, so this is 0 when the copies are averaged on the "
+    "server that holds them (FedSplitX, MU-SplitFed, SplitFedv1) and 0 for any "
+    "method that keeps a single server model."
 )
 
 
@@ -181,9 +182,8 @@ PAPER_COMPONENTS = {
              'NOT SPECIFIED: sent with the client model (L5); S x R',
              ('weights.aux_down',), _sampled_per_round, 'Weights'),
             ('W5', f'{SERVER_FEDAVG_NAME} (per-client w^s copies)',
-             'Alg.1 L6 (copy down) + L12 (copy up, averaged); charged: 2 x S x R',
-             ('weights.server_up', 'weights.server_down'),
-             lambda s: 2 * _sampled_per_round(s), 'Weights'),
+             'Sec. 2.3: averaged at the main server, which holds every copy -> no network traffic',
+             ('weights.server_up', 'weights.server_down'), _never, 'Weights'),
         ],
     },
     'mu_splitfed': {

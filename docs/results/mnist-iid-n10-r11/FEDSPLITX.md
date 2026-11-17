@@ -19,11 +19,11 @@ python main.py rounds=11 save=False device=cuda algorithm=fedsplitx \
 |---|---:|
 | Test accuracy, full model (ensemble of all heads + output) | **96.28%** |
 | Test accuracy, client side (ensemble of the 3 client heads) | 91.67% |
-| Communication, total | **14555.56 MiB** (Cut 5161.29 + Weights 9394.27) |
+| Communication, total | **5738.34 MiB** (Cut 5161.29 + Weights 577.06) |
 | Client memory | **102.54 MiB** |
 | Server memory, per device (table value) | **181.17 MiB** |
-| Server memory, total for all clients' state | **1324.60 MiB** |
-| Latency | **1265.48 s** |
+| Server memory, total for all clients' state | **1324.61 MiB** |
+| Latency | **1270.18 s** |
 
 Every breakdown row ✓. Units: MiB = 1024² bytes (the benchmark table's "MB").
 
@@ -48,7 +48,7 @@ Each round, all 10 clients do the following. In the paper they run in parallel; 
 - **Aux heads:** (64·10+10) + (64·10+10) + (128·10+10) = 2,590 params = 10,360 B = 0.0099 MiB.
 - **Client-rounds of training:** 10 × 11 = **110**.
 
-## Communication: 14555.56 MiB
+## Communication: 5738.34 MiB
 
 | What is sent | Per transfer (MiB) | Count | MiB |
 |---|---:|---:|---:|
@@ -59,13 +59,14 @@ Each round, all 10 clients do the following. In the paper they run in parallel; 
 | Client model down (L5) | 2.6131 | 110 | 287.44 |
 | Aux heads up | 0.0099 | 110 | 1.09 |
 | Aux heads down | 0.0099 | 110 | 1.09 |
-| Server copy down (L6) + up (L12): Server-model FedAvg | 40.0782 | 220 | 8817.21 |
-| **Total** | | | **14555.56** (Cut 5161.29 + Weights 9394.27) |
+| Server copy made (L6) and averaged (L12): on the main server, no network | – | 0 | 0.00 |
+| **Total** | | | **5738.34** (Cut 5161.29 + Weights 577.06) |
 
 - **Where the bytes come from:**
-  - every row is once per client per round: 10 × 11 = 110 (the server copy: 2 × 110 = 220);
+  - every row is once per client per round: 10 × 11 = 110;
   - one upload is 6,000 × 8,192 B = 49,152,000 B = 46.875 MiB.
-- **Server-model FedAvg is 61% of the total.** It is the benchmark's convention of charging server-copy averaging (as for SplitFedv1). Without it: 5738.35 MiB.
+- **The server copies are not charged.** The paper averages the server-side models "at the main server" (Sec. 2.3), which also holds the global server model and every copy, so making a copy (L6) and averaging the copies (L12) never cross a network. Communication counts only network transfers, the same rule as MU-SplitFed and SplitFedv1. The copies still count as server memory (721.14 MiB, below). Only the client-side models and aux heads are averaged across the network, at the fed server (W1–W4).
+- **90% of the traffic is the cut** (5161.29 of 5738.34 MiB).
 - **The cut traffic is one activation per image per round,** the same as HO-SFL's uploads (5156.25 MiB). FedSplitX sends no gradient back, so its cut is half of HO-SFL's.
 
 Code: `src/algos/fedsplitx.py`: `client_step` (L5–L11) and `aggregate` (L12).
@@ -86,10 +87,13 @@ Code: `src/algos/fedsplitx.py`: `client_step` (L5–L11) and `aggregate` (L12).
 | Working memory: the client's whole upload 46.88 + labels 0.05 + autograd activations 14.04 + small outputs 0.01 | 60.97 |
 | **Per device (table value)** | **181.17** |
 | + server copies of the other 9 clients (9 × 80.13, params + grads) | 721.14 |
-| + uploads of the other 9 clients (9 × 49,200,000 B) | 422.28 |
-| **Total for all clients' state** | **1324.60** |
+| + uploads of the other 9 clients (9 × 49,200,000 B = 442,800,000 B) | 422.29 |
+| **Total for all clients' state** | **1324.61** |
 
-- **Why the other 9 uploads count.** In Alg.1 all clients run in parallel, so the server holds all 10 uploads while it trains the 10 copies. The run's breakdown lists the 9 copies (721.14, so 902.32 in its last line); the 9 uploads are added here from the upload size.
+- **Why the other 9 copies and uploads count.** In Alg.1 all clients run in parallel, so the server holds all 10 server copies and all 10 uploads while it trains them. The run's breakdown lists both (721.14 + 422.29), so its last line is 1324.61.
+- **Parallel vs one after another.**
+  - **Results are the same.** The code runs the clients one after another, each from the same global models, which only change at the averaging step. Running them in reverse order gives identical weights.
+  - **Memory is measured one client at a time.** The per-device server number (181.17) is one copy, one upload and one batch's activations. If the server trained all 10 copies at the same instant, their working activations (14.04 each) would add up to 9 × 14.04 = 126.36 MiB more (about 1450.97 MiB in total). That is an estimate: a real server could also train them in turns.
 - **Held-across-cut = 0:** the client never waits for the server.
 - **System peak:** 144.17 MiB live; 269.62 with all model bytes added.
 
@@ -97,10 +101,10 @@ Code: `src/algos/fedsplitx.py`: `client_step` (L5–L11) and `aggregate` (L12).
 
 | | Value |
 |---|---:|
-| Latency | **1265.48 s** |
-| Client compute (mean per client over 11 rounds) | 69.83 s |
-| Server compute (mean per client over 11 rounds) | 23.58 s |
-| Averaging, client / server (total) | 0.16 / 0.14 s |
+| Latency | **1270.18 s** |
+| Client compute (mean per client over 11 rounds) | 70.55 s |
+| Server compute (mean per client over 11 rounds) | 22.74 s |
+| Averaging, client / server (total) | 0.16 / 0.15 s |
 
 - **Per client batch**, the client runs a forward + backward pass with 3 aux heads, and the server runs a forward + backward on **every** batch (CSE-FSL's server only on 1 in 5).
 - **Each client also runs one extra forward pass** over all its data for the upload.

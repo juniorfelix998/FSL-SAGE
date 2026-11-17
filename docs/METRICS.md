@@ -178,85 +178,35 @@ include **buffers** — BatchNorm running stats are real bytes on the wire
    client-local loss. Note `han_locloss` and `fedsplitx` *do* charge labels
    despite being local-loss methods: their servers compute their own
    cross-entropy, so the labels really do cross.
-2. **Server-side aggregation is charged a full model round-trip** in every
-   multi-server method — SplitFedv1, FedSplitX, Han-et-al (and MU-SplitFed in its
-   old port; it now follows its paper, where the Split Server averages its copies
-   locally, so it is not charged). The
-   reference implementations charge this as *zero*, on the grounds that
-   per-client server replicas live on one host, so averaging them is a memory
-   copy rather than network traffic. This harness charges it because the
-   alternative — charging some methods and not others for the identical
-   operation — biases the ranked column.
-
-   **This dominates those methods' weight traffic**, so the table carries a
-   `Server-model FedAvg` sub-column (formerly "of which server-side") to make
-   it separable. That column is
-   important enough to explain on its own — see immediately below.
+2. **Communication counts only what crosses a network.** SplitFedv1, FedSplitX
+   and MU-SplitFed keep one server-side model copy per client **on the main
+   (split) server**, and their papers average those copies there. Making a copy
+   and averaging the copies never leave that machine, so they are **not
+   charged**; the copies still count as server memory. The client-side models
+   (and aux networks) are averaged at the fed server, across the network, and
+   are charged. The one remaining exception is **Han-et-al**, whose server-side
+   replicas are this harness's own extrapolation; it still charges a round trip
+   and has not been revisited.
 
 ### Reading the `Server-model FedAvg` column (formerly "of which server-side")
 
-**How we get it:**
-
 ```
 Server-model FedAvg = weights.server_up + weights.server_down      (ledger keys)
-                    = N clients x R rounds x 2 (up + down) x |x_s|
 ```
 
-charged by `charge_weights_roundtrip(server_model, 'server')` once per client
-per round, only in methods that keep one server-model copy per client.
+It is the network traffic for averaging per-client copies of the server-side
+model. Under the rule above it is **0** for SplitFedv1, FedSplitX and
+MU-SplitFed (averaged on the server that holds the copies), and 0 for every
+method with a single server model. Only Han-et-al still reports a value.
 
-**It is not an extra cost.** It is a *breakdown of* `Comm-weights`, naming how
-much of that number comes from one specific operation: **averaging the
-per-client copies of the SERVER-side model**.
-
-Four methods — SplitFedv1, MU-SplitFed, Han-et-al, FedSplitX — keep **one server
-replica per client**, so each round they FedAvg those replicas as well as the
-client-side models. The server-side model is 40.08 MB against the client-side
-2.61 MB — **15× larger** — so that single operation dominates everything else
-the method sends. Worked from a real run (`rounds × clients = 6`):
-
-```
-client-side aggregation = 6 x 2 x  2.6131 =  31.36 MB   <- every FedAvg method pays this
-server-side aggregation = 6 x 2 x 40.0782 = 480.94 MB   <- only the multi-server methods
-                                            ---------
-SplitFedv1 Comm-weights                    = 512.30 MB
-```
-
-**Why it is broken out.** Every reference implementation charges this as *zero*:
-the replicas share one host, so averaging them is a memory copy, not network
-traffic. This harness charges it anyway, because otherwise SplitFedv1 and
-FedSplitX would be billed for an operation that SplitFedv2 performs internally
-for free — two methods billed differently for the same work. But that is *our*
-convention, not the literature's, so the column exists to let anyone remove it.
-
-Subtract it and the picture changes completely:
-
-| Method | Comm-weights | Server-model FedAvg | **net** |
-|---|---|---|---|
-| SplitFedv1 | 512.30 | 480.94 | **31.36** |
-| SplitFedv2 | 31.36 | 0.00 | **31.36** |
-| MU-SplitFed (old port) | 512.30 | 480.94 | **31.36** |
-| Han-et-al | 513.23 | 480.94 | **32.29** |
-| FedSplitX (old port) | 512.50 | 481.06 | **31.44** |
-| CSE-FSL | 127.71 | 0.00 | 127.71 |
-| FSL-SAGE | 47.42 | 0.00 | 47.42 |
-| LocFedMix-SL | 32.22 | 0.00 | 32.22 |
-| Vanilla-SL | 15.68 | 0.00 | 15.68 |
-| HO-SFL | 0.04 (old port) | 0.00 | 0.04 |
-| DSL-Aux, HOSL | 0.00 | 0.00 | 0.00 |
-
-**The four apparently-expensive methods collapse to ≈31.4 MB — the same as
-SplitFedv2.** Their 16× disadvantage is entirely this accounting convention, not
-a property of the algorithms. And the ranking inverts: under the papers' own
-convention **CSE-FSL (127.71) becomes the most weight-expensive method**, because
-its auxiliary network really is FedAvg'd across the network every round.
-
-Neither column is "the right one" — they answer different questions. *Comm-weights*
-asks "what would this protocol cost if every participant were a separate
-machine", which is the deployment question and is why it stays in the ranked
-Comm-total. *Net of server-side* asks "what do the papers count", which is the
-right column for checking our numbers against a published one. Quote whichever
-you are arguing about, but say which.
+**Why the rule changed.** The harness used to charge this averaging as a full
+round trip per client per round for SplitFedv1 and FedSplitX (but not for
+MU-SplitFed). Because the server-side model is 15× the client-side model, that
+one convention dominated those methods' totals (FedSplitX: 8817.21 of
+14555.56 MiB) for bytes that never cross a network, and it billed the same
+operation differently in different methods. Now one rule applies: count only
+network transfers. FedSplitX's total is 5738.34 MiB; SplitFedv1's
+communication equals SplitFedv2's (same cut, same client FedAvg).
 
 ### Expected accounting signature per method
 A row that violates its signature is a bug, not a finding.

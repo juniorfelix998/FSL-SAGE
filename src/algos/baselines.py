@@ -185,12 +185,11 @@ class SplitFedv1(FLAlgorithm):
 
         for s in self.servers:
             s.model.load_state_dict(agg_weights)
-            # BUGFIX: this exchange used to be charged ZERO bytes, while every
-            # other multi-server method here (fedsplitx, han_locloss,
-            # mu_splitfed) charges a full round trip for the identical
-            # operation. That biased SplitFedv1 low on Comm-TOTAL, the value the
-            # benchmark ranks on.
-            self.charge_weights_roundtrip(self.aggregated_server, 'server')
+            # Not charged: the main server holds every server-side copy and
+            # averages them itself, so nothing crosses a network. Communication
+            # counts only network transfers (the same rule as FedSplitX's main
+            # server and MU-SplitFed's Split Server); the copies still count
+            # as server memory.
 
         ret_dict['server_agg_compute_time'] = time.time() - t0
         return ret_dict

@@ -401,19 +401,18 @@ def test_comm_closed_form():
              res.comm_load[-1])
     splitfedv2 = res
 
-    # ---- SplitFedv1: same cut, PLUS server-replica aggregation ---------
+    # ---- SplitFedv1: same cut; server replicas averaged on the server ---
     cfg, res = build_run('sl_multi_server', M, N, B, R)
     bd = res.comm_breakdown
     check_eq("SplitFedv1 cut.act_up", last(bd, 'cut.act_up'), R * per_round_act)
     check_eq("SplitFedv1 cut.grad_down", last(bd, 'cut.grad_down'),
              R * per_round_act)
-    # the bug this fixes: server aggregation used to be charged ZERO
-    check_eq("SplitFedv1 DOES charge server aggregation (was 0 before)",
-             last(bd, 'weights.server_up') + last(bd, 'weights.server_down'),
-             R * 2 * M * server_model_bytes())
-    check("SplitFedv1 total exceeds SplitFedv2 total (extra server FedAvg)",
-          res.comm_load[-1] > splitfedv2.comm_load[-1],
-          f"v1={res.comm_load[-1]} v2={splitfedv2.comm_load[-1]}")
+    # the main server holds every replica and averages them itself: no
+    # network traffic, so nothing is charged (same rule as FedSplitX, MU-SplitFed)
+    check_eq("SplitFedv1 server-replica averaging is local: not charged",
+             last(bd, 'weights.server_up') + last(bd, 'weights.server_down'), 0)
+    check_eq("SplitFedv1 total equals SplitFedv2 total (same cut, same client FedAvg)",
+             res.comm_load[-1], splitfedv2.comm_load[-1])
 
     # ---- CSE-FSL: activation only, 1 batch in every q ------------------
     Q = 3
@@ -660,8 +659,8 @@ def test_comm_closed_form():
                  last(bd_fx, f'weights.client_{d}'), R * S_fx * client_model_bytes())
         check_eq(f"FedSplitX weights.aux_{d} = S x R aux heads",
                  last(bd_fx, f'weights.aux_{d}'), R * S_fx * head_bytes)
-        check_eq(f"FedSplitX weights.server_{d} = S x R server copies (L6 / L12)",
-                 last(bd_fx, f'weights.server_{d}'), R * S_fx * server_model_bytes())
+        check_eq(f"FedSplitX weights.server_{d} = 0 (copies averaged on the main server, Sec. 2.3)",
+                 last(bd_fx, f'weights.server_{d}'), 0)
     check_paper_rows("FedSplitX", res_fx)
     extra = {l['item'].split(' (')[0]: l['mb'] for l in res_fx.memory_metrics['server_mem_extra_components']}
     upload_one = sum(act_bytes(b) + label_bytes(b) for b in bs_list)

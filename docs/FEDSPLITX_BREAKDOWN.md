@@ -65,7 +65,7 @@ Client size: Table 3 gives 689.4K parameters at level 3; ours has 683,072. The p
 | Batch | 64 | 256 (every method's batch) |
 | Rounds | 1000, 1 local epoch | 11, 1 local epoch |
 | Dataset | CIFAR-10/100 | MNIST |
-| Server-copy averaging | not discussed as traffic | **charged** as Server-model FedAvg: one download (L6) and one upload (L12) of the server model per sampled client per round |
+| Server-copy averaging | at the main server (Sec. 2.3) | **not charged**: the main server holds the global server model and every copy, so nothing crosses a network (the same rule as MU-SplitFed and SplitFedv1); the copies count as server memory |
 
 ## Changes from the earlier port
 

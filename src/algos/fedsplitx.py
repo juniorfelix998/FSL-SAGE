@@ -26,7 +26,7 @@
 #   L3    P_t <- random set of clients, a fraction C        begin_round()
 #   L5    client downloads the global client-side model     client_step, 1st batch
 #         (printed as w^s[:d_k]; a typo for w^c)            -> client_down, aux_down
-#   L6    server copy w^s_k <- w^s[d_k:] for that client     -> server_down
+#   L6    server copy w^s_k <- w^s[d_k:] for that client     (on the main server: no traffic)
 #   L7    s^c_k, y_k <- GetSmashedData(w^c_k, D_k)           client_step, 1st batch
 #   L18     forward ALL of D_k through the DOWNLOADED model,  -> ONE act_up + ONE
 #           send the smashed data and labels to the server       labels_up per round
@@ -36,8 +36,8 @@
 #   L9-11 server trains w^s_k for E epochs on s^c_k with     client_step, every batch
 #         sum_{i=d_k+1..M+1} CE (output only at level 3)
 #   L12   heteroavg: each parameter is averaged over the      aggregate()
-#         clients that hold it (plain mean); the same for    -> client_up, aux_up,
-#         the server-side models                                 server_up
+#         clients that hold it (plain mean); the same for    -> client_up, aux_up
+#         the server-side models (on the main server: no traffic)
 # No gradient ever crosses the cut (p.4, B.2, Fig. 1). Inference (Sec. 3): the
 # ensemble of every auxiliary network and the model output; the paper reports
 # the client-side accuracy as well, logged here each round.
@@ -67,8 +67,14 @@
 #     client per round: 1/10 of the data, and an average of a single model.)
 #     Set algorithm.client_fraction=C to sample S = max(1, round(C * N)).
 #   - batch 256 (the batch every method uses; the paper uses 64)
-#   - the server-copy averaging (L12) is charged as Server-model FedAvg, one
-#     upload (L12) and one download (L6) of x_s per sampled client per round
+#   - communication counts only what crosses a network. Sec. 2.3: "The
+#     aggregation of server-side model parameters is performed at the main
+#     server", which also holds the global w^s and every copy w^s_k, so making
+#     a copy (L6) and averaging the copies (L12) never leave that machine and
+#     are not charged (the same rule as MU-SplitFed's Split Server and
+#     SplitFedv1's main server). The client-side models and aux networks are
+#     averaged at the fed server, across the network: charged (W1-W4). The
+#     copies still count as server memory (server_side_extra_memory).
 #   - random init, the same as every method
 # ------------------------------------------------------------------------------
 import time
@@ -81,7 +87,6 @@ from tqdm import tqdm
 
 from algos import register_algorithm, FLAlgorithm
 from utils.memory import module_static_bytes
-from utils.utils import calculate_load
 from models.aux_models.simple_conv import GAPLinearHead as _AuxHead
 
 # Appendix A.1: ResNet-18 partition points, in order (stem output = maxpool)
@@ -204,12 +209,6 @@ class FedSplitX(FLAlgorithm):
         first = nn.ModuleList([_AuxHead(d, num_classes) for d in s_dims]).to(self.device)
         self.server_aux = [first] + [copy.deepcopy(first) for _ in self.clients[1:]]
 
-    @staticmethod
-    def __server_side_bytes(model, heads):
-        '''One transfer of a server-side model w^s_k: its layers plus its aux
-        networks a_[d_k+1..M] (none at the middle cut).'''
-        return calculate_load(model) + calculate_load(heads)
-
     # -- L3: sample P_t ---------------------------------------------------------
     def begin_round(self, t):
         self.sampled = sorted(int(i) for i in np.random.choice(
@@ -263,8 +262,7 @@ class FedSplitX(FLAlgorithm):
             # L6: the server copy for this client, from the global w^s
             server.load_state_dict(self.aggregated_server.state_dict())
             self.server_aux[i].load_state_dict(self.aggregated_server_aux.state_dict())
-            self.ledger.charge_weights('server_down', self.__server_side_bytes(
-                self.aggregated_server, self.aggregated_server_aux))
+            # (on the main server, which holds w^s and every copy: not charged)
             # L7 / L18: smashed data + labels of all of D_k, one upload
             with self.phase('client', i):
                 s, ys, offsets = self.__get_smashed_data(i)
@@ -334,9 +332,8 @@ class FedSplitX(FLAlgorithm):
         _mean_into(self.aggregated_server, [self.servers[i].model for i in P])
         if len(self.aggregated_server_aux):
             _mean_into(self.aggregated_server_aux, [self.server_aux[i] for i in P])
-        for i in P:
-            self.ledger.charge_weights('server_up', self.__server_side_bytes(
-                self.servers[i].model, self.server_aux[i]))
+        # (Sec. 2.3: averaged at the main server, which already holds every
+        # copy: no network traffic, not charged)
         self._upload = {}                      # the round's uploads are spent
         return {'client_agg_compute_time': t1 - t0,
                 'server_agg_compute_time': time.time() - t1}
