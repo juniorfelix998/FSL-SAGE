@@ -312,6 +312,12 @@ class FLAlgorithm(ABC):
             'groups': getattr(self, 'group_log', None),
         }
 
+    def extra_report(self):
+        '''Optional method-specific table for the end-of-run breakdown
+        ({'title', 'columns', 'rows', 'note', 'data'}), e.g. FedSplitX's
+        per-depth-level results in its heterogeneous mode. None by default.'''
+        return None
+
     def server_side_extra_memory(self):
         '''[{'item', 'mb', 'note'}] for state the protocol keeps on the server
         that is NOT folded into `peak_server_mem_mb` (e.g. FSL-SAGE's alignment
@@ -898,7 +904,7 @@ def _run_fl_algorithm(
         cfg.algorithm.name, alg.schedule(rounds_run), alg.ledger.snapshot(),
         {'cut': alg.comm_load_cut, 'weights': alg.comm_load_weights,
          'total': alg.comm_load},
-        memory_metrics,
+        memory_metrics, extra=alg.extra_report(),
     )
     logging.info("\n" + render_breakdown(breakdown))
 

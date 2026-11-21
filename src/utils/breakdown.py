@@ -251,7 +251,7 @@ PAPER_COMPONENTS = {
 
 
 # ------------------------------------------------------------------------------
-def build_breakdown(algo_name, schedule, snapshot, totals, memory_metrics):
+def build_breakdown(algo_name, schedule, snapshot, totals, memory_metrics, extra=None):
     '''Pure-data breakdown (JSON-serialisable) for one run.
 
     snapshot       -- CommLedger.snapshot() at the end of the run
@@ -311,6 +311,9 @@ def build_breakdown(algo_name, schedule, snapshot, totals, memory_metrics):
             'cut_rows_sum': cut_sum, 'weights_rows_sum': w_sum,
         },
         'server_model_fedavg_how': SERVER_FEDAVG_HOW,
+        # optional method-specific table (FLAlgorithm.extra_report), e.g.
+        # FedSplitX's per-depth-level results; None for every other run
+        'extra': extra,
         'memory': {
             'client_lines': client_lines,
             'client_index': mm.get('client_mem_components_client'),
@@ -392,6 +395,16 @@ def render(bd):
     out.append('')
     out.append(f"- **System peak** (live bytes, both sides at one instant) = {_f(m['system_peak_live'])} MiB; "
                f"with static model/optimizer bytes = {_f(m['system_peak_with_static'])} MiB")
+    ex = bd.get('extra')
+    if ex:
+        out.append('')
+        out.append(f"### {ex['title']}")
+        out.append('| ' + ' | '.join(ex['columns']) + ' |')
+        out.append('|' + '---|' * len(ex['columns']))
+        for row in ex['rows']:
+            out.append('| ' + ' | '.join(str(c) for c in row) + ' |')
+        if ex.get('note'):
+            out.append(f"\n- {ex['note']}")
     return '\n'.join(out)
 
 

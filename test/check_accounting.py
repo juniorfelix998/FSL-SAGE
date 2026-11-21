@@ -1236,6 +1236,105 @@ def test_ho_sfl_iteration():
           all(torch.equal(a, b) for a, b in zip(client.buffers(), bn_ref)))
 
 # ==============================================================================
+# ==============================================================================
+# FedSplitX optional heterogeneous depth levels (paper Sec. 2.1 / 2.3)
+# ==============================================================================
+def test_fedsplitx_hetero():
+    print("\n[10] FedSplitX heterogeneous depth levels (optional mode)")
+    from models import CLIENT_SERVER_MODEL_REGISTRY, Client, Server
+    from algos.fedsplitx import _levels_from_mix
+    from utils.utils import calculate_load
+    cli_ctor, srv_ctor = CLIENT_SERVER_MODEL_REGISTRY['resnet18']
+
+    # -- the stem-only split (level 1) and matching layer names -----------
+    c0, s0 = cli_ctor(client_layers=0), srv_ctor(client_layers=0, num_classes=NUM_CLASSES)
+    check_eq("stem-only client + layer1->fc server: output shape",
+             tuple(s0(c0(torch.randn(2, 3, 32, 32))).shape), (2, NUM_CLASSES))
+    full = sum(p.numel() for p in cli_ctor(client_layers=2).parameters()) + \
+        sum(p.numel() for p in srv_ctor(client_layers=2, num_classes=NUM_CLASSES).parameters())
+    check_eq("level-1 split has the same parameters as the middle cut",
+             sum(p.numel() for p in c0.parameters()) + sum(p.numel() for p in s0.parameters()), full)
+    check("server layer1.* names equal the client's (heteroavg matches by name)",
+          {k for k in s0.state_dict() if k.startswith('layer1.')} ==
+          {k for k in cli_ctor(client_layers=1).state_dict() if k.startswith('layer1.')})
+
+    # -- the level mix ------------------------------------------------------
+    for n, want in ((10, (3, 3, 4)), (50, (16, 16, 18))):
+        lv = _levels_from_mix([0.32, 0.32, 0.36], n)
+        check_eq(f"mix [0.32, 0.32, 0.36] with {n} clients", tuple(lv.count(m) for m in (1, 2, 3)), want)
+    check("mix counts always add up to N",
+          all(len(_levels_from_mix([0.32, 0.32, 0.36], n)) == n for n in range(1, 60)))
+
+    # -- a full run: paper rows, exact bytes per level, per-level report -----
+    levels = [1, 2, 3, 3]
+    res = build_real_run('fedsplitx', {'client_fraction': 1.0, 'depth_levels': levels},
+                         num_clients=4, samples=8, batch_size=4, rounds=1, cut_layers=2)
+    check_paper_rows("FedSplitX hetero", res)
+    bd = res.comm_breakdown[-1]
+    per_img = {1: 64 * 8 * 8 * 4, 2: 64 * 8 * 8 * 4, 3: 128 * 4 * 4 * 4}
+    check_eq("FedSplitX hetero: act_up = each client's upload at its level's size",
+             bd['cut.act_up'], sum(8 * per_img[l] for l in levels))
+    model_bytes = {l: calculate_load(cli_ctor(client_layers=l - 1)) for l in (1, 2, 3)}
+    check_eq("FedSplitX hetero: client_up = each client's model at its level's size",
+             bd['weights.client_up'], sum(model_bytes[l] for l in levels))
+    head = lambda d: (d * NUM_CLASSES + NUM_CLASSES) * 4      # GAP + Linear(d -> classes)
+    head_bytes = {1: head(64), 2: head(64) * 2, 3: head(64) * 2 + head(128)}
+    check_eq("FedSplitX hetero: aux_up = each client's heads a_[1..d_k]",
+             bd['weights.aux_up'], sum(head_bytes[l] for l in levels))
+    ex = res.breakdown.get('extra') or {}
+    data = ex.get('data', {})
+    check_eq("FedSplitX hetero: per-level report has 3 levels", sorted(data), [1, 2, 3])
+    check_eq("FedSplitX hetero: clients per level", [data[m]['clients'] for m in (1, 2, 3)], [1, 1, 2])
+    check("FedSplitX hetero: headline accuracy = mean of the 3 full-model accuracies",
+          math.isclose(res.accuracy[-1], sum(data[m]['acc_full'] for m in (1, 2, 3)) / 3, rel_tol=1e-9))
+
+    # -- heteroavg: each parameter averaged over the models that hold it ----
+    torch.manual_seed(0)
+    cfg = make_cfg('fedsplitx', 4, 1, 4, {'client_fraction': 1.0, 'depth_levels': levels})
+    opt = OmegaConf.create({'optimizer': {'name': 'sgd', 'options': {'lr': 0.01}}})
+    server = Server(srv_ctor(client_layers=2, num_classes=NUM_CLASSES), opt, device='cpu')
+    clients = []
+    for i in range(4):
+        g = torch.Generator().manual_seed(10 + i)
+        data_i = TensorDataset(torch.randn(8, 3, 32, 32, generator=g),
+                               torch.randint(0, NUM_CLASSES, (8,), generator=g))
+        clients.append(Client(i, DataLoader(data_i, batch_size=4), cli_ctor(client_layers=2),
+                              OmegaConf.create({'epoch': 1, 'batch_size': 4, **opt}), device='cpu'))
+    tl = DataLoader(TensorDataset(torch.randn(4, 3, 32, 32), torch.randint(0, NUM_CLASSES, (4,))), batch_size=4)
+    alg = ALGORITHM_REGISTRY['fedsplitx'](cfg.algorithm, server, clients, tl, [0.25] * 4, device='cpu')
+    alg.register_meter_params(); alg.train_mode(0); alg.begin_round(0)
+    for i in range(4):
+        for k, (x, y) in enumerate(clients[i].train_loader):
+            alg.client_step((0, i, 0, k), x, y)
+    cs = [{k: v.clone() for k, v in c.model.state_dict().items()} for c in clients]
+    ss = [{k: v.clone() for k, v in s.model.state_dict().items()} for s in alg.servers]
+    ca = [{k: v.clone() for k, v in h.state_dict().items()} for h in alg.client_aux]
+    sa = [{k: v.clone() for k, v in h.state_dict().items()} for h in alg.server_aux]
+    alg.aggregate()
+    gc, gs = alg.aggregated_client.state_dict(), alg.aggregated_server.state_dict()
+    gca, gsa = alg.aggregated_aux.state_dict(), alg.aggregated_server_aux.state_dict()
+    mean = lambda ts: sum(ts) / len(ts)
+    def same(name, got, holders):
+        check(f"heteroavg: {name} = mean over {len(holders)} holder(s)",
+              torch.allclose(got, mean(holders), atol=1e-7))
+    same("client stem (all 4 clients)", gc['conv1.weight'], [s['conv1.weight'] for s in cs])
+    same("client layer1 (levels 2-3)", gc['layer1.0.conv1.weight'],
+         [s['layer1.0.conv1.weight'] for s, l in zip(cs, levels) if l >= 2])
+    same("client layer2 (level 3)", gc['layer2.0.conv1.weight'],
+         [s['layer2.0.conv1.weight'] for s, l in zip(cs, levels) if l >= 3])
+    same("server layer1 (level-1 copy)", gs['layer1.0.conv1.weight'],
+         [s['layer1.0.conv1.weight'] for s, l in zip(ss, levels) if l <= 1])
+    same("server layer2 (level 1-2 copies)", gs['layer2.0.conv1.weight'],
+         [s['layer2.0.conv1.weight'] for s, l in zip(ss, levels) if l <= 2])
+    same("server layer3 (all 4 copies)", gs['layer3.0.conv1.weight'], [s['layer3.0.conv1.weight'] for s in ss])
+    same("client head a2 (levels 2-3)", gca['layer1.fc.weight'],
+         [s['layer1.fc.weight'] for s, l in zip(ca, levels) if l >= 2])
+    same("server head a2 (level-1 copy)", gsa['layer1.fc.weight'],
+         [s['layer1.fc.weight'] for s, l in zip(sa, levels) if l <= 1])
+    same("server head a3 (level 1-2 copies)", gsa['layer2.fc.weight'],
+         [s['layer2.fc.weight'] for s, l in zip(sa, levels) if l <= 2])
+
+
 def main():
     print("=" * 74)
     print("Measurement-layer checks (communication + per-side memory)")
@@ -1249,6 +1348,7 @@ def main():
     test_system_peak_memory()
     test_held_across_cut_reflects_the_algorithm()
     test_ho_sfl_iteration()
+    test_fedsplitx_hetero()
 
     print("\n" + "=" * 74)
     if FAILURES:

@@ -14,3 +14,13 @@ lr          : 0.01
 momentum    : 0.0
 weight_decay: 0.0
 # Batch: the benchmark's 256 (model.client.batch_size); the paper uses 64.
+# OPTIONAL heterogeneous depth levels (Sec. 2.1, App. A.1), OFF by default:
+# both null = every client at the harness's cut (level 3 at cut=middle), the
+# benchmark setting. Turn it on with the fraction of clients at levels 1, 2, 3
+#   algorithm.depth_level_mix=[0.32,0.32,0.36]   # paper 16/16/18 of 50; 10 -> 3/3/4
+# (counts are rounded to add up to num_clients, clients assigned in order), or
+# give each client's level explicitly (overrides the mix)
+#   algorithm.depth_levels=[1,1,1,2,2,2,3,3,3,3]
+# Level 1 = stem only, 2 = + layer1, 3 = + layer2. Needs ResNet-18, cut=middle.
+depth_level_mix: null
+depth_levels   : null

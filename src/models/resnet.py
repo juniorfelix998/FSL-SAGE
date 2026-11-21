@@ -359,7 +359,9 @@ class ResNetClient(nn.Module):
         # -- 1 = "shallow" cut, 2 = "middle" cut (default, unchanged prior
         # behavior), 3 = "deep" cut. The matching ResNetServer/ResNetAuxiliary
         # must be constructed with the same value. See CLAUDE.md's
-        # "Cuts: early/middle/late" benchmark dimension.
+        # "Cuts: early/middle/late" benchmark dimension. 0 = the stem only
+        # (conv1, bn1, relu, maxpool): FedSplitX's depth level 1, used only by
+        # its optional heterogeneous mode.
         client_layers: int = 2,
     ) -> None:
         super().__init__()
@@ -367,8 +369,8 @@ class ResNetClient(nn.Module):
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
 
-        if client_layers not in (1, 2, 3):
-            raise ValueError(f"client_layers must be 1, 2, or 3, got {client_layers}")
+        if client_layers not in (0, 1, 2, 3):
+            raise ValueError(f"client_layers must be 0, 1, 2, or 3, got {client_layers}")
         self.client_layers = client_layers
 
         self.inplanes = 64
@@ -388,7 +390,8 @@ class ResNetClient(nn.Module):
         self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
+        if client_layers >= 1:
+            self.layer1 = self._make_layer(block, 64, layers[0])
         if client_layers >= 2:
             self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
         if client_layers >= 3:
@@ -460,7 +463,8 @@ class ResNetClient(nn.Module):
         x = self.relu(x)
         x = self.maxpool(x)
 
-        x = self.layer1(x)
+        if self.client_layers >= 1:
+            x = self.layer1(x)
         if self.client_layers >= 2:
             x = self.layer2(x)
         if self.client_layers >= 3:
@@ -490,11 +494,12 @@ class ResNetServer(nn.Module):
         replace_stride_with_dilation: Optional[List[bool]] = None,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
         # must match the paired ResNetClient's client_layers -- see its
-        # docstring. Only used to decide which of layer2/layer3 the server
-        # itself must build (layer1 is always client-side, layer4 is always
-        # server-side); `inplanes` (above) still governs the server's actual
-        # starting channel width and is expected to already be set
-        # consistently with client_layers by the caller.
+        # docstring. Only used to decide which of layer1/layer2/layer3 the
+        # server itself must build (layer1 only when client_layers = 0, i.e.
+        # a stem-only client; layer4 is always server-side); `inplanes`
+        # (above) still governs the server's actual starting channel width and
+        # is expected to already be set consistently with client_layers by the
+        # caller.
         client_layers: int = 2,
     ) -> None:
         super().__init__()
@@ -502,8 +507,8 @@ class ResNetServer(nn.Module):
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
 
-        if client_layers not in (1, 2, 3):
-            raise ValueError(f"client_layers must be 1, 2, or 3, got {client_layers}")
+        if client_layers not in (0, 1, 2, 3):
+            raise ValueError(f"client_layers must be 0, 1, 2, or 3, got {client_layers}")
         self.client_layers = client_layers
 
         self.inplanes = inplanes  # TODO: changed
@@ -519,6 +524,8 @@ class ResNetServer(nn.Module):
             )
         self.groups = groups
         self.base_width = width_per_group
+        if client_layers <= 0:
+            self.layer1 = self._make_layer(block, 64, layers[0])
         if client_layers <= 1:
             self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
         if client_layers <= 2:
@@ -588,6 +595,8 @@ class ResNetServer(nn.Module):
 
     def _forward_impl(self, x: Tensor) -> Tensor:
         # See note [TorchScript super()]
+        if self.client_layers <= 0:
+            x = self.layer1(x)
         if self.client_layers <= 1:
             x = self.layer2(x)
         if self.client_layers <= 2:
@@ -690,7 +699,9 @@ def resnet18_sl_server(*,
         :members:
     """
     if in_planes is None:
-        in_planes = _STAGE_OUT_PLANES[client_layers - 1]
+        # client_layers = 0: the client ends at the stem, whose output has 64
+        # channels (the same width layer1 takes as input)
+        in_planes = 64 if client_layers == 0 else _STAGE_OUT_PLANES[client_layers - 1]
     return _resnet_sl_server(
         BasicBlock, [2, 2, 2, 2], in_planes, weights, progress,
         client_layers=client_layers, **kwargs
