@@ -18,3 +18,4 @@ wandb/
 *.pyc
 .ipynb_checkpoints
 __pycache__
+.claude/*
