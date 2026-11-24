@@ -127,6 +127,79 @@ Code: `src/algos/fedsplitx.py`: `client_step` (L5–L11) and `aggregate` (L12).
 - Each round averages 10 models that each made 24 plain-SGD steps (lr 0.01) from the same start, so the global model moves about one client's worth of steps per round.
 - The other two methods train with Adam.
 
+## Optional: clients at different depth levels (the paper's mixed setting)
+
+This is **not** the reported benchmark run (that is everything above, with every client at level 3). It is the paper's own setting: each client has its own depth level, and heteroavg averages every parameter over the clients that hold it (Sec. 2.3). The mode is off by default.
+
+```
+python main.py rounds=11 save=False device=cuda algorithm=fedsplitx \
+    model=resnet18 dataset=mnist cut=middle seed=200 comm_threshold_mb=204800 measure_memory=true \
+    'algorithm.depth_level_mix=[0.32,0.32,0.36]'
+```
+
+**Setup:**
+- the mix [0.32, 0.32, 0.36] is the paper's 16 / 16 / 18 of 50 clients; with 10 clients that is **3 / 3 / 4** (levels 1, 1, 1, 2, 2, 2, 3, 3, 3, 3);
+- what each level holds:
+
+| Level | Client keeps | Client heads | Server copy keeps | Server heads |
+|---|---|---|---|---|
+| 1 | stem | a1 | layer1 → fc | a2, a3 |
+| 2 | stem, layer1 | a1, a2 | layer2 → fc | a3 |
+| 3 | stem, layer1, layer2 | a1, a2, a3 | layer3 → fc | – |
+
+The global client model is the largest client model (level 3) and the global server model the largest server model (level 1), so layer1, layer2, a2 and a3 exist in a client-trained and a server-trained version (Sec. 2.1).
+
+**Results (11 rounds, Colab T4, every breakdown row ✓):**
+
+| Level | Clients | Accuracy: client side / full model | Client memory (max) | Server copy (params + grads) | Upload | Client model up + down | Aux up + down |
+|---:|---:|---|---:|---:|---:|---:|---:|
+| 1 | 3 | 40.64% / **96.93%** | 123.08 | 85.29 | 3095.26 | 2.43 | 0.16 |
+| 2 | 3 | 78.75% / **96.50%** | 124.22 | 84.15 | 3095.26 | 39.82 | 0.33 |
+| 3 | 4 | 89.91% / **95.27%** | 102.54 | 80.13 | 2064.51 | 229.95 | 0.87 |
+
+| Result | Mixed levels | All at level 3 (reported) |
+|---|---:|---:|
+| Accuracy (mean of the 3 full models / full model) | **96.23%** | 96.28% |
+| Communication: Cut / Weights / **Total** | 8255.04 / 273.57 / **8528.60 MiB** | 5161.29 / 577.06 / **5738.34 MiB** |
+| Client memory (worst client) | 124.22 MiB (a level-2 client) | 102.54 MiB |
+| Server memory, per device | 286.01 MiB | 181.17 MiB |
+| Server memory, all clients' state | 1686.21 MiB | 1324.61 MiB |
+| Latency | 1261.99 s | 1253.75 s |
+
+**How the numbers come about:**
+- **Uploads:** at levels 1 and 2 the cut is after the stem or layer1, where one image is 64 × 8 × 8 values = 16,384 B, twice level 3's 8,192 B. So 6,000 images are 93.75 MiB (+ labels) per upload: 3 clients × 11 rounds × 98,352,000 B = 3095.26 MiB per level. Most of the traffic is therefore the cut (97%), and the total is higher than with every client at level 3.
+- **Client models are smaller at lower levels:** 38,664 B at level 1 and 632,616 B at level 2, against 2,740,048 B at level 3. So the weight traffic drops to 273.57 MiB.
+- **Client-side accuracy rises with the level** (40.64% → 78.75% → 89.91%): a client with more layers has more of the model to predict with on its own. The paper shows the same pattern (Table 1, ResNet-18: 51.81 → 80.36 → 83.81).
+- **Full-model accuracy is about the same at every level (95–97%),** because the server side completes each split. Here level 1 is slightly highest: its server copy trains layer1 → fc with ordinary backprop. The paper's full-model accuracy instead rises slightly with level (80.91 → 84.01 → 84.4 on CIFAR-10).
+- **Memory:**
+  - The worst client is now a level-2 client (124.22 MiB). While it builds its one big upload, all 6,000 smashed images (93.75 MiB at levels 1–2) sit in its memory first.
+  - The server per device is larger: the global server model now runs from layer1 to fc (42.65 MiB), plus a level-1 copy with gradients (85.27) and a level-1 upload (93.75) in its working memory.
+
+**Why the full-model accuracy differs between levels.**
+- **The paper sees the same:** Table 1 reports "client-side / full-model" accuracy per level, e.g. ResNet-18 on CIFAR-10: 80.91 / 84.01 / 84.4.
+- **Each level's full model is the whole ResNet-18,** but built from different versions of the middle layers: the client-trained version (in w^c) up to the cut, the server-trained version (in w^s) after it.
+
+| Part | Level-1 full model | Level-2 full model | Level-3 full model |
+|---|---|---|---|
+| stem | client version (10 clients) | client version (10) | client version (10) |
+| layer1 | **server version** (3 copies) | client version (7 clients) | client version (7) |
+| layer2 | **server version** (6 copies) | **server version** (6) | client version (4 clients) |
+| layer3 → fc | server version (10 copies) | server version (10) | server version (10) |
+| heads a1 / a2 / a3 | client / **server** / **server** | client / client / **server** | client / client / client |
+
+- **So they are three different networks.**
+  - **Server versions are trained end to end:** with ordinary backprop from the real output loss. The client versions learn only from their aux heads. This is the likely reason level 1 is highest.
+  - **Mismatch at the join:** the shared layer3 → fc was trained mostly (6 of 10 copies) on server-trained layer2 features, while the level-3 model feeds it client-trained ones. This fits the numbers but was not measured separately.
+  - **Different amounts of data:** each version is averaged over a different number of clients.
+- **The paper's full-model accuracy rises slightly with level; ours falls slightly.** The setups differ (CIFAR-10, 1000 rounds, 50 clients at 10% per round, batch 64), so the cause can't be pinned down without reproducing the paper's setting.
+
+Code (`src/algos/fedsplitx.py`):
+- `_heteroavg_into` (the heteroavg: each parameter averaged over its holders), called at the fed server and the main server in `aggregate`;
+- `_load_subset` (each client's cut of the global models, L5/L6);
+- `__build_levels` (per-level models);
+- `__evaluate_levels` (the 6 accuracies);
+- `extra_report` (the per-level table).
+
 ## Differences from the paper (deliberate, for a fair benchmark)
 
 - **All clients at one depth level** (the middle cut = level 3), the same cut as every method. The paper's mix of levels is not used, so heteroavg is a plain average.
