@@ -655,7 +655,9 @@ def take_lr_step(obj):
 def log_and_step_lr_per_round(alg, alg_name):
     lr_dict = {}
     log_dict = {}
-    if alg_name not in ['fed_avg', 'sl_multi_server']:
+    # han_locloss trains per-client server copies with their own SGD; the
+    # base `alg.server` (and its config optimizer) is never stepped
+    if alg_name not in ['fed_avg', 'sl_multi_server', 'han_locloss']:
         lr_dict['server_lr'] = take_lr_step(alg.server)
         log_dict[f'Server/server_lr'] = lr_dict['server_lr']
 

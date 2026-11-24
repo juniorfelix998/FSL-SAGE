@@ -1,3 +1,12 @@
 defaults:
   - base_algorithm
 name: han_locloss
+# p.6 "Implementation details": SGD with a fixed lr 0.01 and momentum 0.9 for
+# the client models, the aux heads and the server copies. Weight decay is NOT
+# SPECIFIED in the paper -> 0. These replace the model config's Adam.
+lr          : 0.01
+momentum    : 0.9
+weight_decay: 0.0
+# Batch: the benchmark's 256 (model.client.batch_size); the paper uses 10.
+# Clients: all of the benchmark's clients every round; the paper samples
+# K = 300 of N = 1000 (p.6).

@@ -178,9 +178,9 @@ def collect_cell(cfg, algo_key, distribution, alpha=None, cut='middle',
     # e.g. SplitFedv1 on MNIST, 2 clients x 3 rounds: 6 x 2 x 40.08 = 480.94.
     # Network traffic for averaging the per-client SERVER replicas of a
     # multi-server method. Communication counts only what crosses a network:
-    # SplitFedv1, FedSplitX and MU-SplitFed average their replicas on the
-    # server that holds them, so this is 0 for them (see docs/METRICS.md);
-    # only Han-et-al still charges it. Exactly 0 for every single-server method.
+    # SplitFedv1, FedSplitX, MU-SplitFed and Han-et-al average their replicas
+    # on the server that holds them, so this is 0 for them (see
+    # docs/METRICS.md). Exactly 0 for every single-server method.
     cell['weights_server'] = _summarise_breakdown(
         runs, ('weights.server_up', 'weights.server_down'), 1.0 / MB
     )

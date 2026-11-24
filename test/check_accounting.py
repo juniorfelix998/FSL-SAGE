@@ -1335,6 +1335,77 @@ def test_fedsplitx_hetero():
          [s['layer2.fc.weight'] for s, l in zip(sa, levels) if l <= 2])
 
 
+def test_han_locloss():
+    """Han et al. (locally generated losses), reimplementation: closed-form
+    bytes per category, the paper's optimizer, and proof that our sequential
+    client loop equals the paper's parallel round (Step 4a, p.3)."""
+    print("\n[11] Han et al. (locally generated losses)")
+    import algos as algos_mod
+
+    M, N, B, R = 2, 10, 4, 2
+    bs_list = batch_sizes(N, B)
+    # the method installs its own flattened single-FC aux head (p.6)
+    head_bytes = (CUT_CHANNELS * CUT_HW * CUT_HW * NUM_CLASSES + NUM_CLASSES) * 4
+
+    cfg, res = build_run('han_locloss', M, N, B, R)
+    bd = res.comm_breakdown
+    check_eq("Han cut.act_up (every minibatch, Step 2)", last(bd, 'cut.act_up'),
+             R * M * sum(act_bytes(b) for b in bs_list))
+    check_eq("Han cut.labels_up (every minibatch, Fig. 1(c))",
+             last(bd, 'cut.labels_up'),
+             R * M * sum(label_bytes(b) for b in bs_list))
+    check_eq("Han cut.grad_down is ZERO (no gradient crosses back, p.6)",
+             last(bd, 'cut.grad_down'), 0)
+    check_eq("Han client FedAvg round trip (Steps 1, 3b)",
+             last(bd, 'weights.client_up') + last(bd, 'weights.client_down'),
+             R * 2 * M * client_model_bytes())
+    check_eq("Han aux FedAvg round trip (Steps 1, 3b), flattened single-FC head",
+             last(bd, 'weights.aux_up') + last(bd, 'weights.aux_down'),
+             R * 2 * M * head_bytes)
+    check_eq("Han server-copy FedAvg is on the main server: not charged (Step 4b)",
+             last(bd, 'weights.server_up') + last(bd, 'weights.server_down'), 0)
+    check_eq("Han cut + weights == total",
+             res.comm_load_cut[-1] + res.comm_load_weights[-1],
+             res.comm_load[-1])
+    check_paper_rows("Han", res)
+
+    # p.6: SGD, lr 0.01, momentum 0.9 on clients, aux heads and server copies
+    for c in res.client_list:
+        for name, opt in (('client', c.optimizer),
+                          ('aux', c.auxiliary_model.optimizer)):
+            g = opt.param_groups[0]
+            check(f"Han {name} optimizer is SGD lr 0.01 momentum 0.9",
+                  isinstance(opt, torch.optim.SGD) and g['lr'] == 0.01
+                  and g['momentum'] == 0.9, f"{type(opt).__name__} {g}")
+
+    # Sequential == parallel: clients share nothing until aggregate(), so
+    # running them in reverse order must give the same model, bit for bit.
+    class _Reversed:
+        def __init__(self, it, **kw):
+            self.it = list(it)
+            if kw.get('desc') == 'Client':
+                self.it = self.it[::-1]
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def __iter__(self): return iter(self.it)
+        def __getattr__(self, name): return lambda *a, **kw: None
+
+    orig = algos_mod.tqdm
+    algos_mod.tqdm = _Reversed
+    try:
+        _, rev = build_run('han_locloss', M, N, B, R)
+    finally:
+        algos_mod.tqdm = orig
+    check_eq("Han: reversed client order gives the same test accuracy",
+             rev.accuracy, res.accuracy)
+    check_eq("Han: reversed client order gives the same test loss",
+             rev.loss, res.loss)
+    same = all(torch.equal(a, b) for a, b in zip(
+        res.client_list[0].model.state_dict().values(),
+        rev.client_list[0].model.state_dict().values()))
+    check("Han: reversed client order gives the same client model", same)
+
+
 def main():
     print("=" * 74)
     print("Measurement-layer checks (communication + per-side memory)")
@@ -1349,6 +1420,7 @@ def main():
     test_held_across_cut_reflects_the_algorithm()
     test_ho_sfl_iteration()
     test_fedsplitx_hetero()
+    test_han_locloss()
 
     print("\n" + "=" * 74)
     if FAILURES:

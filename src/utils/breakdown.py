@@ -14,7 +14,7 @@
 # Units are MiB (1024**2 bytes), the same unit as the benchmark table's "MB"
 # columns.
 #
-# CSE-FSL, FSL-SAGE, HO-SFL, MU-SplitFed and FedSplitX have paper-labelled rows; any other method
+# CSE-FSL, FSL-SAGE, HO-SFL, MU-SplitFed, FedSplitX and Han et al. have paper-labelled rows; any other method
 # falls back to the raw ledger categories.
 # ------------------------------------------------------------------------------
 import math
@@ -26,7 +26,8 @@ SERVER_FEDAVG_HOW = (
     "network traffic for averaging per-client copies of the SERVER-side model "
     "(weights.server_up + weights.server_down). Communication counts only what "
     "crosses a network, so this is 0 when the copies are averaged on the "
-    "server that holds them (FedSplitX, MU-SplitFed, SplitFedv1) and 0 for any "
+    "server that holds them (FedSplitX, MU-SplitFed, SplitFedv1, Han et al.) "
+    "and 0 for any "
     "method that keeps a single server model."
 )
 
@@ -183,6 +184,35 @@ PAPER_COMPONENTS = {
              ('weights.aux_down',), _sampled_per_round, 'Weights'),
             ('W5', f'{SERVER_FEDAVG_NAME} (per-client w^s copies)',
              'Sec. 2.3: averaged at the main server, which holds every copy -> no network traffic',
+             ('weights.server_up', 'weights.server_down'), _never, 'Weights'),
+        ],
+    },
+    'han_locloss': {
+        'paper': 'Han et al., locally generated losses, FL-ICML 2021 (reimplementation, no public code)',
+        'rows': [
+            ('C1', 'Activations g_{w_C,k}(x) of each minibatch, client -> main server',
+             'Sec. 3.2 Step 2, p.3: "uploads g(x) ... for all x in D~_k"; N x R x batches per round',
+             ('cut.act_up',), _every_batch, 'Cut'),
+            ('C2', 'Labels y with each minibatch, client -> main server',
+             'Fig. 1(c), p.2: "(Activation, Label)"; the server needs them for its loss l(g(x); w_S) (Eq. 2 / 5); N x R x batches per round',
+             ('cut.labels_up',), _every_batch, 'Cut'),
+            ('C3', 'Gradient at the cut, main server -> client',
+             'p.6: "the downlink communication for transmitting the backpropagated signals is not required" -> never sent',
+             ('cut.grad_down',), _never, 'Cut'),
+            ('W1', 'Client model w_C,k upload (for FedAvg)',
+             'Step 3b, p.3: fed server aggregates w_C = 1/K sum w_C,k; N x R',
+             ('weights.client_up',), _per_client_per_round, 'Weights'),
+            ('W2', 'Global client model w_C download',
+             'Step 1, p.3: each client downloads w_C^t; N x R',
+             ('weights.client_down',), _per_client_per_round, 'Weights'),
+            ('W3', 'Aux network a_C,k upload (for FedAvg)',
+             'Step 3b, p.3: a_C = 1/K sum a_C,k (left out of Table 1 as |a| << |w|; charged anyway); N x R',
+             ('weights.aux_up',), _per_client_per_round, 'Weights'),
+            ('W4', 'Global aux network a_C download',
+             'Step 1, p.3: each client downloads a_C^t; N x R',
+             ('weights.aux_down',), _per_client_per_round, 'Weights'),
+            ('W5', f'{SERVER_FEDAVG_NAME} (per-client w_S,k copies)',
+             'Step 4b, p.4: w_S = 1/K sum w_S,k on the main server, which holds every copy -> no network traffic',
              ('weights.server_up', 'weights.server_down'), _never, 'Weights'),
         ],
     },

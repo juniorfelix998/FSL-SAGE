@@ -114,9 +114,8 @@ It is charged by `charge_weights_roundtrip(server_model, 'server')`, once per cl
 Worked example, SplitFedv1, MNIST, 2 clients × 3 rounds: 2 × 3 × 2 × 40.08 = **480.94 MiB**.
 
 **Who pays it:** only network traffic is charged. Methods that keep one server
-model per client on the main server (SplitFedv1, MU-SplitFed, FedSplitX) average
-those copies there, so they pay 0 too (`docs/METRICS.md`); Han et al. is the one
-remaining exception. Both papers here keep **one** server model, so it is 0:
+model per client on the main server (SplitFedv1, MU-SplitFed, FedSplitX, Han et
+al.) average those copies there, so they pay 0 too (`docs/METRICS.md`). Both papers here keep **one** server model, so it is 0:
 - CSE-FSL p.3: "keep only a single server-side model instead of multiple models"
 - FSL-SAGE p.8: "a single server-side model is maintained"
 
